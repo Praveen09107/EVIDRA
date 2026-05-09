@@ -1,5 +1,6 @@
 # PLAN 05 — Orchestrator & DAG Execution Engine
 **Owner:** Dev A | **Hour:** 3:00–4:00 | **Priority:** CRITICAL
+**Audit Status:** ✅ GAP-7 FIXED — PAUSED_FOR_REVIEW state added (2026-05-10)
 
 ---
 
@@ -10,7 +11,7 @@ Build the python-based Orchestrator that controls the 8-tier agent DAG. It takes
 
 ## 2. DAG Builder Logic
 
-**File: `services/orchestrator/dag.py`**
+**File: `backend/orchestrator/dag.py`**
 
 ```python
 from typing import Dict, Set
@@ -93,14 +94,14 @@ def build_agent_plan(doc_types: Set[str], has_scanned: bool = True) -> Dict[str,
 
 ## 3. Dispatcher Logic
 
-**File: `services/orchestrator/dispatcher.py`**
+**File: `backend/orchestrator/dispatcher.py`**
 
 ```python
 import json
 import logging
 from uuid import UUID
-from services.database import db
-from services.redis_client import publish_task, publish_ws_event
+from core.database import db
+from core.redis_client import publish_task, publish_ws_event
 
 logger = logging.getLogger("orchestrator")
 
@@ -130,7 +131,20 @@ async def dispatch_ready_agents(pipeline_run_id: UUID, case_id: UUID):
     """
     Find agents whose dependencies are all COMPLETE or SKIPPED, 
     and whose status is currently PENDING.
+    
+    GAP-7 FIX: After Tier 1 (format_normalizer) completes,
+    PAUSE the pipeline for human evidence review before running ML agents.
     """
+    # Check if pipeline is paused
+    run_record = await db.fetchrow(
+        "SELECT agent_plan, status FROM pipeline_runs WHERE pipeline_run_id=$1", pipeline_run_id
+    )
+    if run_record and run_record["status"] == "PAUSED_FOR_REVIEW":
+        logger.info(f"Pipeline {pipeline_run_id} is PAUSED_FOR_REVIEW. Skipping dispatch.")
+        return 0
+    
+    plan = json.loads(run_record["agent_plan"]) if run_record else {}
+    
     tasks = await db.fetch(
         "SELECT * FROM agent_tasks WHERE pipeline_run_id=$1", pipeline_run_id
     )
@@ -140,9 +154,30 @@ async def dispatch_ready_agents(pipeline_run_id: UUID, case_id: UUID):
     all_done = True
     any_failed_required = False
     
-    # Get the plan to check "required" flag
-    run_record = await db.fetchrow("SELECT agent_plan FROM pipeline_runs WHERE pipeline_run_id=$1", pipeline_run_id)
-    plan = json.loads(run_record["agent_plan"]) if run_record else {}
+    # GAP-7: Check if Tier 1 just completed → pause for human review
+    tier1_agents = [aid for aid, cfg in plan.items() if cfg.get("tier") == 1]
+    tier1_all_done = all(
+        tasks_by_id.get(a, {}).get("status") in ["COMPLETE", "SKIPPED"]
+        for a in tier1_agents
+    )
+    tier2_not_started = all(
+        tasks_by_id.get(a, {}).get("status") == "PENDING"
+        for a in tasks_by_id if plan.get(a, {}).get("tier", 0) >= 2
+    )
+    if tier1_agents and tier1_all_done and tier2_not_started:
+        logger.info(f"Tier 1 complete. Pausing pipeline for human review.")
+        await db.execute(
+            "UPDATE pipeline_runs SET status='PAUSED_FOR_REVIEW' WHERE pipeline_run_id=$1",
+            pipeline_run_id
+        )
+        await db.execute(
+            "UPDATE cases SET status='PAUSED_FOR_REVIEW' WHERE case_id=$1", case_id
+        )
+        await publish_ws_event(str(case_id), "PIPELINE_PAUSED_FOR_REVIEW", {
+            "run_id": str(pipeline_run_id),
+            "message": "Evidence parsed. Please review extracted data before proceeding."
+        })
+        return 0
     
     for agent_id, task in tasks_by_id.items():
         if task["status"] in ["PENDING", "FAILED"]:
@@ -195,7 +230,7 @@ async def dispatch_ready_agents(pipeline_run_id: UUID, case_id: UUID):
 
 ## 4. Main Orchestrator Loop
 
-**File: `services/orchestrator/main.py`**
+**File: `backend/orchestrator/main.py`**
 
 ```python
 """
@@ -206,9 +241,9 @@ When an agent finishes, it triggers the dispatcher to check for next steps.
 import asyncio
 import logging
 from uuid import UUID
-from services.database import db
-from services.redis_client import get_redis
-from services.orchestrator.dispatcher import dispatch_ready_agents
+from core.database import db
+from core.redis_client import get_redis
+from orchestrator.dispatcher import dispatch_ready_agents
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("orchestrator")
@@ -254,14 +289,14 @@ if __name__ == "__main__":
 
 ## 5. Connecting Gateway to Orchestrator
 
-**File: `services/gateway/pipeline.py`**
+**File: `backend/api/pipeline.py`**
 
 ```python
 from fastapi import APIRouter, Depends, HTTPException
-from services.database import db
-from services.gateway.auth import get_current_user
-from services.orchestrator.dag import build_agent_plan
-from services.orchestrator.dispatcher import create_pipeline_run, dispatch_ready_agents
+from core.database import db
+from api.auth import get_current_user
+from orchestrator.dag import build_agent_plan
+from orchestrator.dispatcher import create_pipeline_run, dispatch_ready_agents
 import json
 
 router = APIRouter()

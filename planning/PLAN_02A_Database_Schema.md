@@ -1,10 +1,21 @@
 # PLAN 02A — PostgreSQL Schema & Database Utilities
 **Owner:** Dev A | **Hour:** 0:30–1:00 | **Priority:** CRITICAL
+**Audit Status:** ✅ ALL 8 GAPS FIXED (2026-05-10)
 
 ---
 
 ## 1. Objective
-Execute the complete 24-table PostgreSQL schema, create the asyncpg connection pool module, and verify all tables, triggers, and indexes are operational. This is the foundational data layer — every agent, the API gateway, and the orchestrator depend on it.
+Execute the complete **29-table** PostgreSQL schema, create the asyncpg connection pool module, and verify all tables, triggers, and indexes are operational. This is the foundational data layer — every agent, the API gateway, and the orchestrator depend on it.
+
+> [!IMPORTANT]
+> This schema has been updated to fix all 8 gaps found in the final audit:
+> - Added `organizations` table (GAP-1)
+> - Added `claim_relations` + `claim_verdicts` tables (GAP-2)
+> - Added `model_calibration_stats` table (GAP-3)
+> - Added `nbe_feedback` table (GAP-4)
+> - Added 3 immutability triggers on append-only tables (GAP-5)
+> - Added `PAUSED_FOR_REVIEW` to pipeline_runs status (GAP-7)
+> - Total: 29 tables + 7 triggers
 
 ---
 
@@ -14,39 +25,54 @@ Execute the complete 24-table PostgreSQL schema, create the asyncpg connection p
 
 ```sql
 -- ═══════════════════════════════════════════════════════════
--- AIVENTRA Forensic Intelligence Platform — Database Schema
--- PostgreSQL 16 | 24 Tables | UUID Primary Keys | JSONB
+-- EVIDRA Forensic Intelligence Platform — Database Schema
+-- PostgreSQL 16 | 29 Tables | UUID Primary Keys | JSONB
 -- ═══════════════════════════════════════════════════════════
 
 -- Enable extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
--- ─── 1. USERS ───
+-- ─── 1. ORGANIZATIONS ─── (GAP-1 FIX)
+CREATE TABLE organizations (
+    org_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name        TEXT NOT NULL,
+    tier        TEXT NOT NULL DEFAULT 'STANDARD' CHECK (tier IN ('STANDARD','PREMIUM','ENTERPRISE')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Default organization for hackathon
+INSERT INTO organizations (org_id, name, tier) VALUES
+    ('00000000-0000-0000-0000-000000000001', 'EVIDRA Default Org', 'ENTERPRISE');
+
+-- ─── 2. USERS ───
 CREATE TABLE users (
     user_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    email         VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    full_name     VARCHAR(255) NOT NULL,
-    role          VARCHAR(50) NOT NULL DEFAULT 'INVESTIGATOR'
-                    CHECK (role IN ('ADMIN','INVESTIGATOR','PATHOLOGIST','LEGAL','VIEWER')),
-    department    VARCHAR(255),
+    org_id        UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001' REFERENCES organizations(org_id),
+    email         TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    full_name     TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'INVESTIGATOR'
+                    CHECK (role IN ('ADMIN','INVESTIGATOR','SUPERVISOR','PATHOLOGIST','LEGAL','VIEWER')),
+    department    TEXT,
     is_active     BOOLEAN DEFAULT TRUE,
     created_at    TIMESTAMPTZ DEFAULT NOW(),
     updated_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ─── 2. CASES ───
+-- ─── 3. CASES ───
 CREATE TABLE cases (
     case_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    case_number   VARCHAR(50) UNIQUE NOT NULL,
-    title         VARCHAR(500) NOT NULL,
+    org_id        UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001' REFERENCES organizations(org_id),
+    case_number   TEXT UNIQUE NOT NULL DEFAULT '',
+    title         TEXT NOT NULL,
     description   TEXT,
-    status        VARCHAR(30) NOT NULL DEFAULT 'OPEN'
-                    CHECK (status IN ('OPEN','IN_ANALYSIS','REVIEW','CLOSED','ARCHIVED')),
-    risk_level    VARCHAR(20) DEFAULT 'MEDIUM'
+    status        TEXT NOT NULL DEFAULT 'OPEN'
+                    CHECK (status IN ('OPEN','IN_ANALYSIS','PAUSED_FOR_REVIEW','REVIEW','CLOSED','ARCHIVED')),
+    risk_level    TEXT DEFAULT 'MEDIUM'
                     CHECK (risk_level IN ('LOW','MEDIUM','HIGH','CRITICAL')),
-    location      VARCHAR(500),
+    location      TEXT,
     incident_date TIMESTAMPTZ,
     created_by    UUID REFERENCES users(user_id),
     assigned_to   UUID REFERENCES users(user_id),
@@ -60,7 +86,7 @@ CREATE INDEX idx_cases_status ON cases(status);
 CREATE INDEX idx_cases_created_by ON cases(created_by);
 CREATE INDEX idx_cases_created_at ON cases(created_at DESC);
 
--- ─── 3. CASE FILES ───
+-- ─── 4. CASE FILES ───
 CREATE TABLE case_files (
     file_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id       UUID NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
@@ -82,13 +108,13 @@ CREATE TABLE case_files (
 CREATE INDEX idx_case_files_case ON case_files(case_id);
 CREATE INDEX idx_case_files_doc_type ON case_files(doc_type);
 
--- ─── 4. PIPELINE RUNS ───
+-- ─── 5. PIPELINE RUNS ───
 CREATE TABLE pipeline_runs (
     pipeline_run_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
     triggered_by    UUID REFERENCES users(user_id),
-    status          VARCHAR(30) DEFAULT 'PENDING'
-                      CHECK (status IN ('PENDING','RUNNING','COMPLETE','FAILED','CANCELLED')),
+    status          TEXT DEFAULT 'PENDING'
+                      CHECK (status IN ('PENDING','RUNNING','PAUSED_FOR_REVIEW','PARTIAL','COMPLETE','FAILED','CANCELLED')),
     agent_plan      JSONB NOT NULL DEFAULT '{}',
     started_at      TIMESTAMPTZ,
     completed_at    TIMESTAMPTZ,
@@ -100,13 +126,13 @@ CREATE TABLE pipeline_runs (
 CREATE INDEX idx_pipeline_runs_case ON pipeline_runs(case_id);
 CREATE INDEX idx_pipeline_runs_status ON pipeline_runs(status);
 
--- ─── 5. AGENT TASKS ───
+-- ─── 6. AGENT TASKS ───
 CREATE TABLE agent_tasks (
     task_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     pipeline_run_id UUID NOT NULL REFERENCES pipeline_runs(pipeline_run_id),
     agent_id        VARCHAR(50) NOT NULL,
-    status          VARCHAR(30) DEFAULT 'PENDING'
-                      CHECK (status IN ('PENDING','DISPATCHED','RUNNING','COMPLETE','FAILED','SKIPPED')),
+    status          TEXT DEFAULT 'PENDING'
+                      CHECK (status IN ('PENDING','WAITING','DISPATCHED','RUNNING','COMPLETE','FAILED','SKIPPED')),
     tier            INT NOT NULL DEFAULT 0,
     depends_on      TEXT[] DEFAULT '{}',
     attempt_count   INT DEFAULT 0,
@@ -122,7 +148,7 @@ CREATE INDEX idx_agent_tasks_pipeline ON agent_tasks(pipeline_run_id);
 CREATE INDEX idx_agent_tasks_status ON agent_tasks(status);
 CREATE UNIQUE INDEX idx_agent_tasks_unique ON agent_tasks(pipeline_run_id, agent_id);
 
--- ─── 6. AGENT RESULTS ───
+-- ─── 7. AGENT RESULTS ───
 CREATE TABLE agent_results (
     result_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     pipeline_run_id UUID NOT NULL REFERENCES pipeline_runs(pipeline_run_id),
@@ -136,7 +162,7 @@ CREATE TABLE agent_results (
 CREATE UNIQUE INDEX idx_agent_results_unique ON agent_results(pipeline_run_id, agent_id);
 CREATE INDEX idx_agent_results_pipeline ON agent_results(pipeline_run_id);
 
--- ─── 7. REPLAY STEPS (Audit Trail) ───
+-- ─── 8. REPLAY STEPS (Audit Trail) ───
 CREATE TABLE replay_steps (
     step_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     pipeline_run_id UUID NOT NULL REFERENCES pipeline_runs(pipeline_run_id),
@@ -157,7 +183,7 @@ CREATE INDEX idx_replay_steps_pipeline ON replay_steps(pipeline_run_id);
 CREATE INDEX idx_replay_steps_agent ON replay_steps(agent_id);
 CREATE INDEX idx_replay_steps_ts ON replay_steps(timestamp);
 
--- ─── 8. CANONICAL CDR EVENTS ───
+-- ─── 9. CANONICAL CDR EVENTS ───
 CREATE TABLE canonical_cdr_events (
     event_id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id             UUID NOT NULL REFERENCES cases(case_id),
@@ -180,7 +206,7 @@ CREATE INDEX idx_cdr_timestamp ON canonical_cdr_events(event_timestamp);
 CREATE INDEX idx_cdr_tower ON canonical_cdr_events(cell_tower_id);
 CREATE INDEX idx_cdr_msisdn ON canonical_cdr_events(source_msisdn);
 
--- ─── 9. CANONICAL FINANCIAL EVENTS ───
+-- ─── 10. CANONICAL FINANCIAL EVENTS ───
 CREATE TABLE canonical_financial_events (
     event_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id       UUID NOT NULL REFERENCES cases(case_id),
@@ -201,7 +227,21 @@ CREATE INDEX idx_fin_case ON canonical_financial_events(case_id);
 CREATE INDEX idx_fin_timestamp ON canonical_financial_events(timestamp);
 CREATE INDEX idx_fin_amount ON canonical_financial_events(amount);
 
--- ─── 10. COLLISION EVENTS ───
+-- ─── 11. ENTITY TRACKS ─── (from Image Agent + CDR + IoT)
+CREATE TABLE entity_tracks (
+    track_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id     UUID NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+    entity_id   TEXT NOT NULL,
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('PERSON','DEVICE','OBJECT')),
+    source      TEXT NOT NULL CHECK (source IN ('CCTV','PHONE','IOT','SCENE','MANUAL')),
+    segments    JSONB NOT NULL,
+    confidence  FLOAT NOT NULL DEFAULT 0.5,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_tracks_case ON entity_tracks(case_id);
+
+-- ─── 12. COLLISION EVENTS ───
 CREATE TABLE collision_events (
     collision_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -218,7 +258,7 @@ CREATE TABLE collision_events (
 
 CREATE INDEX idx_collision_case ON collision_events(case_id);
 
--- ─── 11. HOTSPOTS ───
+-- ─── 13. HOTSPOTS ───
 CREATE TABLE hotspots (
     hotspot_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -236,7 +276,7 @@ CREATE TABLE hotspots (
 CREATE INDEX idx_hotspots_case ON hotspots(case_id);
 CREATE INDEX idx_hotspots_score ON hotspots(score DESC);
 
--- ─── 12. CLAIMS ───
+-- ─── 14. CLAIMS ───
 CREATE TABLE claims (
     claim_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -256,7 +296,20 @@ CREATE TABLE claims (
 
 CREATE INDEX idx_claims_case ON claims(case_id);
 
--- ─── 13. EVIDENCE-CLAIM LINKS ───
+-- ─── 15. CLAIM RELATIONS ─── (GAP-2 FIX)
+CREATE TABLE claim_relations (
+    relation_id   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id       UUID NOT NULL REFERENCES cases(case_id),
+    from_claim_id UUID NOT NULL REFERENCES claims(claim_id),
+    to_claim_id   UUID NOT NULL REFERENCES claims(claim_id),
+    relation      TEXT NOT NULL CHECK (relation IN ('CONTRADICTS','SUPPORTS','REFINES','TEMPORALLY_BEFORE')),
+    confidence    FLOAT NOT NULL DEFAULT 0.5,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_clrel_case ON claim_relations(case_id);
+
+-- ─── 16. EVIDENCE-CLAIM LINKS ───
 CREATE TABLE evidence_claim_links (
     link_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id        UUID NOT NULL REFERENCES cases(case_id),
@@ -273,7 +326,25 @@ CREATE TABLE evidence_claim_links (
 CREATE INDEX idx_ecl_case ON evidence_claim_links(case_id);
 CREATE INDEX idx_ecl_claim ON evidence_claim_links(claim_id);
 
--- ─── 14. HYPOTHESIS HISTORY ───
+-- ─── 17. CLAIM VERDICTS ─── (GAP-2 FIX)
+CREATE TABLE claim_verdicts (
+    verdict_id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id        UUID NOT NULL REFERENCES cases(case_id),
+    pipeline_run_id UUID REFERENCES pipeline_runs(pipeline_run_id),
+    claim_id       UUID NOT NULL REFERENCES claims(claim_id),
+    verdict        TEXT NOT NULL CHECK (verdict IN ('SUPPORTED','REFUTED','CONFLICTING','NOT_ENOUGH_INFO')),
+    confidence     FLOAT NOT NULL,
+    support_mass   FLOAT,
+    refute_mass    FLOAT,
+    nei_mass       FLOAT,
+    justification  TEXT,
+    flags          JSONB DEFAULT '[]',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_cv_claim ON claim_verdicts(claim_id);
+
+-- ─── 18. HYPOTHESIS HISTORY ───
 CREATE TABLE hypothesis_history (
     history_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -289,7 +360,7 @@ CREATE TABLE hypothesis_history (
 CREATE INDEX idx_hyp_case ON hypothesis_history(case_id);
 CREATE INDEX idx_hyp_pipeline ON hypothesis_history(pipeline_run_id);
 
--- ─── 15. CAUSAL GRAPH NODES ───
+-- ─── 19. CAUSAL GRAPH NODES ───
 CREATE TABLE causal_graph_nodes (
     node_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -302,7 +373,7 @@ CREATE TABLE causal_graph_nodes (
 
 CREATE INDEX idx_cgn_case ON causal_graph_nodes(case_id);
 
--- ─── 16. CAUSAL GRAPH EDGES ───
+-- ─── 20. CAUSAL GRAPH EDGES ───
 CREATE TABLE causal_graph_edges (
     edge_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -316,7 +387,7 @@ CREATE TABLE causal_graph_edges (
 
 CREATE INDEX idx_cge_case ON causal_graph_edges(case_id);
 
--- ─── 17. UNCERTAINTY REPORTS ───
+-- ─── 21. UNCERTAINTY REPORTS ───
 CREATE TABLE uncertainty_reports (
     report_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -327,7 +398,7 @@ CREATE TABLE uncertainty_reports (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ─── 18. NBE SUGGESTIONS ───
+-- ─── 22. NBE SUGGESTIONS ───
 CREATE TABLE nbe_suggestions (
     suggestion_id   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -345,7 +416,17 @@ CREATE TABLE nbe_suggestions (
 
 CREATE INDEX idx_nbe_case ON nbe_suggestions(case_id);
 
--- ─── 19. AUDIT LOG (Append-Only) ───
+-- ─── 23. NBE FEEDBACK ─── (GAP-4 FIX)
+CREATE TABLE nbe_feedback (
+    feedback_id   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    suggestion_id UUID NOT NULL REFERENCES nbe_suggestions(suggestion_id),
+    case_id       UUID NOT NULL REFERENCES cases(case_id),
+    action_taken  TEXT NOT NULL CHECK (action_taken IN ('ACCEPTED','IGNORED','REJECTED','NOT_POSSIBLE')),
+    outcome       TEXT CHECK (outcome IN ('HELPFUL','NOT_HELPFUL','UNKNOWN')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─── 24. AUDIT LOG (Append-Only) ───
 CREATE TABLE audit_log (
     log_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id     UUID REFERENCES users(user_id),
@@ -361,7 +442,7 @@ CREATE INDEX idx_audit_timestamp ON audit_log(timestamp DESC);
 CREATE INDEX idx_audit_user ON audit_log(user_id);
 CREATE INDEX idx_audit_action ON audit_log(action);
 
--- ─── 20. CHAIN OF CUSTODY ───
+-- ─── 25. CHAIN OF CUSTODY ───
 CREATE TABLE chain_of_custody (
     custody_id  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     file_id     UUID NOT NULL REFERENCES case_files(file_id),
@@ -374,7 +455,7 @@ CREATE TABLE chain_of_custody (
 
 CREATE INDEX idx_custody_file ON chain_of_custody(file_id);
 
--- ─── 21. TIMELINE EVENTS (Unified) ───
+-- ─── 26. TIMELINE EVENTS (Unified) ───
 CREATE TABLE timeline_events (
     event_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -391,7 +472,7 @@ CREATE TABLE timeline_events (
 CREATE INDEX idx_timeline_case ON timeline_events(case_id);
 CREATE INDEX idx_timeline_ts ON timeline_events(timestamp);
 
--- ─── 22. ANOMALY WINDOWS ───
+-- ─── 27. ANOMALY WINDOWS ───
 CREATE TABLE anomaly_windows (
     window_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -409,7 +490,7 @@ CREATE TABLE anomaly_windows (
 
 CREATE INDEX idx_anomaly_case ON anomaly_windows(case_id);
 
--- ─── 23. REPORT SNAPSHOTS ───
+-- ─── 28. REPORT SNAPSHOTS ───
 CREATE TABLE report_snapshots (
     report_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     case_id         UUID NOT NULL REFERENCES cases(case_id),
@@ -421,11 +502,11 @@ CREATE TABLE report_snapshots (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ─── 24. SESSIONS (Token Tracking) ───
+-- ─── 29. SESSIONS (Token Tracking) ───
 CREATE TABLE sessions (
     session_id  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id     UUID NOT NULL REFERENCES users(user_id),
-    token_hash  VARCHAR(64),
+    token_hash  TEXT,
     ip_address  INET,
     user_agent  TEXT,
     expires_at  TIMESTAMPTZ NOT NULL,
@@ -433,6 +514,19 @@ CREATE TABLE sessions (
 );
 
 CREATE INDEX idx_sessions_user ON sessions(user_id);
+
+-- ─── 30. MODEL CALIBRATION STATS ─── (GAP-3 FIX)
+CREATE TABLE model_calibration_stats (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    model_id          TEXT NOT NULL,
+    model_type        TEXT NOT NULL CHECK (model_type IN ('ML','LLM','RULE','HYBRID')),
+    calibration_status TEXT DEFAULT 'UNCALIBRATED',
+    global_brier_score FLOAT,
+    ece               FLOAT,
+    training_data_note TEXT,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_calibration_model ON model_calibration_stats(model_id);
 
 -- ═══════════════════════════════════════════════════════════
 -- TRIGGERS
@@ -482,12 +576,33 @@ CREATE TRIGGER trg_file_custody AFTER INSERT ON case_files
     FOR EACH ROW EXECUTE FUNCTION log_file_custody();
 
 -- ═══════════════════════════════════════════════════════════
+-- IMMUTABILITY TRIGGERS (GAP-5 FIX — Court Readiness)
+-- These prevent UPDATE/DELETE on append-only forensic tables.
+-- ═══════════════════════════════════════════════════════════
+
+CREATE OR REPLACE FUNCTION prevent_update_delete() RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'UPDATE/DELETE not permitted on append-only table %', TG_TABLE_NAME;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_audit_immutable BEFORE UPDATE OR DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION prevent_update_delete();
+
+CREATE TRIGGER trg_custody_immutable BEFORE UPDATE OR DELETE ON chain_of_custody
+    FOR EACH ROW EXECUTE FUNCTION prevent_update_delete();
+
+CREATE TRIGGER trg_replay_immutable BEFORE UPDATE OR DELETE ON replay_steps
+    FOR EACH ROW EXECUTE FUNCTION prevent_update_delete();
+
+-- ═══════════════════════════════════════════════════════════
 -- SEED DATA (Development Only)
 -- ═══════════════════════════════════════════════════════════
 
 -- Default admin user (password: admin123)
 INSERT INTO users (email, password_hash, full_name, role) VALUES
-    ('admin@aiventra.gov', '$2b$12$LJ3m4ys4dF0G9q2o5h0rAOe.TV/0YVJz8.5BW0dO9.CQ3MfR2zEPi', 'System Admin', 'ADMIN'),
+    ('admin@evidra.gov', '$2b$12$LJ3m4ys4dF0G9q2o5h0rAOe.TV/0YVJz8.5BW0dO9.CQ3MfR2zEPi', 'System Admin', 'ADMIN'),
     ('investigator@police.gov', '$2b$12$LJ3m4ys4dF0G9q2o5h0rAOe.TV/0YVJz8.5BW0dO9.CQ3MfR2zEPi', 'Inspector Singh', 'INVESTIGATOR');
 ```
 
@@ -495,7 +610,7 @@ INSERT INTO users (email, password_hash, full_name, role) VALUES
 
 ## 3. Database Connection Pool Module
 
-**File: `services/database.py`**
+**File: `backend/core/database.py`**
 
 ```python
 """
@@ -503,7 +618,7 @@ Async PostgreSQL connection pool using asyncpg.
 All database operations across the platform use this module.
 
 Usage:
-    from services.database import db
+    from core.database import db
     rows = await db.fetch("SELECT * FROM cases WHERE status=$1", "OPEN")
     row = await db.fetchrow("SELECT * FROM users WHERE email=$1", email)
     await db.execute("INSERT INTO cases (title) VALUES ($1)", title)
@@ -584,8 +699,8 @@ db = type('DB', (), {
 
 ```powershell
 # After docker compose up -d:
-docker exec -it aiventra_postgres psql -U aiventra -d aiventra_db -c "\dt"
-# Should list 24 tables
+docker exec -it evidra_postgres psql -U evidra -d evidra_db -c "\dt"
+# Should list 30 tables (29 data + 1 organizations seed)
 
 # Test Python connection:
 python -c "
@@ -605,9 +720,12 @@ asyncio.run(test())
 ---
 
 ## 5. Acceptance Criteria
-- [ ] `\dt` in psql shows exactly 24 tables
+- [ ] `\dt` in psql shows exactly 30 tables
 - [ ] All CHECK constraints are active (test invalid insert fails)
 - [ ] Triggers fire: inserting a case auto-generates `case_number`
 - [ ] Inserting a case_file auto-creates `chain_of_custody` record
+- [ ] Immutability triggers block UPDATE/DELETE on `audit_log`, `chain_of_custody`, `replay_steps`
+- [ ] `PAUSED_FOR_REVIEW` is a valid status for both `cases` and `pipeline_runs`
 - [ ] `database.py` pool connects and `fetch("SELECT 1")` returns
-- [ ] Seed users exist and can be queried
+- [ ] Seed org + seed users exist and can be queried
+
