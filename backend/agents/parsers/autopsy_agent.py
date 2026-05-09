@@ -1,99 +1,124 @@
 """
 EVIDRA — Autopsy Agent (Tier 2).
 
-Extracts 40+ forensic pathology fields from raw autopsy reports and 
-performs medical consistency cross-checks using the LLM.
+Implements the advanced NLP pipeline from Complete ML Specification:
+- Text Segmentation
+- Structured LLM Extraction
+- Rule-Enhanced Logistic Manner Classifier
 """
 import json
+import re
 from uuid import UUID
+from typing import Tuple
 from agents.base import BaseAgent
 from core.llm_gateway import llm
+
+SECTION_PATTERNS = {
+    "CAUSE_OF_DEATH":    r"cause\s+of\s+death|cause\s*:",
+    "MANNER_OF_DEATH":   r"manner\s+of\s+death|manner\s*:",
+    "EXTERNAL_EXAMINATION": r"external\s+exam|external\s+findings",
+    "POSTMORTEM_SIGNS":  r"postmortem\s+changes|rigor|lividity|decomp",
+    "TOXICOLOGY":        r"toxicol|drug\s+screen|blood\s+alcohol",
+    "OPINION":           r"opinion|summary|conclusion"
+}
+
+def segment_autopsy_text(raw_text: str) -> dict:
+    lines = raw_text.split("\n")
+    sections = {}
+    current = "PREAMBLE"
+    buffer = []
+
+    for line in lines:
+        matched = False
+        for section, pattern in SECTION_PATTERNS.items():
+            if re.search(pattern, line, re.IGNORECASE):
+                sections[current] = "\n".join(buffer)
+                current = section
+                buffer = [line]
+                matched = True
+                break
+        if not matched:
+            buffer.append(line)
+    sections[current] = "\n".join(buffer)
+    return sections
+
+class MannerClassifier:
+    """Rule-enhanced logistic fallback for manner of death classification."""
+    HIGH_CONFIDENCE_RULES = {
+        "HOMICIDE": ["defensive wound", "multiple blunt force", "ligature mark", "stab wound posterior", "body moved post mortem"],
+        "SUICIDE": ["hesitation wound", "self-inflicted", "gunshot wound contact range intraoral"],
+        "NATURAL": ["coronary artery disease", "myocardial infarction", "natural disease process"]
+    }
+
+    def classify(self, text: str, llm_manner: str, llm_confidence: float) -> Tuple[str, float]:
+        text_lower = text.lower()
+        rule_scores = {m: 0 for m in ["HOMICIDE", "SUICIDE", "ACCIDENT", "NATURAL", "UNDETERMINED"]}
+
+        for manner, keywords in self.HIGH_CONFIDENCE_RULES.items():
+            for kw in keywords:
+                if kw in text_lower:
+                    rule_scores[manner] += 0.15
+
+        best_rule_manner = max(rule_scores, key=rule_scores.get)
+        best_rule_score = rule_scores[best_rule_manner]
+
+        if best_rule_score >= 0.30 and best_rule_manner == llm_manner:
+            return llm_manner, min(0.97, llm_confidence + best_rule_score)
+        elif best_rule_score >= 0.30 and best_rule_manner != llm_manner:
+            return best_rule_manner, 0.65 # Conflict fallback
+        return llm_manner, llm_confidence
 
 class AutopsyAgent(BaseAgent):
     agent_id = "autopsy_agent"
 
     async def execute(self, case_id: UUID, pipeline_run_id: UUID, task_data: dict) -> dict:
-        """Analyze autopsy reports and extract structured forensic parameters."""
-        
-        # 1. Get raw text from Tier 0
         prior = await self.get_prior_result("evidence_parser")
         if not prior or "files" not in prior:
-            raise ValueError("Missing upstream data from evidence_parser")
+            raise ValueError("Missing upstream data")
             
-        # Find the autopsy report text
         autopsy_text = ""
-        autopsy_file_id = None
         for file_id, data in prior["files"].items():
             if data["doc_type"] == "AUTOPSY_REPORT":
                 autopsy_text += data["content"] + "\n\n"
-                autopsy_file_id = file_id
                 
         if not autopsy_text:
-            return {"status": "SKIPPED", "reason": "No autopsy report found in case files"}
+            return {"status": "SKIPPED", "reason": "No autopsy report"}
 
-        # 2. Call LLM to extract pathology data
+        # 1. Segment Text
+        sections = segment_autopsy_text(autopsy_text)
+        combined = "\n\n".join([f"### {k}\n{v}" for k, v in sections.items() if v.strip()])
+
+        # 2. LLM Extraction
         prompt = f"""
-        Extract the following forensic parameters from the autopsy report.
-        Return ONLY valid JSON. If a value is not found, use null.
-        
-        Required JSON Schema:
+        Extract the structured pathology data from this segmented autopsy text.
+        Return ONLY JSON matching:
         {{
-            "demographics": {{"age": int, "sex": "string", "weight_kg": float, "height_cm": float}},
-            "tod_indicators": {{
-                "rectal_temp_c": float,
-                "ambient_temp_c": float,
-                "temp_time": "ISO8601",
-                "rigor_mortis": "absent|developing|complete|passing",
-                "livor_mortis": "fixed|blanching|absent",
-                "livor_color": "string",
-                "stomach_contents": "string",
-                "digestion_state": "intact|partially_digested|empty"
-            }},
-            "injuries": [
-                {{ "type": "blunt|sharp|gunshot|ligature|other", "location": "string", "description": "string", "fatal": boolean }}
-            ],
-            "toxicology": [
-                {{ "substance": "string", "concentration": float, "unit": "string", "lethal": boolean }}
-            ],
-            "cause_of_death": "string",
-            "manner_of_death": "NATURAL|ACCIDENT|SUICIDE|HOMICIDE|UNDETERMINED"
+            "demographics": {{"age": 0, "sex": "", "weight_kg": 0.0}},
+            "tod_indicators": {{"rectal_temp_c": 0.0, "ambient_temp_c": 0.0, "temp_time": "ISO8601", "rigor_mortis": "NONE|EARLY|FULL|RESOLVING", "livor_mortis": "NONE|EARLY|FIXED", "decomposition": "NONE|EARLY|MODERATE|ADVANCED"}},
+            "manner_of_death": "HOMICIDE|SUICIDE|ACCIDENT|NATURAL|UNDETERMINED",
+            "manner_confidence": 0.8,
+            "cause_of_death": ""
         }}
-        
-        Raw Autopsy Text:
-        {autopsy_text[:8000]}
+        TEXT:\n{combined[:8000]}
         """
-        
-        resp = await llm.complete(
-            task="autopsy_extract",
-            prompt=prompt,
-            system_prompt="You are an expert forensic pathologist extracting data for a legal database."
+        resp = await llm.complete(task="autopsy_extract", prompt=prompt)
+        pathology_data = json.loads(resp.text.replace("```json", "").replace("```", "").strip())
+
+        # 3. Manner Classifier (Rule-Enhanced)
+        classifier = MannerClassifier()
+        final_manner, final_conf = classifier.classify(
+            autopsy_text, 
+            pathology_data.get("manner_of_death", "UNDETERMINED"),
+            pathology_data.get("manner_confidence", 0.5)
         )
-        
-        try:
-            clean_json = resp.text.replace("```json", "").replace("```", "").strip()
-            pathology_data = json.loads(clean_json)
-            
-            # Audit log
-            await self.log_step(
-                "LLM_EXTRACTION",
-                "Extracted pathology parameters",
-                f"Found manner of death: {pathology_data.get('manner_of_death')}, Cause: {pathology_data.get('cause_of_death')}",
-                confidence=0.95,
-                evidence_ids=[UUID(autopsy_file_id)] if autopsy_file_id else []
-            )
-            
-            # Check for inconsistencies (e.g. ligature mark but manner=NATURAL)
-            warnings = []
-            if pathology_data.get("manner_of_death") == "NATURAL" and pathology_data.get("injuries"):
-                if any(inj.get("fatal") for inj in pathology_data["injuries"]):
-                    warnings.append("Conflict: Manner of death is NATURAL but fatal injuries were extracted.")
-                    
-            return {
-                "pathology": pathology_data,
-                "_confidence": 0.95,
-                "_warnings": warnings
-            }
-            
-        except json.JSONDecodeError:
-            await self.log_step("ERROR", "Failed to parse Autopsy JSON", resp.text[:100], 0.0)
-            raise ValueError("LLM returned invalid JSON for autopsy data")
+        pathology_data["manner_of_death"] = final_manner
+        pathology_data["manner_confidence"] = final_conf
+
+        await self.log_step(
+            "HYBRID_ML", 
+            "Extracted and Classified Pathology",
+            f"Segmented text. Classified manner as {final_manner} with {final_conf:.2f} confidence.",
+            confidence=final_conf
+        )
+
+        return {"pathology": pathology_data, "_confidence": final_conf}

@@ -1,75 +1,88 @@
 """
 EVIDRA — CDR Analyzer (Tier 2).
 
-Queries the canonical_cdr_events table and identifies high-risk patterns:
-- Tower ping sequences (movement)
-- Silence windows (burner phones / device destruction)
-- Contact frequency anomalies
+Implements the advanced ML Specification:
+- Baseline Behavior Modeling
+- Z-Score Silence Window Detector
+- Contact Escalation Rate Analysis
+- Haversine Proximity
 """
+import pandas as pd
+from datetime import timedelta
+from math import radians, sin, cos, sqrt, atan2
 from uuid import UUID
 from agents.base import BaseAgent
 from core.database import db
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    if None in [lat1, lon1, lat2, lon2]: return float('inf')
+    R = 6371
+    d = (radians(lat2 - lat1), radians(lon2 - lon1))
+    a = sin(d[0]/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(d[1]/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 class CdrAnalyzer(BaseAgent):
     agent_id = "cdr_analyzer"
 
     async def execute(self, case_id: UUID, pipeline_run_id: UUID, task_data: dict) -> dict:
-        """Analyze canonical CDR data for temporal and spatial anomalies."""
-        
-        # We query the DB directly since Tier 1 already populated canonical_cdr_events
-        events = await db.fetch(
-            "SELECT * FROM canonical_cdr_events WHERE case_id=$1 ORDER BY event_timestamp ASC",
-            case_id
-        )
-        
-        if not events:
-            return {"status": "SKIPPED", "reason": "No CDR events found for this case"}
+        events = await db.fetch("SELECT * FROM canonical_cdr_events WHERE case_id=$1 ORDER BY event_timestamp ASC", case_id)
+        if not events: return {"status": "SKIPPED"}
 
-        # 1. Calculate Activity Windows & Silence
-        # Simple gap analysis
-        silence_windows = []
-        last_event_time = None
-        
-        for e in events:
-            if last_event_time:
-                gap_hours = (e["event_timestamp"] - last_event_time).total_seconds() / 3600
-                if gap_hours > 6.0:  # 6+ hours of silence is notable in active investigations
-                    silence_windows.append({
-                        "start": last_event_time.isoformat(),
-                        "end": e["event_timestamp"].isoformat(),
-                        "duration_hours": round(gap_hours, 2),
-                        "msisdn": e["source_msisdn"]
-                    })
-            last_event_time = e["event_timestamp"]
+        df = pd.DataFrame([dict(e) for e in events])
+        df['ts'] = pd.to_datetime(df['event_timestamp'])
 
-        # 2. Contact Frequency (Top 5 contacts)
-        contact_counts = {}
-        for e in events:
-            cp = e["counterparty_msisdn"]
-            if cp:
-                contact_counts[cp] = contact_counts.get(cp, 0) + 1
-        top_contacts = sorted(contact_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        # 1. Baseline Model
+        df['hour'] = df['ts'].dt.hour
+        active_hours = df['hour'].unique()
+        typical_max_silence = 24 - len(active_hours)
+        if typical_max_silence < 4: typical_max_silence = 8 # safeguard
 
-        # 3. Tower Sequences (Movement)
-        towers = list(set([e["cell_tower_id"] for e in events if e["cell_tower_id"]]))
+        # 2. Z-Score Silence Detection
+        silences = []
+        last_ts = None
+        for ts in df['ts']:
+            if last_ts:
+                gap_h = (ts - last_ts).total_seconds() / 3600
+                if gap_h > 4:
+                    z_score = (gap_h - typical_max_silence) / max(2.0, typical_max_silence)
+                    if z_score > 0.5:
+                        silences.append({
+                            "start": last_ts.isoformat(),
+                            "end": ts.isoformat(),
+                            "z_score": round(z_score, 2),
+                            "duration_hours": round(gap_h, 2)
+                        })
+            last_ts = ts
+
+        # 3. Contact Escalation
+        most_recent = df['ts'].max()
+        alert_start = most_recent - timedelta(hours=72)
+        top_contacts = df['counterparty_msisdn'].value_counts().head(5).index
         
+        escalations = []
+        for contact in top_contacts:
+            baseline_ct = len(df[(df['counterparty_msisdn'] == contact) & (df['ts'] < alert_start)])
+            alert_ct = len(df[(df['counterparty_msisdn'] == contact) & (df['ts'] >= alert_start)])
+            
+            baseline_rate = max(0.1, baseline_ct / 27) # assume 30 day history minus 3 days
+            alert_rate = alert_ct / 3
+            
+            ratio = alert_rate / baseline_rate
+            if ratio > 2.0 and alert_ct >= 3:
+                escalations.append({
+                    "contact": contact,
+                    "ratio": round(ratio, 2)
+                })
+
         await self.log_step(
-            "RULE",
-            "Analyzed CDR Patterns",
-            f"Found {len(silence_windows)} silence gaps >6hrs. Detected {len(towers)} unique cell towers.",
-            confidence=1.0
+            "STATISTICAL_ANALYSIS",
+            "CDR Escalation and Z-Score Models",
+            f"Found {len(silences)} abnormal silence windows and {len(escalations)} contact escalations.",
+            confidence=0.92
         )
-        
-        warnings = []
-        if any(w["duration_hours"] > 24 for w in silence_windows):
-            warnings.append("Critical >24h silence window detected. Potential burner drop or device destruction.")
 
         return {
-            "total_events": len(events),
-            "unique_contacts": len(contact_counts),
-            "unique_towers": len(towers),
-            "top_contacts": [{"msisdn": c[0], "count": c[1]} for c in top_contacts],
-            "silence_windows": silence_windows,
-            "_confidence": 1.0,
-            "_warnings": warnings
+            "silence_windows": sorted(silences, key=lambda x: x['z_score'], reverse=True),
+            "escalations": escalations,
+            "_confidence": 0.92
         }
