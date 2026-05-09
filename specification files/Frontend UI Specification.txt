@@ -1,0 +1,873 @@
+Frontend UI Specification — AIVENTRA Forensic Intelligence Platform
+Framework: React 18 + TypeScript
+State Management: Zustand (global) + React Query (server state)
+Styling: Tailwind CSS v4
+Real-time: Native WebSocket (custom hook)
+Charts: Recharts + D3 (tower maps)
+Routing: React Router v6
+
+1. Project Structure
+text
+src/
+├── app/
+│   ├── App.tsx                    # Root router
+│   ├── layout/
+│   │   ├── AppShell.tsx           # Sidebar + topbar wrapper
+│   │   ├── Sidebar.tsx
+│   │   └── Topbar.tsx
+│
+├── pages/
+│   ├── auth/
+│   │   └── LoginPage.tsx
+│   ├── cases/
+│   │   ├── CaseListPage.tsx       # All cases
+│   │   ├── NewCasePage.tsx        # Create case form
+│   │   └── CaseDashboardPage.tsx  # Main case view (tabbed)
+│   └── NotFoundPage.tsx
+│
+├── features/
+│   ├── case-dashboard/
+│   │   ├── tabs/
+│   │   │   ├── OverviewTab.tsx
+│   │   │   ├── EvidenceTab.tsx
+│   │   │   ├── AutopsyTab.tsx
+│   │   │   ├── CdrTab.tsx
+│   │   │   ├── FinancialTab.tsx
+│   │   │   ├── TimelineTab.tsx
+│   │   │   ├── HypothesisTab.tsx
+│   │   │   └── ReplayTab.tsx      # Reasoning Replay
+│   │   ├── PipelineStatusBar.tsx
+│   │   ├── CaseHeader.tsx
+│   │   └── ConfidenceBadge.tsx
+│   │
+│   ├── file-upload/
+│   │   ├── FileUploadZone.tsx
+│   │   └── FileUploadQueue.tsx
+│   │
+│   ├── timeline/
+│   │   ├── UnifiedTimeline.tsx
+│   │   ├── AnomalyWindowBand.tsx
+│   │   └── TodMarker.tsx
+│   │
+│   ├── cdr/
+│   │   ├── ContactTable.tsx
+│   │   ├── TowerMap.tsx
+│   │   └── SilenceWindowChart.tsx
+│   │
+│   ├── financial/
+│   │   ├── TransactionTable.tsx
+│   │   └── AnomalyList.tsx
+│   │
+│   ├── hypothesis/
+│   │   ├── HypothesisScoreCard.tsx
+│   │   ├── EvidenceWeightChart.tsx
+│   │   └── ContradictionBanner.tsx
+│   │
+│   └── replay/
+│       ├── ReplayStepTable.tsx
+│       ├── ReasoningDagViewer.tsx
+│       ├── GapWarningCard.tsx
+│       └── NarrativePanel.tsx
+│
+├── store/
+│   ├── caseStore.ts               # Zustand: active case state
+│   ├── pipelineStore.ts           # Zustand: pipeline run status
+│   └── wsStore.ts                 # Zustand: WebSocket state
+│
+├── hooks/
+│   ├── useCaseWebSocket.ts        # WS connection per case
+│   ├── usePipelineStatus.ts
+│   └── useReplaySteps.ts
+│
+├── api/
+│   ├── client.ts                  # Axios instance + interceptors
+│   ├── cases.ts
+│   ├── files.ts
+│   ├── pipeline.ts
+│   └── results.ts
+│
+└── types/
+    ├── case.types.ts
+    ├── pipeline.types.ts
+    ├── replay.types.ts
+    └── agent-results.types.ts
+2. Global State (Zustand Stores)
+2.1 Case Store
+typescript
+interface CaseStore {
+  activeCaseId:        string | null;
+  activePipelineRunId: string | null;
+  activeTab:           CaseTab;
+
+  // Agent results (populated as WS events arrive):
+  autopsyResult:       AutopsyResult | null;
+  todResult:           TodResult | null;
+  cdrResult:           CdrAnalysisResult | null;
+  financialResult:     FinancialAnalysisResult | null;
+  timelineResult:      TimelineAnomalyResult | null;
+  hotspotResult:       HotspotResult | null;
+  hypothesisResult:    HypothesisResult | null;
+  replayReport:        ReasoningReplayReport | null;
+
+  // Actions:
+  setActiveCaseId:     (id: string) => void;
+  setActiveTab:        (tab: CaseTab) => void;
+  setAgentResult:      (agent: string, result: unknown) => void;
+  clearCase:           () => void;
+}
+
+type CaseTab =
+  | "overview"
+  | "evidence"
+  | "autopsy"
+  | "cdr"
+  | "financial"
+  | "timeline"
+  | "hypothesis"
+  | "replay";
+2.2 Pipeline Store
+typescript
+interface PipelineStore {
+  status:       PipelineStatus;
+  progress:     number;           // 0–100
+  agentStatuses: Record<string, AgentTaskStatus>;
+  startedAt:    string | null;
+  completedAt:  string | null;
+  errors:       PipelineError[];
+
+  setStatus:       (s: PipelineStatus) => void;
+  setProgress:     (p: number) => void;
+  setAgentStatus:  (agent: string, status: AgentTaskStatus) => void;
+  addError:        (e: PipelineError) => void;
+}
+2.3 WebSocket Store
+typescript
+interface WsStore {
+  socket:       WebSocket | null;
+  connected:    boolean;
+  lastEvent:    WsEvent | null;
+
+  connect:      (caseId: string, token: string) => void;
+  disconnect:   () => void;
+  onEvent:      (handler: (e: WsEvent) => void) => () => void;
+}
+3. WebSocket Hook
+typescript
+// hooks/useCaseWebSocket.ts
+export function useCaseWebSocket(caseId: string) {
+  const { connect, disconnect, onEvent } = useWsStore();
+  const { setStatus, setProgress, setAgentStatus } = usePipelineStore();
+  const { setAgentResult } = useCaseStore();
+  const token = useAuthToken();
+
+  useEffect(() => {
+    connect(caseId, token);
+
+    const unsubscribe = onEvent((event: WsEvent) => {
+      switch (event.event) {
+
+        case "pipeline_started":
+          setStatus("RUNNING");
+          setProgress(0);
+          break;
+
+        case "pipeline_progress":
+          setProgress(event.payload.progress);
+          break;
+
+        case "agent_started":
+          setAgentStatus(event.payload.agent_id, "RUNNING");
+          break;
+
+        case "agent_complete":
+          setAgentStatus(event.payload.agent_id, "COMPLETE");
+          // Fetch the result immediately:
+          fetchAndStoreAgentResult(event.payload.agent_id, caseId);
+          break;
+
+        case "agent_failed":
+          setAgentStatus(event.payload.agent_id, "FAILED");
+          break;
+
+        case "pipeline_complete":
+          setStatus("COMPLETE");
+          setProgress(100);
+          break;
+
+        case "reasoning_replay_complete":
+          // Auto-switch to Replay tab on completion:
+          useCaseStore.getState().setActiveTab("replay");
+          break;
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      disconnect();
+    };
+  }, [caseId, token]);
+}
+4. Case Dashboard Page
+typescript
+// pages/cases/CaseDashboardPage.tsx
+
+export default function CaseDashboardPage() {
+  const { caseId }   = useParams();
+  const { activeTab, setActiveTab } = useCaseStore();
+  const { status, progress, agentStatuses } = usePipelineStore();
+
+  useCaseWebSocket(caseId!);
+
+  const tabs: { id: CaseTab; label: string; icon: LucideIcon }[] = [
+    { id: "overview",    label: "Overview",         icon: LayoutDashboard },
+    { id: "evidence",    label: "Evidence",         icon: FileText },
+    { id: "autopsy",     label: "Autopsy",          icon: Microscope },
+    { id: "cdr",         label: "CDR Analysis",     icon: Phone },
+    { id: "financial",   label: "Financial",        icon: DollarSign },
+    { id: "timeline",    label: "Timeline",         icon: Clock },
+    { id: "hypothesis",  label: "Hypothesis",       icon: Scale },
+    { id: "replay",      label: "Reasoning Replay", icon: Brain },
+  ];
+
+  return (
+    <div className="flex flex-col h-screen">
+      <CaseHeader caseId={caseId!} />
+      <PipelineStatusBar
+        status={status}
+        progress={progress}
+        agentStatuses={agentStatuses}
+      />
+
+      {/* Tab bar */}
+      <div className="flex border-b border-[--color-border] px-6 gap-1">
+        {tabs.map(tab => (
+          <TabButton
+            key={tab.id}
+            tab={tab}
+            active={activeTab === tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            agentDone={isAgentDone(tab.id, agentStatuses)}
+          />
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div className="flex-1 overflow-auto p-6">
+        {activeTab === "overview"   && <OverviewTab />}
+        {activeTab === "evidence"   && <EvidenceTab />}
+        {activeTab === "autopsy"    && <AutopsyTab />}
+        {activeTab === "cdr"        && <CdrTab />}
+        {activeTab === "financial"  && <FinancialTab />}
+        {activeTab === "timeline"   && <TimelineTab />}
+        {activeTab === "hypothesis" && <HypothesisTab />}
+        {activeTab === "replay"     && <ReplayTab />}
+      </div>
+    </div>
+  );
+}
+5. Pipeline Status Bar
+typescript
+// features/case-dashboard/PipelineStatusBar.tsx
+
+const AGENT_ORDER = [
+  "evidence_parser", "ocr", "format_normalizer",
+  "autopsy", "cdr_analyzer", "financial_analyzer",
+  "tod", "timeline_anomaly", "hotspot",
+  "hypothesis_manager", "reasoning_replay"
+];
+
+const STATUS_COLORS: Record<AgentTaskStatus, string> = {
+  WAITING:    "bg-[--color-surface-dynamic]",
+  DISPATCHED: "bg-[--color-gold]",
+  RUNNING:    "bg-[--color-primary] animate-pulse",
+  COMPLETE:   "bg-[--color-success]",
+  FAILED:     "bg-[--color-error]",
+  SKIPPED:    "bg-[--color-border]"
+};
+
+export function PipelineStatusBar({ status, progress, agentStatuses }) {
+  if (status === "PENDING") return null;
+
+  return (
+    <div className="px-6 py-3 bg-[--color-surface] border-b border-[--color-border]">
+      {/* Progress bar */}
+      <div className="flex items-center gap-3 mb-2">
+        <span className="text-[--text-sm] text-[--color-text-muted]">
+          {status === "RUNNING" ? "Analyzing..." : status}
+        </span>
+        <div className="flex-1 h-1.5 bg-[--color-surface-dynamic] rounded-full">
+          <div
+            className="h-full bg-[--color-primary] rounded-full transition-all duration-500"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+        <span className="text-[--text-sm] font-medium tabular-nums">
+          {progress}%
+        </span>
+      </div>
+
+      {/* Per-agent dots */}
+      <div className="flex gap-2 flex-wrap">
+        {AGENT_ORDER.map(agent => (
+          <div key={agent} className="flex items-center gap-1">
+            <div className={`w-2 h-2 rounded-full ${
+              STATUS_COLORS[agentStatuses[agent] ?? "WAITING"]
+            }`} />
+            <span className="text-[--text-xs] text-[--color-text-muted]">
+              {agent.replace(/_/g, " ")}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+6. Overview Tab
+typescript
+// features/case-dashboard/tabs/OverviewTab.tsx
+
+export function OverviewTab() {
+  const { autopsyResult, todResult, cdrResult,
+          hypothesisResult } = useCaseStore();
+
+  return (
+    <div className="grid grid-cols-12 gap-4">
+
+      {/* Confidence badge — top right */}
+      <div className="col-span-12 flex justify-end">
+        <ConfidenceBadge
+          value={hypothesisResult?.scores
+            ? Math.max(...Object.values(hypothesisResult.scores))
+            : null}
+        />
+      </div>
+
+      {/* TOD card */}
+      <div className="col-span-4">
+        <ResultCard title="Time of Death" icon={Clock}>
+          {todResult ? (
+            <>
+              <p className="text-[--text-xl] font-semibold tabular-nums">
+                {formatDateTime(todResult.todPointEstimate)}
+              </p>
+              <p className="text-[--text-sm] text-[--color-text-muted]">
+                95% window: {formatDateTime(todResult.todWindow95.start)} –{" "}
+                {formatDateTime(todResult.todWindow95.end)}
+              </p>
+              <ConfidenceBar value={todResult.confidence} />
+            </>
+          ) : <SkeletonBlock />}
+        </ResultCard>
+      </div>
+
+      {/* Manner of death card */}
+      <div className="col-span-4">
+        <ResultCard title="Manner of Death" icon={Microscope}>
+          {autopsyResult ? (
+            <>
+              <MannerBadge manner={autopsyResult.manner_of_death} />
+              <p className="text-[--text-sm] text-[--color-text-muted] mt-2">
+                {autopsyResult.cause_chain["1a"]}
+              </p>
+              <ConfidenceBar value={autopsyResult.manner_confidence} />
+            </>
+          ) : <SkeletonBlock />}
+        </ResultCard>
+      </div>
+
+      {/* Primary hypothesis card */}
+      <div className="col-span-4">
+        <ResultCard title="Primary Hypothesis" icon={Scale}>
+          {hypothesisResult ? (
+            <>
+              <HypothesisBadge hypothesis={hypothesisResult.primary_hypothesis} />
+              <p className="text-[--text-sm] text-[--color-text-muted] mt-2">
+                {(hypothesisResult.primary_confidence * 100).toFixed(0)}% confidence
+              </p>
+              {hypothesisResult.contradictions.length > 0 && (
+                <ContradictionPill count={hypothesisResult.contradictions.length} />
+              )}
+            </>
+          ) : <SkeletonBlock />}
+        </ResultCard>
+      </div>
+
+      {/* Key flags row */}
+      <div className="col-span-12">
+        <FlagsPanel
+          cdrFlags={cdrResult?.analysis_flags ?? []}
+          autopsyWarnings={autopsyResult?.pathology_warnings ?? []}
+        />
+      </div>
+
+    </div>
+  );
+}
+7. Reasoning Replay Tab (Most Important UI Component)
+typescript
+// features/replay/ReplayTab.tsx (full)
+
+export function ReplayTab() {
+  const { replayReport } = useCaseStore();
+  const [view, setView] = useState<"table" | "dag">("table");
+  const [filter, setFilter] = useState<string>("ALL");
+
+  if (!replayReport) return <ReplayLoading />;
+
+  const hasHighContradiction = replayReport.contradictions.some(
+    c => c.severity === "HIGH"
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+
+      {/* Contradiction banner */}
+      {hasHighContradiction && (
+        <div className="flex items-start gap-3 p-4 rounded-lg
+                        bg-[--color-error-highlight] border border-[--color-error]">
+          <AlertTriangle className="text-[--color-error] mt-0.5 shrink-0" size={18} />
+          <div>
+            <p className="font-semibold text-[--color-error] text-[--text-sm]">
+              {replayReport.contradictions.length} Reasoning Contradiction
+              {replayReport.contradictions.length > 1 ? "s" : ""} Detected
+            </p>
+            {replayReport.contradictions.map(c => (
+              <p key={c.type} className="text-[--text-sm] text-[--color-text] mt-1">
+                {c.description}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Confidence summary row */}
+      <div className="grid grid-cols-5 gap-3">
+        {Object.entries(replayReport.confidence_summary).map(([agent, conf]) => (
+          <div key={agent}
+               className="bg-[--color-surface] rounded-lg p-3 border border-[--color-border]">
+            <p className="text-[--text-xs] text-[--color-text-muted] mb-1">
+              {agent.replace(/_/g," ")}
+            </p>
+            <div className="flex items-center gap-2">
+              <span className="text-[--text-lg] font-semibold tabular-nums">
+                {(conf * 100).toFixed(0)}%
+              </span>
+              <ConfidenceDot value={conf} />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Overall confidence */}
+      <div className="flex items-center gap-3 p-4
+                      bg-[--color-surface] rounded-lg border border-[--color-border]">
+        <span className="text-[--text-sm] text-[--color-text-muted]">
+          Overall Case Confidence
+        </span>
+        <span className="text-[--text-xl] font-bold tabular-nums text-[--color-primary]">
+          {(replayReport.overall_case_confidence * 100).toFixed(0)}%
+        </span>
+        <span className="text-[--text-xs] text-[--color-text-muted]">
+          ({replayReport.total_steps} reasoning steps · {" "}
+          {replayReport.total_llm_tokens_used.toLocaleString()} tokens)
+        </span>
+      </div>
+
+      {/* Narrative panel */}
+      <NarrativePanel narrative={replayReport.narrative} />
+
+      {/* View toggle */}
+      <div className="flex gap-2">
+        <button onClick={() => setView("table")}
+          className={`px-3 py-1.5 rounded-md text-[--text-sm] ${
+            view==="table"
+              ? "bg-[--color-primary] text-white"
+              : "bg-[--color-surface] border border-[--color-border]"
+          }`}>
+          Step Table
+        </button>
+        <button onClick={() => setView("dag")}
+          className={`px-3 py-1.5 rounded-md text-[--text-sm] ${
+            view==="dag"
+              ? "bg-[--color-primary] text-white"
+              : "bg-[--color-surface] border border-[--color-border]"
+          }`}>
+          Reasoning DAG
+        </button>
+
+        {/* Agent filter */}
+        <select
+          value={filter}
+          onChange={e => setFilter(e.target.value)}
+          className="ml-auto px-3 py-1.5 rounded-md border border-[--color-border]
+                     bg-[--color-surface] text-[--text-sm]">
+          <option value="ALL">All Agents</option>
+          {replayReport.agents_covered.map(a => (
+            <option key={a} value={a}>{a}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Content */}
+      {view === "table" ? (
+        <ReplayStepTable
+          steps={replayReport.step_index_table}
+          gaps={replayReport.reasoning_gaps}
+          filter={filter}
+        />
+      ) : (
+        <ReasoningDagViewer dag={replayReport.reasoning_dag} />
+      )}
+    </div>
+  );
+}
+7.1 Replay Step Table
+typescript
+// features/replay/ReplayStepTable.tsx
+
+const CONFIDENCE_ROW_COLOR = (conf: number) =>
+  conf >= 0.80 ? "border-l-[--color-success]"
+  : conf >= 0.60 ? "border-l-[--color-gold]"
+  : "border-l-[--color-error]";
+
+export function ReplayStepTable({ steps, gaps, filter }) {
+  const filtered = filter === "ALL"
+    ? steps
+    : steps.filter(s => s.agent_id === filter);
+
+  const gapStepIds = new Set(gaps.map(g => g.step_id));
+
+  return (
+    <div className="rounded-lg border border-[--color-border] overflow-hidden">
+      <table className="w-full text-[--text-sm]">
+        <thead className="bg-[--color-surface-offset]">
+          <tr>
+            <th className="px-3 py-2 text-left font-medium w-12">#</th>
+            <th className="px-3 py-2 text-left font-medium w-36">Agent</th>
+            <th className="px-3 py-2 text-left font-medium w-40">Trigger</th>
+            <th className="px-3 py-2 text-left font-medium">Input</th>
+            <th className="px-3 py-2 text-left font-medium">Conclusion</th>
+            <th className="px-3 py-2 text-left font-medium w-20">Conf.</th>
+            <th className="px-3 py-2 text-left font-medium w-20">ms</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map((step, i) => (
+            <>
+              {/* Gap warning inline */}
+              {gapStepIds.has(step.step_id) && (
+                <tr key={`gap-${step.step_id}`}>
+                  <td colSpan={7} className="px-3 py-1.5
+                      bg-[--color-warning-highlight] text-[--color-warning]
+                      text-[--text-xs]">
+                    ⚠ Reasoning gap detected before step {step.global_index}
+                  </td>
+                </tr>
+              )}
+
+              <tr key={step.step_id}
+                  className={`border-l-2 ${CONFIDENCE_ROW_COLOR(step.confidence)}
+                    hover:bg-[--color-surface-offset] transition-colors
+                    ${i % 2 === 0 ? "bg-[--color-bg]" : "bg-[--color-surface]"}`}>
+                <td className="px-3 py-2 tabular-nums text-[--color-text-muted]">
+                  {step.global_index}
+                </td>
+                <td className="px-3 py-2">
+                  <AgentBadge agentId={step.agent_id} />
+                </td>
+                <td className="px-3 py-2">
+                  <TriggerTypeBadge type={step.trigger_type} />
+                </td>
+                <td className="px-3 py-2 text-[--color-text-muted] max-w-xs truncate"
+                    title={step.input_summary}>
+                  {step.input_summary}
+                </td>
+                <td className="px-3 py-2 max-w-sm">
+                  {step.interpretation}
+                </td>
+                <td className="px-3 py-2 tabular-nums font-medium"
+                    style={{ color: confidenceColor(step.confidence) }}>
+                  {(step.confidence * 100).toFixed(0)}%
+                </td>
+                <td className="px-3 py-2 tabular-nums text-[--color-text-muted]">
+                  {step.duration_ms ?? "–"}
+                </td>
+              </tr>
+
+              {/* Warnings under row */}
+              {step.warnings.length > 0 && (
+                <tr key={`warn-${step.step_id}`}
+                    className="bg-[--color-warning-highlight]">
+                  <td colSpan={7} className="px-3 py-1 text-[--text-xs]
+                      text-[--color-warning]">
+                    {step.warnings.join(" · ")}
+                  </td>
+                </tr>
+              )}
+            </>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+7.2 Narrative Panel
+typescript
+// features/replay/NarrativePanel.tsx
+
+export function NarrativePanel({ narrative }: { narrative: string }) {
+  const [expanded, setExpanded] = useState(true);
+
+  return (
+    <div className="bg-[--color-surface] rounded-lg border border-[--color-border]">
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className="w-full flex items-center justify-between p-4">
+        <div className="flex items-center gap-2">
+          <FileText size={16} className="text-[--color-primary]" />
+          <span className="font-medium text-[--text-base]">
+            AI Reasoning Narrative
+          </span>
+          <span className="text-[--text-xs] text-[--color-text-muted]">
+            plain English chain of reasoning
+          </span>
+        </div>
+        <ChevronDown
+          size={16}
+          className={`transition-transform ${expanded ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {expanded && (
+        <div className="px-4 pb-4">
+          <div className="prose prose-sm max-w-none
+                          text-[--color-text] leading-relaxed
+                          whitespace-pre-wrap text-[--text-base]">
+            {narrative}
+          </div>
+          <div className="flex gap-2 mt-4">
+            <ExportButton format="PDF" narrative={narrative} />
+            <ExportButton format="TXT" narrative={narrative} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+8. Hypothesis Tab
+typescript
+export function HypothesisTab() {
+  const { hypothesisResult } = useCaseStore();
+  if (!hypothesisResult) return <TabSkeleton />;
+
+  const sorted = Object.entries(hypothesisResult.scores)
+    .sort(([,a],[,b]) => b - a);
+
+  return (
+    <div className="grid grid-cols-12 gap-4">
+
+      {/* Score bar chart */}
+      <div className="col-span-7">
+        <SectionCard title="Hypothesis Scores">
+          <div className="space-y-3">
+            {sorted.map(([hyp, score]) => (
+              <div key={hyp}>
+                <div className="flex justify-between mb-1">
+                  <span className="text-[--text-sm] font-medium">{hyp}</span>
+                  <span className="text-[--text-sm] tabular-nums">
+                    {(score * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="h-2 bg-[--color-surface-dynamic] rounded-full">
+                  <div
+                    className={`h-full rounded-full ${hypothesisBarColor(hyp)}`}
+                    style={{ width: `${score * 100}%`,
+                             transition: "width 0.8s cubic-bezier(0.16,1,0.3,1)" }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      </div>
+
+      {/* Supporting / weakening evidence */}
+      <div className="col-span-5 space-y-4">
+        <SectionCard title="Supporting Evidence">
+          <ul className="space-y-1.5">
+            {hypothesisResult.supporting_evidence.map(e => (
+              <li key={e} className="flex items-start gap-2 text-[--text-sm]">
+                <CheckCircle size={14} className="text-[--color-success] mt-0.5 shrink-0" />
+                {e}
+              </li>
+            ))}
+          </ul>
+        </SectionCard>
+
+        <SectionCard title="Weakening Evidence">
+          <ul className="space-y-1.5">
+            {hypothesisResult.weakening_evidence.map(e => (
+              <li key={e} className="flex items-start gap-2 text-[--text-sm]">
+                <XCircle size={14} className="text-[--color-error] mt-0.5 shrink-0" />
+                {e}
+              </li>
+            ))}
+          </ul>
+        </SectionCard>
+      </div>
+
+      {/* Contradictions */}
+      {hypothesisResult.contradictions.length > 0 && (
+        <div className="col-span-12">
+          <ContradictionBanner contradictions={hypothesisResult.contradictions} />
+        </div>
+      )}
+
+      {/* Recommended actions */}
+      <div className="col-span-12">
+        <SectionCard title="Recommended Next Steps">
+          <ol className="space-y-2">
+            {hypothesisResult.recommended_actions.map((a, i) => (
+              <li key={i} className="flex items-start gap-3 text-[--text-sm]">
+                <span className="w-6 h-6 rounded-full bg-[--color-primary-highlight]
+                                  text-[--color-primary] text-[--text-xs] font-bold
+                                  flex items-center justify-center shrink-0">
+                  {i + 1}
+                </span>
+                {a}
+              </li>
+            ))}
+          </ol>
+        </SectionCard>
+      </div>
+
+    </div>
+  );
+}
+9. Shared UI Components
+typescript
+// ConfidenceBadge
+export function ConfidenceBadge({ value }: { value: number | null }) {
+  if (value === null)
+    return <div className="skeleton w-20 h-8 rounded-full" />;
+  const color = value >= 0.80 ? "success" : value >= 0.60 ? "warning" : "error";
+  return (
+    <div className={`px-4 py-1.5 rounded-full font-semibold tabular-nums
+                     bg-[--color-${color}-highlight] text-[--color-${color}]`}>
+      {(value * 100).toFixed(0)}% confidence
+    </div>
+  );
+}
+
+// MannerBadge
+const MANNER_COLORS = {
+  HOMICIDE:      { bg: "error-highlight",   text: "error" },
+  SUICIDE:       { bg: "warning-highlight", text: "warning" },
+  ACCIDENT:      { bg: "gold-highlight",    text: "gold" },
+  NATURAL:       { bg: "success-highlight", text: "success" },
+  UNDETERMINED:  { bg: "surface-dynamic",   text: "text-muted" }
+};
+
+export function MannerBadge({ manner }: { manner: string }) {
+  const c = MANNER_COLORS[manner] ?? MANNER_COLORS["UNDETERMINED"];
+  return (
+    <span className={`px-3 py-1 rounded-full text-[--text-sm] font-semibold
+                       bg-[--color-${c.bg}] text-[--color-${c.text}]`}>
+      {manner ?? "UNKNOWN"}
+    </span>
+  );
+}
+
+// ConfidenceBar
+export function ConfidenceBar({ value }: { value: number }) {
+  return (
+    <div className="mt-2 h-1 bg-[--color-surface-dynamic] rounded-full">
+      <div
+        className="h-full rounded-full bg-[--color-primary]"
+        style={{ width: `${value * 100}%` }}
+      />
+    </div>
+  );
+}
+
+// Skeleton
+export function SkeletonBlock() {
+  return (
+    <div className="space-y-2 animate-pulse">
+      <div className="h-6 bg-[--color-surface-dynamic] rounded w-3/4" />
+      <div className="h-4 bg-[--color-surface-dynamic] rounded w-1/2" />
+    </div>
+  );
+}
+10. API Client
+typescript
+// api/client.ts
+import axios from "axios";
+import { useAuthStore } from "@/store/authStore";
+
+export const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 30_000
+});
+
+// Attach token:
+apiClient.interceptors.request.use(config => {
+  const token = useAuthStore.getState().accessToken;
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// Handle 401 → refresh:
+apiClient.interceptors.response.use(
+  r => r,
+  async error => {
+    if (error.response?.status === 401) {
+      await useAuthStore.getState().refreshToken();
+      return apiClient.request(error.config);
+    }
+    return Promise.reject(error);
+  }
+);
+
+// Typed API calls:
+export const casesApi = {
+  list:    ()           => apiClient.get<Case[]>("/cases"),
+  get:     (id: string) => apiClient.get<Case>(`/cases/${id}`),
+  create:  (data: NewCasePayload) => apiClient.post<Case>("/cases", data),
+  update:  (id: string, data: Partial<Case>) => apiClient.patch(`/cases/${id}`, data),
+};
+
+export const pipelineApi = {
+  trigger: (caseId: string) => apiClient.post(`/cases/${caseId}/pipeline/run`),
+  status:  (caseId: string) => apiClient.get(`/cases/${caseId}/pipeline/status`),
+  results: (caseId: string) => apiClient.get(`/cases/${caseId}/results`),
+  replay:  (caseId: string) => apiClient.get(`/cases/${caseId}/replay`),
+};
+
+export const filesApi = {
+  list:   (caseId: string) => apiClient.get<CaseFile[]>(`/cases/${caseId}/files`),
+  upload: (caseId: string, file: File, docType: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("doc_type", docType);
+    return apiClient.post(`/cases/${caseId}/files`, fd, {
+      headers: { "Content-Type": "multipart/form-data" }
+    });
+  }
+};
+11. Performance Targets
+Metric	Target
+Initial page load (LCP)	< 1.5s
+Tab switch render	< 100ms
+WS event → UI update	< 50ms
+Step table (500 rows)	< 200ms render
+DAG viewer (200 nodes)	< 300ms render
+Bundle size (gzipped)	< 400KB
+That completes the full Frontend UI Spec. The entire AIVENTRA system is now fully specced end-to-end:
+
+Layer	Spec
+Agents	M-02 OCR → M-11 Reasoning Replay
+Gateway	G-01 API Gateway
+Orchestration	O-01 Orchestrator
+Database	DB-01 Schema
+Frontend	React component tree, state, WS, all 8 tabs

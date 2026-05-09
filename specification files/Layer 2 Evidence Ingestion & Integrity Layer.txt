@@ -1,0 +1,1571 @@
+AIVENTRA — Layer 2: Evidence Ingestion & Integrity Layer
+Full Technical Specification
+Layer: 2 of 4 | Domain: Evidence Upload, Storage, Encryption, Integrity Verification, Custody Chain, PII Vault Bootstrap
+Runtime: FastAPI (Python 3.12) + MinIO + asyncpg | Port: 8000 (shared API process, separate router)
+
+PART I — LAYER PURPOSE & BOUNDARIES
+Layer 2 is the evidence management spine of AIVENTRA. Every piece of forensic material — autopsy PDFs, CDR spreadsheets, call logs, location data, financial records, CCTV metadata — enters the system exclusively through this layer. Nothing reaches the agent pipeline (Layer 3) without passing through every integrity, encryption, and custody gate defined here.
+
+Five core responsibilities:
+
+Ingest & Validate — receive multipart uploads, enforce file type/size rules, reject malformed inputs
+
+Encrypt & Store — AES-256-GCM encrypt every file at rest before MinIO write; never store plaintext
+
+Integrity Chain — compute SHA-256 on upload, re-verify on every access, quarantine on tamper detection
+
+Custody Chain — immutable append-only log of every actor who touched each file
+
+PII Vault Bootstrap — after upload, trigger initial PII scan on text-extractable evidence
+
+Layer 2 does not perform any LLM calls, agent orchestration, or forensic analysis. Its only outputs are: (1) evidence metadata rows in PostgreSQL; (2) encrypted bytes in MinIO; (3) custody_log rows; (4) initial PII vault entries from text scan.
+
+Boundary contracts:
+
+Receives: authenticated HTTP multipart requests (from Layer 1 verified users)
+
+Feeds: Layer 3 agents receive evidence_file_id references, never raw bytes directly
+
+Agents call Layer 2's internal evidence_reader service to decrypt + retrieve bytes on demand
+
+PART II — INFRASTRUCTURE STACK
+2.1 Components
+text
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         LAYER 2 — RUNTIME STACK                                    │
+├───────────────────────────┬─────────────────────────────────────────────────────────┤
+│ Component                 │ Spec                                                    │
+├───────────────────────────┼─────────────────────────────────────────────────────────┤
+│ Web Framework             │ FastAPI 0.111 — shared process with Layer 1, separate   │
+│                           │ router mounted at /evidence/*                           │
+│ Object Storage            │ MinIO (self-hosted S3-compatible) — single bucket       │
+│                           │ "aiventra-evidence", versioning enabled, SSE-S3         │
+│ File Encryption           │ AES-256-GCM (PyCryptodome 3.20) — per-file unique key  │
+│                           │ wrapped with case-level KEK (Key Encryption Key)        │
+│ Key Hierarchy             │ AIVENTRA_MASTER_KEY (env) → case_kek (per case, in DB) │
+│                           │ → file_dek (per file, generated at upload time)         │
+│ Integrity                 │ hashlib.sha256 (client-side + server-side)              │
+│ Virus Scan                │ ClamAV (daemon mode, clamd socket) — async scan        │
+│ Text Extraction           │ pypdf 4.x (PDF text layer), python-docx (Word),        │
+│                           │ openpyxl (Excel), python-pptx (PPT)                    │
+│ PII Scanner               │ spaCy en_core_web_lg + custom regex patterns           │
+│ DB Access                 │ asyncpg 0.29 — shared pool from Layer 1               │
+│ Storage SDK               │ minio-py 7.2 (async wrapper)                           │
+│ Background Tasks          │ asyncio tasks for virus scan + PII pre-scan            │
+├───────────────────────────┼─────────────────────────────────────────────────────────┤
+│ Max File Size             │ 500 MB per file, 5 GB per case                         │
+│ Allowed MIME Types        │ See Section 3.3                                        │
+│ Encryption                │ AES-256-GCM, per-file DEK, unique 96-bit nonce        │
+│ Integrity Check           │ SHA-256 of plaintext, verified on every read           │
+└───────────────────────────┴─────────────────────────────────────────────────────────┘
+2.2 Storage Architecture
+text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        LAYER 2 STORAGE ARCHITECTURE                         │
+│                                                                              │
+│   Client Upload                                                              │
+│       │                                                                      │
+│       │ multipart/form-data (HTTPS — Layer 1 TLS)                           │
+│       ▼                                                                      │
+│   FastAPI /evidence/upload                                                   │
+│       │                                                                      │
+│       ├─ [Validation] ──────── MIME check, size check, magic bytes          │
+│       │                                                                      │
+│       ├─ [ClamAV Scan] ──────── async virus scan (pre-encryption)           │
+│       │                                                                      │
+│       ├─ [SHA-256] ─────────── hash plaintext bytes                         │
+│       │                                                                      │
+│       ├─ [AES-256-GCM] ──────── encrypt with file DEK                      │
+│       │                                                                      │
+│       ├─ [MinIO Write] ──────── PUT cases/{case_id}/evidence/{file_id}     │
+│       │                                                                      │
+│       ├─ [PostgreSQL] ──────── INSERT evidence_files + evidence_integrity   │
+│       │                                                                      │
+│       ├─ [Custody Log] ──────── INSERT custody_log (UPLOAD event)          │
+│       │                                                                      │
+│       └─ [PII Pre-scan] ──────── async background task                     │
+│                                                                              │
+│                                                                              │
+│   MinIO Bucket: aiventra-evidence                                           │
+│   ┌─────────────────────────────────────────────────────┐                  │
+│   │  cases/                                             │                  │
+│   │    {case_id}/                                       │                  │
+│   │      evidence/                                      │                  │
+│   │        {file_id}.enc          ← AES-GCM ciphertext │                  │
+│   │        {file_id}.enc.meta     ← nonce + tag JSON   │                  │
+│   │      reports/                                       │                  │
+│   │        report_{timestamp}.pdf                       │                  │
+│   └─────────────────────────────────────────────────────┘                  │
+└──────────────────────────────────────────────────────────────────────────────┘
+2.3 Key Hierarchy Architecture
+text
+MASTER_KEY (32 bytes, from env AIVENTRA_MASTER_KEY)
+    │
+    │ AES-256-CBC wrapping
+    ▼
+CASE_KEK (32 bytes, generated once per case)
+    stored: cases.case_kek_encrypted = AES_CBC_encrypt(case_kek, MASTER_KEY)
+    │
+    │ AES-256-GCM wrapping (key wrapping)
+    ▼
+FILE_DEK (32 bytes, generated once per file upload)
+    stored: evidence_integrity.dek_encrypted = AES_GCM_wrap(file_dek, case_kek)
+    │
+    │ AES-256-GCM encryption
+    ▼
+CIPHERTEXT (stored in MinIO as {file_id}.enc)
+
+RATIONALE:
+- MASTER_KEY compromise → re-encrypt all case_keks (1 operation per case)
+- CASE_KEK compromise → re-encrypt all file_deks for that case
+- FILE_DEK compromise → only 1 file exposed
+- Each layer isolated → blast radius minimized
+PART III — DATA MODELS (Layer 2 Owned)
+3.1 PostgreSQL — evidence_files Table
+sql
+CREATE TABLE evidence_files (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    case_id             UUID NOT NULL REFERENCES cases(id) ON DELETE RESTRICT,
+    uploaded_by         UUID NOT NULL REFERENCES users(id),
+    original_filename   TEXT NOT NULL,
+    sanitized_filename  TEXT NOT NULL,          -- safe filename, no path traversal chars
+    evidence_category   TEXT NOT NULL CHECK (evidence_category IN (
+                          'AUTOPSY_REPORT', 'CDR_RECORDS', 'LOCATION_DATA',
+                          'FINANCIAL_RECORDS', 'CCTV_FOOTAGE_METADATA',
+                          'WITNESS_STATEMENT', 'CRIME_SCENE_PHOTOS',
+                          'TOXICOLOGY_REPORT', 'DIGITAL_DEVICE_DUMP',
+                          'COURT_ORDER', 'OTHER'
+                        )),
+    mime_type           TEXT NOT NULL,
+    file_size_bytes     BIGINT NOT NULL,
+    minio_object_key    TEXT NOT NULL UNIQUE,   -- full object path in MinIO
+    sha256_plaintext    TEXT NOT NULL,          -- SHA-256 of plaintext (pre-encryption)
+    sha256_ciphertext   TEXT NOT NULL,          -- SHA-256 of ciphertext (post-encryption)
+    encryption_algo     TEXT NOT NULL DEFAULT 'AES-256-GCM',
+    description         TEXT,
+    status              TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN (
+                          'ACTIVE', 'QUARANTINED', 'ARCHIVED', 'DELETED'
+                        )),
+    quarantine_reason   TEXT,
+    virus_scan_status   TEXT NOT NULL DEFAULT 'PENDING' CHECK (virus_scan_status IN (
+                          'PENDING', 'CLEAN', 'INFECTED', 'SCAN_FAILED'
+                        )),
+    virus_scan_result   TEXT,
+    text_extractable    BOOLEAN,               -- NULL = not yet checked
+    page_count          INTEGER,               -- for PDFs
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Indexes
+CREATE INDEX idx_evidence_case_id         ON evidence_files(case_id);
+CREATE INDEX idx_evidence_case_category   ON evidence_files(case_id, evidence_category);
+CREATE INDEX idx_evidence_status          ON evidence_files(status) WHERE status = 'ACTIVE';
+CREATE INDEX idx_evidence_uploaded_by     ON evidence_files(uploaded_by);
+CREATE INDEX idx_evidence_virus_pending   ON evidence_files(virus_scan_status) WHERE virus_scan_status = 'PENDING';
+3.2 PostgreSQL — evidence_integrity Table
+sql
+CREATE TABLE evidence_integrity (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_id             UUID NOT NULL REFERENCES evidence_files(id) ON DELETE CASCADE,
+    case_id             UUID NOT NULL,
+    sha256_plaintext    TEXT NOT NULL,      -- copied from evidence_files (denormalized for integrity)
+    sha256_ciphertext   TEXT NOT NULL,
+    nonce               TEXT NOT NULL,      -- base64 of 96-bit AES-GCM nonce
+    auth_tag            TEXT NOT NULL,      -- base64 of 128-bit AES-GCM authentication tag
+    dek_encrypted       TEXT NOT NULL,      -- base64(AES-GCM-wrap(file_dek, case_kek))
+    dek_nonce           TEXT NOT NULL,      -- nonce used for DEK wrapping
+    dek_tag             TEXT NOT NULL,      -- auth tag from DEK wrapping
+    integrity_verified_at  TIMESTAMPTZ,    -- last successful integrity check time
+    integrity_fail_count   INTEGER NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- immutable after insert: no UPDATE/DELETE permitted by trigger
+CREATE TRIGGER trg_prevent_integrity_update
+  BEFORE UPDATE ON evidence_integrity
+  FOR EACH ROW EXECUTE FUNCTION prevent_modification();
+
+CREATE TRIGGER trg_prevent_integrity_delete
+  BEFORE DELETE ON evidence_integrity
+  FOR EACH ROW EXECUTE FUNCTION prevent_modification();
+
+CREATE UNIQUE INDEX idx_integrity_file_id ON evidence_integrity(file_id);
+3.3 PostgreSQL — custody_log Table
+sql
+CREATE TABLE custody_log (
+    id                  BIGSERIAL PRIMARY KEY,   -- ordered integer for chain linkage
+    file_id             UUID NOT NULL REFERENCES evidence_files(id),
+    case_id             UUID NOT NULL,
+    action              TEXT NOT NULL CHECK (action IN (
+                          'UPLOAD',           -- initial upload by investigator
+                          'INTEGRITY_VERIFY', -- hash verified (no bytes read)
+                          'AGENT_READ',       -- agent pipeline read file
+                          'INVESTIGATOR_READ',-- investigator downloaded file
+                          'ADMIN_READ',       -- admin downloaded file
+                          'QUARANTINE',       -- file quarantined (integrity failure / virus)
+                          'UNQUARANTINE',     -- file cleared by admin
+                          'METADATA_UPDATE',  -- description/category changed
+                          'REPORT_CITED',     -- file cited in generated report
+                          'EXPORT',           -- file exported for court submission
+                          'SOFT_DELETE'       -- file soft-deleted
+                        )),
+    actor_id            UUID,                    -- user UUID or NULL for system actions
+    actor_type          TEXT NOT NULL CHECK (actor_type IN ('USER', 'AGENT', 'SYSTEM')),
+    actor_role          TEXT,
+    agent_id            TEXT,                    -- e.g. "evidence_parser", "ocr"
+    current_hash        TEXT NOT NULL,           -- SHA-256 at time of this custody event
+    chain_hash          TEXT NOT NULL,           -- SHA-256(prev_chain_hash + current_hash + file_id + timestamp)
+    ip_address          INET,
+    notes               TEXT,
+    timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Immutable: no UPDATE or DELETE
+CREATE TRIGGER trg_prevent_custody_update
+  BEFORE UPDATE ON custody_log
+  FOR EACH ROW EXECUTE FUNCTION prevent_modification();
+
+CREATE TRIGGER trg_prevent_custody_delete
+  BEFORE DELETE ON custody_log
+  FOR EACH ROW EXECUTE FUNCTION prevent_modification();
+
+CREATE INDEX idx_custody_file_id    ON custody_log(file_id);
+CREATE INDEX idx_custody_case_id    ON custody_log(case_id);
+CREATE INDEX idx_custody_actor      ON custody_log(actor_id);
+CREATE INDEX idx_custody_timestamp  ON custody_log(timestamp);
+3.4 PostgreSQL — pii_vault Table
+sql
+CREATE TABLE pii_vault (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    case_id                 UUID NOT NULL REFERENCES cases(id),
+    file_id                 UUID REFERENCES evidence_files(id),  -- which file introduced this PII
+    entity_type             TEXT NOT NULL CHECK (entity_type IN (
+                              'PERSON', 'PHONE', 'EMAIL', 'ADDRESS',
+                              'AADHAAR', 'PAN', 'VEHICLE', 'ORG', 'GPE', 'DATE_SENSITIVE'
+                            )),
+    placeholder             TEXT NOT NULL,                       -- [PERSON_1], [PHONE_3], etc.
+    original_value_encrypted TEXT NOT NULL,                      -- AES-CBC encrypted real value
+    original_value_hash     TEXT NOT NULL,                       -- SHA-256(original_value) for lookup
+    first_seen_in           TEXT,                                -- "autopsy_report", "cdr", etc.
+    occurrence_count        INTEGER NOT NULL DEFAULT 1,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (case_id, original_value_hash)                        -- no duplicates per case
+);
+
+CREATE INDEX idx_pii_case_id         ON pii_vault(case_id);
+CREATE INDEX idx_pii_lookup          ON pii_vault(case_id, original_value_hash);
+CREATE INDEX idx_pii_placeholder     ON pii_vault(case_id, placeholder);
+CREATE INDEX idx_pii_entity_type     ON pii_vault(case_id, entity_type);
+3.5 Allowed MIME Types & Extensions
+python
+ALLOWED_EVIDENCE_TYPES = {
+    # PDFs
+    "application/pdf":                              [".pdf"],
+    # Word Documents
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+    "application/msword":                           [".doc"],
+    # Excel / CSV
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+    "application/vnd.ms-excel":                     [".xls"],
+    "text/csv":                                     [".csv"],
+    # Plain text
+    "text/plain":                                   [".txt", ".log"],
+    # Images (crime scene, medical images)
+    "image/jpeg":                                   [".jpg", ".jpeg"],
+    "image/png":                                    [".png"],
+    "image/tiff":                                   [".tiff", ".tif"],
+    # JSON (exported device data, app logs)
+    "application/json":                             [".json"],
+    # XML
+    "application/xml":                              [".xml"],
+    "text/xml":                                     [".xml"],
+}
+
+MAX_FILE_SIZE_BYTES     = 500 * 1024 * 1024   # 500 MB
+MAX_CASE_STORAGE_BYTES  = 5 * 1024 * 1024 * 1024  # 5 GB per case
+
+MAGIC_BYTES_MAP = {
+    b"\x25\x50\x44\x46":                   "application/pdf",        # %PDF
+    b"\x50\x4B\x03\x04":                   "application/zip_based",  # ZIP (docx, xlsx, pptx)
+    b"\xD0\xCF\x11\xE0":                   "application/msoffice",   # Old Office formats
+    b"\xFF\xD8\xFF":                        "image/jpeg",
+    b"\x89\x50\x4E\x47\x0D\x0A\x1A\x0A":  "image/png",
+    b"\x49\x49\x2A\x00":                   "image/tiff",             # little-endian TIFF
+    b"\x4D\x4D\x00\x2A":                   "image/tiff",             # big-endian TIFF
+}
+3.6 PostgreSQL — cases Table (Layer 2 relevant columns)
+sql
+-- Additional columns Layer 2 uses in the existing cases table:
+ALTER TABLE cases ADD COLUMN IF NOT EXISTS
+    case_kek_encrypted  TEXT,            -- AES-CBC(case_kek, MASTER_KEY) — set on first evidence upload
+    case_kek_nonce      TEXT,            -- IV for KEK encryption
+    total_evidence_size_bytes BIGINT NOT NULL DEFAULT 0,
+    evidence_count      INTEGER NOT NULL DEFAULT 0;
+PART IV — COMPLETE EVIDENCE UPLOAD WORKFLOW
+4.1 POST /evidence/upload — Full Detail
+text
+TRIGGER: POST /evidence/upload
+AUTH:    Bearer token (Layer 1 validated — LEAD_INVESTIGATOR or ADMIN)
+CONTENT-TYPE: multipart/form-data
+
+FORM FIELDS:
+  file:               <binary file data>         ← required
+  case_id:            UUID string                ← required
+  evidence_category:  string (enum)              ← required
+  description:        string (optional, max 500 chars)
+  client_sha256:      hex string (64 chars)      ← required (client pre-computes)
+
+═══════════════════════════════════════════════════════════════
+PHASE 1: LAYER 1 GATE (runs before this handler)
+═══════════════════════════════════════════════════════════════
+
+Already validated by AuthMiddleware:
+  ✅ JWT valid, not expired, not blacklisted
+  ✅ User is ACTIVE, not locked
+  ✅ Role in [ADMIN, LEAD_INVESTIGATOR]
+
+Rate limit (RateLimitMiddleware):
+  evidence_upload tier: 20 uploads per hour per user
+  If exceeded → 429 before reaching this handler
+
+═══════════════════════════════════════════════════════════════
+PHASE 2: INPUT VALIDATION
+═══════════════════════════════════════════════════════════════
+
+2.1  Field Presence Check:
+     Required: file, case_id, evidence_category, client_sha256
+     Missing any → 422 MISSING_REQUIRED_FIELD
+
+2.2  Case ID validation:
+     case_row = await db.fetchrow(
+         "SELECT id, status, total_evidence_size_bytes, case_kek_encrypted
+          FROM cases WHERE id = $1",
+         UUID(case_id)
+     )
+     If None → 404 CASE_NOT_FOUND
+     If case_row.status in ['ARCHIVED', 'DELETED'] → 403 CASE_NOT_MODIFIABLE
+
+2.3  Case Access Check (Layer 1 RBAC):
+     await require_case_access(user, case_id, db)
+     → Checks user in assigned_investigators OR role=ADMIN
+
+2.4  Evidence category validation:
+     If evidence_category not in ALLOWED_EVIDENCE_CATEGORIES → 422
+
+2.5  client_sha256 format:
+     If not re.match(r'^[0-9a-f]{64}$', client_sha256) → 422 INVALID_HASH_FORMAT
+
+═══════════════════════════════════════════════════════════════
+PHASE 3: FILE READING & STREAMING
+═══════════════════════════════════════════════════════════════
+
+3.1  Stream file into memory (up to MAX_FILE_SIZE_BYTES):
+     chunks = []
+     total_bytes = 0
+     async for chunk in file.stream():
+         total_bytes += len(chunk)
+         if total_bytes > MAX_FILE_SIZE_BYTES:
+             raise HTTPException(413, "FILE_TOO_LARGE",
+                                 detail=f"Max {MAX_FILE_SIZE_BYTES // 1024 // 1024}MB per file")
+         chunks.append(chunk)
+     file_bytes = b"".join(chunks)
+
+3.2  Empty file check:
+     if len(file_bytes) == 0 → 400 EMPTY_FILE
+
+3.3  Case storage quota check:
+     new_total = case_row.total_evidence_size_bytes + len(file_bytes)
+     if new_total > MAX_CASE_STORAGE_BYTES → 413 CASE_STORAGE_QUOTA_EXCEEDED
+
+═══════════════════════════════════════════════════════════════
+PHASE 4: MAGIC BYTES VALIDATION (MIME Verification)
+═══════════════════════════════════════════════════════════════
+
+4.1  Claimed MIME type from upload headers:
+     claimed_mime = file.content_type or "application/octet-stream"
+
+4.2  Magic bytes detection (first 16 bytes):
+     header_bytes = file_bytes[:16]
+     detected_type = None
+     for magic_seq, mime_type in MAGIC_BYTES_MAP.items():
+         if header_bytes.startswith(magic_seq):
+             detected_type = mime_type
+             break
+
+4.3  Validate detected vs allowed:
+     If detected_type is None:
+         → For .csv and .txt: check all bytes are valid UTF-8 or ASCII
+           file_bytes.decode("utf-8", errors="strict")
+           If fails → 415 UNSUPPORTED_MEDIA_TYPE
+         → For JSON: json.loads(file_bytes) — if fails → 415
+         → Otherwise: 415 UNSUPPORTED_MEDIA_TYPE
+
+     If detected_type not in ALLOWED_EVIDENCE_TYPES → 415 UNSUPPORTED_MEDIA_TYPE
+
+4.4  Extension consistency check:
+     file_extension = Path(file.filename).suffix.lower()
+     expected_extensions = ALLOWED_EVIDENCE_TYPES.get(claimed_mime, [])
+     If file_extension not in expected_extensions:
+         → Log warning (not block — MIME header can be wrong, magic bytes win)
+
+4.5  Filename sanitization:
+     original_filename = file.filename
+     sanitized_filename = re.sub(r'[^\w\-_\.]', '_', Path(file.filename).name)
+     sanitized_filename = sanitized_filename[:255]  # max filename length
+     If sanitized_filename != original_filename:
+         log warning: FILENAME_SANITIZED
+
+═══════════════════════════════════════════════════════════════
+PHASE 5: CLIENT HASH VERIFICATION
+═══════════════════════════════════════════════════════════════
+
+5.1  Compute server-side SHA-256 of received bytes:
+     server_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+5.2  Compare with client-provided hash:
+     if server_sha256 != client_sha256.lower():
+         INSERT audit_log: {
+             action: "UPLOAD_INTEGRITY_MISMATCH",
+             result: "FAILURE",
+             case_id, actor_id: user.id,
+             context: {
+                 filename: sanitized_filename,
+                 client_sha256, server_sha256,
+                 size_bytes: len(file_bytes)
+             }
+         }
+         raise HTTPException(400, "UPLOAD_INTEGRITY_MISMATCH",
+             detail="File hash mismatch. File may have been corrupted in transit.")
+     → Hash match confirmed: file arrived intact
+
+═══════════════════════════════════════════════════════════════
+PHASE 6: VIRUS SCAN (ClamAV)
+═══════════════════════════════════════════════════════════════
+
+6.1  Generate file_id early (needed for audit trail during scan):
+     file_id = uuid4()
+
+6.2  Write to temp file (ClamAV needs file path or socket stream):
+     temp_path = f"/tmp/aiventra_scan_{file_id}.tmp"
+     async with aiofiles.open(temp_path, "wb") as f:
+         await f.write(file_bytes)
+
+6.3  ClamAV scan via clamd socket:
+     import clamd
+     cd = clamd.ClamdUnixSocket(path="/var/run/clamav/clamd.ctl")
+     scan_result = cd.instream(io.BytesIO(file_bytes))
+     # Returns: {'stream': ('OK', None)} or {'stream': ('FOUND', 'Eicar-Test-Signature')}
+
+6.4  Handle scan result:
+     status, virus_name = scan_result.get("stream", ("SCAN_FAILED", None))
+
+     If status == "FOUND":
+         → virus_scan_status = "INFECTED"
+         → virus_scan_result = virus_name
+         INSERT audit_log: {
+             action: "VIRUS_DETECTED",
+             result: "ALERT",
+             case_id, actor_id: user.id,
+             context: {filename: sanitized_filename, virus: virus_name}
+         }
+         os.unlink(temp_path)  ← delete temp file immediately
+         raise HTTPException(422, "VIRUS_DETECTED",
+             detail=f"Malware detected: {virus_name}. File rejected.")
+
+     If status == "SCAN_FAILED":
+         → virus_scan_status = "SCAN_FAILED"
+         → Log warning, continue (don't block on scanner failure)
+         INSERT audit_log: {action: "VIRUS_SCAN_FAILED", result: "WARNING", case_id}
+
+     If status == "OK":
+         → virus_scan_status = "CLEAN"
+
+6.5  Clean up temp file:
+     os.unlink(temp_path)
+
+═══════════════════════════════════════════════════════════════
+PHASE 7: CASE KEK BOOTSTRAP (first evidence for this case)
+═══════════════════════════════════════════════════════════════
+
+7.1  Check if case already has a KEK:
+     if case_row.case_kek_encrypted is None:
+         → First evidence upload for this case → generate KEK
+
+         case_kek = os.urandom(32)              ← 32 bytes = 256-bit key
+         kek_iv   = os.urandom(16)
+
+         cipher = AES.new(MASTER_KEY_BYTES, AES.MODE_CBC, kek_iv)
+         case_kek_encrypted = base64.b64encode(
+             kek_iv + cipher.encrypt(pad(case_kek, AES.block_size))
+         ).decode()
+
+         UPDATE cases SET
+           case_kek_encrypted = $1,
+           case_kek_nonce = $2       ← redundant (iv embedded in encrypted blob, kept for indexing)
+         WHERE id = $case_id
+
+         case_kek_bytes = case_kek
+
+     Else:
+         → Decrypt existing case KEK for use in this file's DEK wrapping:
+         encrypted_blob = base64.b64decode(case_row.case_kek_encrypted)
+         kek_iv         = encrypted_blob[:16]
+         kek_ciphertext = encrypted_blob[16:]
+         cipher = AES.new(MASTER_KEY_BYTES, AES.MODE_CBC, kek_iv)
+         case_kek_bytes = unpad(cipher.decrypt(kek_ciphertext), AES.block_size)
+
+═══════════════════════════════════════════════════════════════
+PHASE 8: FILE ENCRYPTION (AES-256-GCM)
+═══════════════════════════════════════════════════════════════
+
+8.1  Generate per-file DEK and nonce:
+     file_dek   = os.urandom(32)    ← 32 bytes = 256-bit Data Encryption Key
+     file_nonce = os.urandom(12)    ← 96-bit nonce (GCM recommended size)
+
+8.2  Encrypt file bytes:
+     cipher = AES.new(file_dek, AES.MODE_GCM, nonce=file_nonce)
+     cipher.update(file_id.bytes)       ← AAD: file_id as additional authenticated data
+                                         (binds ciphertext to this specific file_id)
+     ciphertext, auth_tag = cipher.encrypt_and_digest(file_bytes)
+
+     ciphertext_with_tag = ciphertext + auth_tag  ← 16-byte tag appended
+     ← auth_tag allows detecting any byte-level tampering during decryption
+
+8.3  Compute SHA-256 of ciphertext:
+     sha256_ciphertext = hashlib.sha256(ciphertext_with_tag).hexdigest()
+
+8.4  Wrap DEK with Case KEK (AES-GCM key wrapping):
+     dek_nonce  = os.urandom(12)
+     kek_cipher = AES.new(case_kek_bytes, AES.MODE_GCM, nonce=dek_nonce)
+     kek_cipher.update(file_id.bytes)   ← AAD: bind DEK to this file_id
+     encrypted_dek, dek_tag = kek_cipher.encrypt_and_digest(file_dek)
+
+8.5  Encode for storage:
+     nonce_b64        = base64.b64encode(file_nonce).hexdigest()
+     auth_tag_b64     = base64.b64encode(auth_tag).decode()
+     dek_encrypted_b64 = base64.b64encode(encrypted_dek).decode()
+     dek_nonce_b64    = base64.b64encode(dek_nonce).decode()
+     dek_tag_b64      = base64.b64encode(dek_tag).decode()
+
+═══════════════════════════════════════════════════════════════
+PHASE 9: MINIO WRITE
+═══════════════════════════════════════════════════════════════
+
+9.1  Construct object key:
+     minio_object_key = f"cases/{case_id}/evidence/{file_id}.enc"
+
+9.2  Write ciphertext to MinIO:
+     minio_client.put_object(
+         bucket_name  = "aiventra-evidence",
+         object_name  = minio_object_key,
+         data         = io.BytesIO(ciphertext_with_tag),
+         length       = len(ciphertext_with_tag),
+         content_type = "application/octet-stream",
+         metadata     = {
+             "x-amz-meta-file-id":     str(file_id),
+             "x-amz-meta-case-id":     str(case_id),
+             "x-amz-meta-sha256":      sha256_ciphertext,
+             "x-amz-meta-uploaded-by": str(user.id),
+             "x-amz-meta-category":    evidence_category,
+             "x-amz-meta-encrypted":   "AES-256-GCM"
+         }
+     )
+
+9.3  Verify MinIO write (read back header):
+     stat = minio_client.stat_object("aiventra-evidence", minio_object_key)
+     if stat.size != len(ciphertext_with_tag):
+         → MinIO write incomplete → abort, cleanup
+         minio_client.remove_object("aiventra-evidence", minio_object_key)
+         raise HTTPException(500, "STORAGE_WRITE_FAILED")
+
+═══════════════════════════════════════════════════════════════
+PHASE 10: DATABASE WRITES (single transaction)
+═══════════════════════════════════════════════════════════════
+
+10.1  Open transaction:
+      async with db.transaction():
+
+10.2  Insert evidence_files:
+      INSERT INTO evidence_files (
+        id, case_id, uploaded_by, original_filename, sanitized_filename,
+        evidence_category, mime_type, file_size_bytes, minio_object_key,
+        sha256_plaintext, sha256_ciphertext, encryption_algo,
+        description, status, virus_scan_status, virus_scan_result,
+        text_extractable, created_at, updated_at
+      ) VALUES (
+        $file_id, $case_id, $user_id, $original_filename, $sanitized_filename,
+        $evidence_category, $detected_mime, $len(file_bytes), $minio_object_key,
+        $server_sha256, $sha256_ciphertext, 'AES-256-GCM',
+        $description, 'ACTIVE', $virus_scan_status, $virus_scan_result,
+        NULL,         ← text_extractable set by background task
+        NOW(), NOW()
+      )
+
+10.3  Insert evidence_integrity:
+      INSERT INTO evidence_integrity (
+        file_id, case_id,
+        sha256_plaintext, sha256_ciphertext,
+        nonce, auth_tag,
+        dek_encrypted, dek_nonce, dek_tag,
+        created_at
+      ) VALUES (
+        $file_id, $case_id,
+        $server_sha256, $sha256_ciphertext,
+        $nonce_b64, $auth_tag_b64,
+        $dek_encrypted_b64, $dek_nonce_b64, $dek_tag_b64,
+        NOW()
+      )
+
+10.4  Update cases storage counters:
+      UPDATE cases SET
+        total_evidence_size_bytes = total_evidence_size_bytes + $file_size,
+        evidence_count            = evidence_count + 1,
+        updated_at                = NOW()
+      WHERE id = $case_id
+
+10.5  Custody log — UPLOAD event:
+      Chain hash computation:
+        prev_chain_hash = await _get_last_custody_hash(file_id)
+        ← For first event, prev_chain_hash = sha256(f"GENESIS:{file_id}")
+        chain_hash = sha256(
+            (prev_chain_hash + server_sha256 + str(file_id) + NOW().isoformat()).encode()
+        ).hexdigest()
+
+      INSERT INTO custody_log (
+        file_id, case_id, action, actor_id, actor_type, actor_role,
+        current_hash, chain_hash, ip_address, notes, timestamp
+      ) VALUES (
+        $file_id, $case_id, 'UPLOAD', $user_id, 'USER', $user_role,
+        $server_sha256, $chain_hash, $request_ip,
+        f"Initial upload: {sanitized_filename} ({len(file_bytes)} bytes)",
+        NOW()
+      )
+
+10.6  Commit transaction
+
+═══════════════════════════════════════════════════════════════
+PHASE 11: AUDIT LOG
+═══════════════════════════════════════════════════════════════
+
+11.1  INSERT audit_log: {
+        action: "EVIDENCE_UPLOAD",
+        result: "SUCCESS",
+        actor_id: user.id,
+        actor_role: user.role,
+        case_id: case_id,
+        resource_type: "EVIDENCE_FILE",
+        resource_id: str(file_id),
+        ip_address: request_ip,
+        context: {
+            filename: sanitized_filename,
+            category: evidence_category,
+            size_bytes: len(file_bytes),
+            mime_type: detected_mime,
+            sha256: server_sha256,
+            virus_status: virus_scan_status
+        }
+      }
+
+═══════════════════════════════════════════════════════════════
+PHASE 12: BACKGROUND TASKS (launched async, not awaited)
+═══════════════════════════════════════════════════════════════
+
+12.1  asyncio.create_task(text_extraction_and_pii_scan(file_id, case_id))
+      → See Section 4.2 for full detail
+
+12.2  asyncio.create_task(update_case_summary_stats(case_id))
+      → Refreshes cached evidence count in Redis for WS broadcasts
+
+═══════════════════════════════════════════════════════════════
+PHASE 13: RESPONSE
+═══════════════════════════════════════════════════════════════
+
+13.1  HTTP 201 Created
+      {
+        "file_id":              "<uuid>",
+        "case_id":              "<uuid>",
+        "original_filename":    "autopsy_report_case_007.pdf",
+        "sanitized_filename":   "autopsy_report_case_007.pdf",
+        "evidence_category":    "AUTOPSY_REPORT",
+        "mime_type":            "application/pdf",
+        "file_size_bytes":      245760,
+        "sha256":               "a3f9b2c1...",  ← server-verified hash
+        "encryption":           "AES-256-GCM",
+        "virus_scan_status":    "CLEAN",
+        "status":               "ACTIVE",
+        "uploaded_at":          "2026-05-09T14:22:15Z",
+        "uploaded_by":          "Officer Ravi Shankar",
+        "custody_chain_start":  "<chain_hash>",
+        "message":              "Evidence uploaded, encrypted, and integrity-logged successfully."
+      }
+4.2 Background Task: Text Extraction & PII Pre-Scan
+text
+FUNCTION: text_extraction_and_pii_scan(file_id, case_id)
+RUNS: Async, after upload response is sent
+PURPOSE: Determine text_extractable, page_count; bootstrap pii_vault for this file
+
+═══════════════════════════════════════════════════════════════
+STEP 1: Decrypt file for text extraction
+═══════════════════════════════════════════════════════════════
+
+1.1  Load integrity record:
+     integrity = await db.fetchrow(
+         "SELECT * FROM evidence_integrity WHERE file_id = $1", file_id
+     )
+     evidence = await db.fetchrow(
+         "SELECT * FROM evidence_files WHERE id = $1", file_id
+     )
+
+1.2  Decrypt file DEK:
+     case_kek = _decrypt_case_kek(case_id)    ← decrypt from cases.case_kek_encrypted
+     dek_encrypted = base64.b64decode(integrity.dek_encrypted)
+     dek_nonce     = base64.b64decode(integrity.dek_nonce)
+     dek_tag       = base64.b64decode(integrity.dek_tag)
+
+     kek_cipher = AES.new(case_kek, AES.MODE_GCM, nonce=dek_nonce)
+     kek_cipher.update(file_id.bytes)          ← AAD must match what was used during wrap
+     file_dek = kek_cipher.decrypt_and_verify(dek_encrypted, dek_tag)
+
+1.3  Download ciphertext from MinIO:
+     ciphertext_with_tag = minio_client.get_object(
+         "aiventra-evidence", evidence.minio_object_key
+     ).read()
+
+1.4  Verify ciphertext integrity first:
+     actual_sha256 = hashlib.sha256(ciphertext_with_tag).hexdigest()
+     if actual_sha256 != integrity.sha256_ciphertext:
+         → TAMPER DETECTED at background scan
+         await _quarantine_file(file_id, "CIPHERTEXT_TAMPER_DETECTED_AT_PII_SCAN")
+         return
+
+1.5  Decrypt:
+     nonce    = base64.b64decode(integrity.nonce)
+     tag      = base64.b64decode(integrity.auth_tag)
+     ct       = ciphertext_with_tag[:-16]     ← separate ciphertext from tag
+     tag_from_file = ciphertext_with_tag[-16:]
+
+     cipher = AES.new(file_dek, AES.MODE_GCM, nonce=nonce)
+     cipher.update(file_id.bytes)
+     try:
+         plaintext = cipher.decrypt_and_verify(ct, tag_from_file)
+     except ValueError:
+         → GCM auth tag mismatch → BYTE-LEVEL TAMPER
+         await _quarantine_file(file_id, "GCM_AUTH_TAG_MISMATCH")
+         return
+
+1.6  Custody log — INTEGRITY_VERIFY event (first read after upload):
+     await _append_custody(file_id, case_id, 'INTEGRITY_VERIFY',
+                            actor_type='SYSTEM', hash=server_sha256)
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Text Extraction
+═══════════════════════════════════════════════════════════════
+
+2.1  Route by MIME type:
+     extracted_text = None
+     page_count     = None
+
+     if evidence.mime_type == "application/pdf":
+         reader = pypdf.PdfReader(io.BytesIO(plaintext))
+         page_count = len(reader.pages)
+         text_parts = []
+         for page in reader.pages:
+             text_parts.append(page.extract_text() or "")
+         extracted_text = "\n".join(text_parts)
+         text_extractable = len(extracted_text.strip()) > 100  ← at least 100 meaningful chars
+
+     elif evidence.mime_type in [
+         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+     ]:
+         doc = python_docx.Document(io.BytesIO(plaintext))
+         extracted_text = "\n".join([p.text for p in doc.paragraphs])
+         text_extractable = len(extracted_text.strip()) > 100
+
+     elif evidence.mime_type in [
+         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+         "application/vnd.ms-excel"
+     ]:
+         wb = openpyxl.load_workbook(io.BytesIO(plaintext), read_only=True, data_only=True)
+         all_cells = []
+         for sheet in wb.worksheets:
+             for row in sheet.iter_rows(values_only=True):
+                 for cell in row:
+                     if cell is not None:
+                         all_cells.append(str(cell))
+         extracted_text = " ".join(all_cells)
+         text_extractable = len(extracted_text.strip()) > 50
+
+     elif evidence.mime_type == "text/csv":
+         extracted_text = plaintext.decode("utf-8", errors="replace")
+         text_extractable = True
+
+     elif evidence.mime_type == "text/plain":
+         extracted_text = plaintext.decode("utf-8", errors="replace")
+         text_extractable = True
+
+     elif evidence.mime_type == "application/json":
+         json_obj = json.loads(plaintext)
+         extracted_text = json.dumps(json_obj, indent=2)
+         text_extractable = True
+
+     else:  # images, binary formats
+         text_extractable = False
+         extracted_text   = None
+
+2.2  Update evidence_files:
+     UPDATE evidence_files SET
+       text_extractable = $text_extractable,
+       page_count       = $page_count,
+       updated_at       = NOW()
+     WHERE id = $file_id
+
+═══════════════════════════════════════════════════════════════
+STEP 3: PII Pre-scan
+═══════════════════════════════════════════════════════════════
+
+3.1  If text not extractable → skip PII scan
+     If extracted_text is None or len(extracted_text.strip()) == 0 → skip
+
+3.2  Run spaCy NER:
+     nlp = spacy.load("en_core_web_lg")
+     doc = nlp(extracted_text[:50000])   ← cap at 50K chars for large docs
+     spacy_entities = {
+         (ent.text.strip(), ent.label_)
+         for ent in doc.ents
+         if ent.label_ in {"PERSON", "ORG", "GPE", "LOC", "DATE"}
+         and len(ent.text.strip()) > 2
+     }
+
+3.3  Run regex patterns:
+     PII_PATTERNS = {
+         "PHONE":   r"(?:\+91|0)?[6-9]\d{9}",
+         "AADHAAR": r"\d{4}\s?\d{4}\s?\d{4}",
+         "PAN":     r"[A-Z]{5}\d{4}[A-Z]",
+         "EMAIL":   r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+         "VEHICLE": r"[A-Z]{2}\d{2}[A-Z]{2}\d{4}",
+         "PINCODE": r"\b[1-9][0-9]{5}\b"
+     }
+     regex_entities = {}
+     for entity_type, pattern in PII_PATTERNS.items():
+         matches = re.findall(pattern, extracted_text, re.IGNORECASE)
+         for match in set(matches):
+             regex_entities[match] = entity_type
+
+3.4  Merge and deduplicate:
+     all_entities = {}
+     for text_val, entity_type in spacy_entities:
+         all_entities[text_val] = entity_type
+     for text_val, entity_type in regex_entities.items():
+         all_entities[text_val] = entity_type
+
+3.5  Assign placeholders and populate pii_vault:
+     type_counters = defaultdict(int)
+     # First: count existing placeholders for this case to continue numbering
+     existing = await db.fetch(
+         "SELECT entity_type, MAX(CAST(SPLIT_PART(placeholder, '_', 2) AS INT)) as max_n
+          FROM pii_vault WHERE case_id = $1 GROUP BY entity_type",
+         case_id
+     )
+     for row in existing:
+         type_counters[row["entity_type"]] = row["max_n"]
+
+     for original_value, entity_type in all_entities.items():
+         value_hash = hashlib.sha256(original_value.encode()).hexdigest()
+
+         # Check if this value already in vault for this case
+         existing_entry = await db.fetchrow(
+             "SELECT placeholder, occurrence_count FROM pii_vault
+              WHERE case_id = $1 AND original_value_hash = $2",
+             case_id, value_hash
+         )
+
+         if existing_entry:
+             # Increment occurrence count
+             UPDATE pii_vault SET
+               occurrence_count = occurrence_count + 1,
+               updated_at       = NOW()
+             WHERE case_id = $1 AND original_value_hash = $2
+         else:
+             # New entity → assign placeholder
+             type_counters[entity_type] += 1
+             placeholder = f"[{entity_type}_{type_counters[entity_type]}]"
+
+             # Encrypt original value
+             iv = os.urandom(16)
+             cipher = AES.new(case_kek_bytes, AES.MODE_CBC, iv)
+             encrypted_value = base64.b64encode(
+                 iv + cipher.encrypt(pad(original_value.encode(), AES.block_size))
+             ).decode()
+
+             INSERT INTO pii_vault (
+               case_id, file_id, entity_type, placeholder,
+               original_value_encrypted, original_value_hash,
+               first_seen_in, occurrence_count, created_at, updated_at
+             ) VALUES (
+               $case_id, $file_id, $entity_type, $placeholder,
+               $encrypted_value, $value_hash,
+               $evidence_category, 1, NOW(), NOW()
+             )
+
+3.6  Log completion:
+     pii_count = len(all_entities)
+     INSERT audit_log: {
+         action: "PII_PRESCAN_COMPLETE",
+         result: "SUCCESS",
+         case_id, resource_id: str(file_id),
+         context: {entities_found: pii_count, text_chars: len(extracted_text)}
+     }
+PART V — EVIDENCE RETRIEVAL WORKFLOW
+5.1 GET /evidence/{file_id} — Metadata Only
+text
+TRIGGER: GET /evidence/{file_id}
+AUTH:    Any authenticated user with case access
+RETURNS: Metadata, NO file bytes
+
+1.  Layer 1 middleware validates JWT
+2.  Load evidence: SELECT * FROM evidence_files WHERE id = $1
+    → 404 if not found
+3.  require_case_access(user, evidence.case_id, db)
+4.  Return metadata (no decryption, no MinIO read):
+    {
+      "file_id":           "<uuid>",
+      "original_filename": "autopsy_report.pdf",
+      "evidence_category": "AUTOPSY_REPORT",
+      "mime_type":         "application/pdf",
+      "file_size_bytes":   245760,
+      "sha256":            "a3f9b2c1...",
+      "status":            "ACTIVE",
+      "virus_scan_status": "CLEAN",
+      "text_extractable":  true,
+      "page_count":        12,
+      "uploaded_by_name":  "Officer Ravi Shankar",
+      "uploaded_at":       "2026-05-09T14:22:15Z",
+      "description":       "Post-mortem examination report"
+    }
+5.  Custody log: INTEGRITY_VERIFY (metadata-only access)
+6.  Audit: EVIDENCE_METADATA_VIEWED
+5.2 GET /evidence/{file_id}/download — Full Decryption
+text
+TRIGGER: GET /evidence/{file_id}/download
+AUTH:    ADMIN, LEAD_INVESTIGATOR, MEDICAL_EXAMINER (for their category only)
+RETURNS: Decrypted file bytes (streaming)
+
+═══════════════════════════════════════════════════════════════
+STEP 1: Authorization
+═══════════════════════════════════════════════════════════════
+
+1.1  Layer 1 JWT validation
+1.2  Load evidence_files row
+1.3  require_case_access(user, evidence.case_id, db)
+1.4  Role-based download permission:
+     ADMIN              → any file
+     LEAD_INVESTIGATOR  → any file in their case
+     MEDICAL_EXAMINER   → only AUTOPSY_REPORT, TOXICOLOGY_REPORT categories
+     ANALYST            → DENIED (no download)
+     If denied → 403 DOWNLOAD_NOT_PERMITTED
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Status Check
+═══════════════════════════════════════════════════════════════
+
+2.1  If evidence.status == "QUARANTINED":
+     → 403 FILE_QUARANTINED, {reason: evidence.quarantine_reason}
+2.2  If evidence.status in ["DELETED", "ARCHIVED"]:
+     → 403 FILE_NOT_ACCESSIBLE
+
+═══════════════════════════════════════════════════════════════
+STEP 3: Integrity Pre-check (before decryption)
+═══════════════════════════════════════════════════════════════
+
+3.1  Download ciphertext from MinIO:
+     ciphertext_with_tag = minio_client.get_object(
+         "aiventra-evidence", evidence.minio_object_key
+     ).read()
+
+3.2  Recompute ciphertext hash:
+     actual_ciphertext_sha256 = hashlib.sha256(ciphertext_with_tag).hexdigest()
+
+3.3  Compare with stored hash:
+     if actual_ciphertext_sha256 != integrity.sha256_ciphertext:
+         → STORAGE LAYER TAMPER DETECTED
+         await _quarantine_file(file_id, "CIPHERTEXT_SHA256_MISMATCH_ON_DOWNLOAD")
+         INSERT audit_log: {action: "EVIDENCE_TAMPER_DETECTED", result: "ALERT",
+                             case_id, resource_id: file_id,
+                             context: {expected: integrity.sha256_ciphertext,
+                                       actual: actual_ciphertext_sha256}}
+         WS broadcast to ADMIN: SECURITY_ALERT → TAMPER_DETECTED
+         raise HTTPException(500, "INTEGRITY_FAILURE",
+             detail="File integrity check failed. File has been quarantined for investigation.")
+
+═══════════════════════════════════════════════════════════════
+STEP 4: Decryption
+═══════════════════════════════════════════════════════════════
+
+4.1  Decrypt Case KEK → File DEK (same as Phase 7/8 of upload, reversed):
+     case_kek  = _decrypt_case_kek(evidence.case_id)
+     file_dek  = _decrypt_file_dek(integrity, case_kek, file_id)
+
+4.2  Decrypt file:
+     nonce = base64.b64decode(integrity.nonce)
+     tag   = base64.b64decode(integrity.auth_tag)
+     ct    = ciphertext_with_tag[:-16]
+     stored_tag = ciphertext_with_tag[-16:]
+
+     cipher = AES.new(file_dek, AES.MODE_GCM, nonce=nonce)
+     cipher.update(file_id.bytes)           ← must match AAD used during encryption
+     try:
+         plaintext = cipher.decrypt_and_verify(ct, stored_tag)
+     except ValueError:
+         → GCM auth tag failure → byte-level corruption
+         await _quarantine_file(file_id, "GCM_AUTH_TAG_FAILURE_ON_DOWNLOAD")
+         raise HTTPException(500, "DECRYPTION_INTEGRITY_FAILURE")
+
+4.3  Verify plaintext hash:
+     actual_plaintext_sha256 = hashlib.sha256(plaintext).hexdigest()
+     if actual_plaintext_sha256 != integrity.sha256_plaintext:
+         → Double integrity failure (cipher & plaintext both wrong) → serious tamper
+         await _quarantine_file(file_id, "PLAINTEXT_HASH_MISMATCH_ON_DOWNLOAD")
+         raise HTTPException(500, "INTEGRITY_FAILURE")
+
+     UPDATE evidence_integrity SET
+       integrity_verified_at = NOW()
+     WHERE file_id = $file_id
+
+═══════════════════════════════════════════════════════════════
+STEP 5: Custody Log + Audit
+═══════════════════════════════════════════════════════════════
+
+5.1  Determine actor_type:
+     if user.role == "ADMIN": action = "ADMIN_READ"
+     else: action = "INVESTIGATOR_READ"
+
+5.2  Append custody_log: {action, actor_id, actor_type: "USER",
+                           actor_role, current_hash: actual_plaintext_sha256,
+                           chain_hash: computed, ip_address, timestamp}
+
+5.3  INSERT audit_log: {
+       action: "EVIDENCE_DOWNLOAD",
+       result: "SUCCESS",
+       actor_id, actor_role, case_id,
+       resource_type: "EVIDENCE_FILE", resource_id: file_id,
+       ip_address,
+       context: {filename, size_bytes, category}
+     }
+
+═══════════════════════════════════════════════════════════════
+STEP 6: Streaming Response
+═══════════════════════════════════════════════════════════════
+
+6.1  Return as StreamingResponse:
+     async def stream_bytes():
+         CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+         for i in range(0, len(plaintext), CHUNK_SIZE):
+             yield plaintext[i:i+CHUNK_SIZE]
+
+     return StreamingResponse(
+         stream_bytes(),
+         media_type=evidence.mime_type,
+         headers={
+             "Content-Disposition": f'attachment; filename="{evidence.sanitized_filename}"',
+             "Content-Length":      str(len(plaintext)),
+             "X-File-SHA256":       actual_plaintext_sha256,
+             "X-Integrity-Verified": "true",
+             "Cache-Control":       "no-store, no-cache, must-revalidate"
+         }
+     )
+5.3 Internal Agent Read — evidence_reader Service
+text
+USED BY: All Layer 3 agents — they call this service internally (not HTTP)
+PURPOSE: Give agents decrypted bytes WITHOUT going through HTTP layer overhead
+
+FUNCTION: async def agent_read_evidence(
+    file_id: UUID,
+    agent_id: str,
+    case_id: UUID,
+    task_token: str     ← mTLS task token verified by Layer 3
+) -> EvidenceReadResult
+
+═══════════════════════════════════════════════════════════════
+STEP 1: Task Token Verification
+═══════════════════════════════════════════════════════════════
+
+1.1  Verify task_token is valid JWT:
+     payload = jwt.decode(task_token, orchestrator_public_key, algorithms=["RS256"])
+     Verify: sub == agent_id, case_id == case_id, op == "run", not expired
+     Replay check: Redis GET aiventra:task_tokens:{jti} != "used"
+     Mark used: Redis SET aiventra:task_tokens:{jti} "used" EX 300
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Load + Decrypt (same as Section 5.2 Steps 3-4)
+═══════════════════════════════════════════════════════════════
+
+2.1  Load evidence_files + evidence_integrity from DB
+2.2  Integrity check: ciphertext SHA-256 comparison
+2.3  Decrypt Case KEK → File DEK → plaintext
+2.4  Verify plaintext SHA-256
+2.5  Update integrity_verified_at
+
+═══════════════════════════════════════════════════════════════
+STEP 3: Custody Log — AGENT_READ
+═══════════════════════════════════════════════════════════════
+
+3.1  INSERT custody_log: {
+       action: "AGENT_READ",
+       actor_id: NULL,
+       actor_type: "AGENT",
+       agent_id: agent_id,
+       current_hash: actual_plaintext_sha256,
+       chain_hash: computed,
+       notes: f"Read by {agent_id} for pipeline run",
+       timestamp: NOW()
+     }
+
+3.2  INSERT audit_log: {
+       action: "EVIDENCE_AGENT_ACCESS",
+       result: "SUCCESS",
+       actor_id: NULL,
+       case_id,
+       resource_id: file_id,
+       context: {agent_id, task_token_jti: payload["jti"]}
+     }
+
+═══════════════════════════════════════════════════════════════
+STEP 4: Return
+═══════════════════════════════════════════════════════════════
+
+4.1  Return EvidenceReadResult:
+     {
+       file_id:          file_id,
+       plaintext_bytes:  plaintext,
+       sha256:           actual_plaintext_sha256,
+       mime_type:        evidence.mime_type,
+       original_filename: evidence.original_filename,
+       text_extractable: evidence.text_extractable,
+       page_count:       evidence.page_count,
+       evidence_category: evidence.evidence_category,
+       integrity_verified: True
+     }
+PART VI — INTEGRITY VERIFICATION WORKFLOWS
+6.1 GET /evidence/{file_id}/integrity — On-Demand Verification
+text
+TRIGGER: GET /evidence/{file_id}/integrity
+AUTH:    ADMIN, LEAD_INVESTIGATOR
+
+1.  Authorization + case access check
+2.  Load integrity record from evidence_integrity
+3.  Fetch ciphertext from MinIO (without decrypting)
+4.  Compute actual_ciphertext_sha256
+5.  Compare with stored sha256_ciphertext
+
+6.  If MISMATCH:
+    → _quarantine_file(file_id, "MANUAL_INTEGRITY_CHECK_FAILED")
+    → Return: { verified: false, tamper_detected: true, quarantined: true }
+
+7.  If MATCH:
+    → UPDATE evidence_integrity SET integrity_verified_at=NOW()
+    → Append custody_log: INTEGRITY_VERIFY
+    → Return: { verified: true, sha256: ..., last_verified: NOW() }
+
+8.  Audit: INTEGRITY_CHECK_PERFORMED
+6.2 _quarantine_file() — Sub-Workflow
+text
+async def _quarantine_file(file_id: UUID, reason: str):
+
+1.  UPDATE evidence_files SET
+      status = 'QUARANTINED',
+      quarantine_reason = $reason,
+      updated_at = NOW()
+    WHERE id = $file_id
+    RETURNING case_id
+
+2.  Append custody_log: {
+      action: "QUARANTINE",
+      actor_type: "SYSTEM",
+      current_hash: "UNKNOWN",   ← can't trust hash since tamper detected
+      chain_hash: computed,
+      notes: reason,
+      timestamp: NOW()
+    }
+
+3.  INSERT audit_log: {
+      action: "EVIDENCE_QUARANTINED",
+      result: "ALERT",
+      case_id,
+      resource_id: file_id,
+      context: {reason}
+    }
+
+4.  WS broadcast to all case subscribers + ADMIN:
+    {
+      type: "EVIDENCE_QUARANTINED",
+      case_id,
+      data: { file_id, reason, quarantined_at: NOW() }
+    }
+
+5.  UPDATE evidence_integrity SET
+      integrity_fail_count = integrity_fail_count + 1
+    WHERE file_id = $file_id
+
+6.  If file is INFECTED by virus (reason = "VIRUS_DETECTED"):
+    → MinIO: add quarantine tag to object metadata (does NOT delete)
+      minio_client.set_object_tags("aiventra-evidence", object_key,
+          {"quarantined": "true", "reason": reason})
+    → Original bytes preserved for forensic investigation
+6.3 Scheduled Integrity Sweep — Background Worker
+text
+SCHEDULE: Every 6 hours (asyncio background task, launched at startup)
+PURPOSE:  Proactively detect MinIO storage tampering without waiting for access
+
+async def integrity_sweep_worker():
+    while True:
+        try:
+            # Get all ACTIVE evidence files
+            files = await db.fetch(
+                """SELECT ef.id, ef.case_id, ef.minio_object_key,
+                          ei.sha256_ciphertext
+                   FROM evidence_files ef
+                   JOIN evidence_integrity ei ON ei.file_id = ef.id
+                   WHERE ef.status = 'ACTIVE'
+                   ORDER BY ei.integrity_verified_at ASC NULLS FIRST
+                   LIMIT 100"""   ← process 100 per sweep cycle
+            )
+
+            for file in files:
+                try:
+                    # Fetch just the object, compute hash
+                    obj_bytes = minio_client.get_object(
+                        "aiventra-evidence", file.minio_object_key
+                    ).read()
+                    actual_hash = hashlib.sha256(obj_bytes).hexdigest()
+
+                    if actual_hash != file.sha256_ciphertext:
+                        await _quarantine_file(file.id, "SWEEP_CIPHERTEXT_TAMPER")
+                        logger.critical(
+                            f"TAMPER DETECTED during sweep: file {file.id}, "
+                            f"case {file.case_id}"
+                        )
+                    else:
+                        await db.execute(
+                            "UPDATE evidence_integrity SET integrity_verified_at=NOW() WHERE file_id=$1",
+                            file.id
+                        )
+                except Exception as e:
+                    logger.error(f"Sweep error for file {file.id}: {e}")
+
+        except Exception as e:
+            logger.error(f"Integrity sweep worker error: {e}")
+
+        await asyncio.sleep(6 * 3600)   # 6 hours
+PART VII — CUSTODY CHAIN WORKFLOWS
+7.1 GET /evidence/{file_id}/custody — Full Chain Report
+text
+TRIGGER: GET /evidence/{file_id}/custody
+AUTH:    ADMIN, LEAD_INVESTIGATOR
+
+1.  Authorization + case access
+
+2.  SELECT * FROM custody_log
+    WHERE file_id = $1
+    ORDER BY id ASC                 ← integer ID preserves insertion order
+
+3.  Chain verification:
+    prev_chain_hash = sha256(f"GENESIS:{file_id}".encode()).hexdigest()
+    chain_valid     = True
+    tampered_at_id  = None
+
+    for entry in entries:
+        expected_chain = sha256(
+            (prev_chain_hash + entry.current_hash + str(file_id) + entry.timestamp.isoformat()).encode()
+        ).hexdigest()
+        if expected_chain != entry.chain_hash:
+            chain_valid    = False
+            tampered_at_id = entry.id
+            break
+        prev_chain_hash = entry.current_hash
+
+4.  Build human-readable entries:
+    [
+      {
+        seq: 1,
+        action: "UPLOAD",
+        actor: "Officer Ravi Shankar",
+        actor_type: "USER",
+        role: "LEAD_INVESTIGATOR",
+        timestamp: "2026-05-09T14:22:15Z",
+        hash: "a3f9b2c1...",
+        chain_hash: "d4e5f6...",
+        chain_valid: true,
+        notes: "Initial upload: autopsy_report.pdf (245760 bytes)"
+      },
+      {
+        seq: 2,
+        action: "AGENT_READ",
+        actor: "evidence_parser [AGENT]",
+        actor_type: "AGENT",
+        agent_id: "evidence_parser",
+        timestamp: "2026-05-09T14:23:01Z",
+        hash: "a3f9b2c1...",   ← same hash (file not modified)
+        chain_valid: true
+      },
+      ...
+    ]
+
+5.  Return:
+    {
+      file_id:         "<uuid>",
+      original_filename: "autopsy_report.pdf",
+      total_entries:   12,
+      chain_valid:     true,
+      tampered_at_seq: null,
+      entries:         [...],
+      verified_at:     "2026-05-09T22:15:00Z"
+    }
+
+6.  Audit: CUSTODY_CHAIN_VIEWED → {file_id, actor_id}
+7.2 _append_custody() — Internal Sub-function
+python
+async def _append_custody(
+    file_id: UUID,
+    case_id: UUID,
+    action: str,
+    current_hash: str,
+    actor_id: UUID = None,
+    actor_type: str = "SYSTEM",
+    actor_role: str = None,
+    agent_id: str = None,
+    ip_address: str = None,
+    notes: str = None,
+    db = None
+):
+    """
+    Appends one entry to custody_log.
+    Computes chain_hash from previous entry.
+    Atomic: uses SELECT FOR UPDATE on the last row.
+    """
+    async with db.transaction():
+        # Fetch last chain hash (with row lock to prevent concurrent inserts)
+        last_row = await db.fetchrow(
+            """SELECT chain_hash, current_hash FROM custody_log
+               WHERE file_id = $1
+               ORDER BY id DESC LIMIT 1
+               FOR UPDATE""",
+            file_id
+        )
+
+        if last_row is None:
+            # First entry → Genesis hash
+            prev_chain_hash = hashlib.sha256(
+                f"GENESIS:{file_id}".encode()
+            ).hexdigest()
+        else:
+            prev_chain_hash = last_row["chain_hash"]
+
+        # Compute chain hash
+        timestamp_str = datetime.utcnow().isoformat()
+        chain_hash = hashlib.sha256(
+            (prev_chain_hash + current_hash + str(file_id) + timestamp_str).encode()
+        ).hexdigest()
+
+        # Insert
+        await db.execute(
+            """INSERT INTO custody_log
+               (file_id, case_id, action, actor_id, actor_type, actor_role,
+                agent_id, current_hash, chain_hash, ip_address, notes, timestamp)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())""",
+            file_id, case_id, action, actor_id, actor_type, actor_role,
+            agent_id, current_hash, chain_hash, ip_address, notes
+        )
+PART VIII — EVIDENCE MANAGEMENT OPERATIONS
+8.1 PATCH /evidence/{file_id}/metadata
+text
+TRIGGER: PATCH /evidence/{file_id}/metadata
+AUTH:    ADMIN, LEAD_INVESTIGATOR
+BODY:    { "description": "...", "evidence_category": "..." }
+
+1.  Auth + case access
+2.  Load evidence: must be ACTIVE
+3.  Validate new category (if provided)
+4.  UPDATE evidence_files SET
+      description       = COALESCE($description, description),
+      evidence_category = COALESCE($category, evidence_category),
+      updated_at        = NOW()
+    WHERE id = $file_id
+
+5.  Custody log: METADATA_UPDATE
+6.  Audit: EVIDENCE_METADATA_UPDATED
+7.  HTTP 200
+8.2 DELETE /evidence/{file_id} — Soft Delete Only
+text
+TRIGGER: DELETE /evidence/{file_id}
+AUTH:    ADMIN only
+RATIONALE: Hard delete PROHIBITED — forensic evidence must be preserved
+
+1.  Auth: require_role(["ADMIN"])
+2.  Load evidence: case_access check
+3.  UPDATE evidence_files SET
+      status     = 'DELETED',
+      updated_at = NOW()
+    WHERE id = $file_id
+
+4.  MinIO: add tag "deleted=true" to object (bytes NOT removed)
+5.  Custody log: SOFT_DELETE
+6.  UPDATE cases SET
+      evidence_count            = evidence_count - 1,
+      total_evidence_size_bytes = total_evidence_size_bytes - $file_size_bytes
+    WHERE id = $case_id
+
+7.  Audit: EVIDENCE_SOFT_DELETED → {file_id, actor_id}
+8.  HTTP 200 { "message": "Evidence soft-deleted. Bytes preserved in storage." }
+8.3 Admin Unquarantine — POST /admin/evidence/{file_id}/unquarantine
+text
+TRIGGER: POST /admin/evidence/{file_id}/unquarantine
+AUTH:    ADMIN only
+BODY:    { "reason": "False positive — ClamAV signature error" }
+
+1.  require_role(["ADMIN"])
+2.  Check evidence.status == "QUARANTINED"
+    → If not → 400 NOT_QUARANTINED
+
+3.  UPDATE evidence_files SET
+      status            = 'ACTIVE',
+      quarantine_reason = NULL,
+      updated_at        = NOW()
+    WHERE id = $file_id
+
+4.  MinIO: remove quarantine tags
+5.  Custody log: UNQUARANTINE → {notes: reason}
+6.  Audit: EVIDENCE_UNQUARANTINED → {actor_id, reason}
+7.  HTTP 200
+PART IX — ERROR RESPONSE CATALOG (Layer 2)
+text
+HTTP   ERROR_CODE                        CAUSE
+────────────────────────────────────────────────────────────────────────────────
+400    UPLOAD_INTEGRITY_MISMATCH         client_sha256 != server computed SHA-256
+400    EMPTY_FILE                        File has 0 bytes
+400    INVALID_HASH_FORMAT               client_sha256 not a 64-char hex string
+400    NOT_QUARANTINED                   Unquarantine attempted on non-quarantined file
+
+403    CASE_NOT_MODIFIABLE               Case is ARCHIVED or DELETED
+403    FILE_QUARANTINED                  Access denied — file in quarantine
+403    FILE_NOT_ACCESSIBLE               File is DELETED or ARCHIVED
+403    DOWNLOAD_NOT_PERMITTED            User role cannot download this file category
+403    CASE_ACCESS_DENIED                (from Layer 1 RBAC)
+403    INSUFFICIENT_ROLE                 (from Layer 1 RBAC)
+
+404    CASE_NOT_FOUND                    case_id not found
+404    EVIDENCE_NOT_FOUND                file_id not found or not in user's case
+
+409    DUPLICATE_UPLOAD                  SHA-256 already exists for this case
+       (detected by: SELECT 1 FROM evidence_files WHERE case_id=$1 AND sha256_plaintext=$2)
+
+413    FILE_TOO_LARGE                    File exceeds 500MB
+413    CASE_STORAGE_QUOTA_EXCEEDED       Case has reached 5GB total
+
+415    UNSUPPORTED_MEDIA_TYPE            Magic bytes don't match allowed types
+415    VIRUS_DETECTED                    ClamAV found malware
+
+422    MISSING_REQUIRED_FIELD            file / case_id / evidence_category / client_sha256 absent
+422    INVALID_EVIDENCE_CATEGORY         Category not in allowed enum
+
+429    RATE_LIMIT_EXCEEDED               Upload rate limit hit (20/hr per user)
+
+500    STORAGE_WRITE_FAILED              MinIO write failure / size mismatch
+500    INTEGRITY_FAILURE                 Ciphertext SHA-256 or GCM tag mismatch on read
+500    DECRYPTION_INTEGRITY_FAILURE      GCM auth tag failure during decryption
+500    KEY_DECRYPTION_FAILED             Master key / KEK decryption error
+PART X — LAYER 2 PERFORMANCE SPECIFICATIONS
+10.1 Latency Targets
+text
+OPERATION                              P50      P95      P99      NOTES
+────────────────────────────────────────────────────────────────────────────────
+Upload 1MB file (full pipeline)        1.2s     2.5s     4s       ClamAV dominates
+Upload 50MB file                       4s       8s       15s      AES-GCM is fast ~200MB/s
+Upload 100MB file                      8s       15s      25s
+GET metadata                           30ms     80ms     150ms    DB only
+GET download + decrypt 1MB             0.3s     0.8s     1.5s     MinIO + AES-GCM
+GET download + decrypt 100MB           2s       5s       10s      Streaming
+Integrity check (metadata only)        0.4s     1.2s     2s       MinIO read + SHA-256
+PII pre-scan (50K chars)               3s       8s       15s      spaCy NER
+Custody chain report (50 entries)      50ms     120ms    250ms    DB scan
+Agent internal read (no HTTP)          0.2s     0.5s     1s       Direct function call
+10.2 Resource Usage
+text
+COMPONENT                  MEMORY        CPU
+─────────────────────────────────────────────────────────
+AES-256-GCM encryption     ~file_size    ~200ms/100MB
+SHA-256 computation        minimal       ~50ms/100MB
+ClamAV scan                200MB (daemon) variable
+spaCy NER model            500MB         1-3s/50K chars
+asyncpg pool (20 conn)     ~50MB         minimal
+MinIO connection           minimal       minimal
+
+PEAK MEMORY per upload:    file_size × 2   (plaintext + ciphertext in memory)
+→ For 500MB file: ~1GB peak RAM
+→ Mitigation: enforce MAX_FILE_SIZE = 500MB; stream to disk for files > 50MB
+PART XI — LAYER 2 COMPLETE FILE STRUCTURE
+text
+api/
+├── routers/
+│   ├── evidence.py                    ← /evidence/* HTTP routes
+│   └── admin_evidence.py              ← /admin/evidence/* routes
+│
+├── services/
+│   ├── evidence_service.py            ← upload, download, delete orchestration
+│   ├── encryption_service.py          ← AES-256-GCM encrypt/decrypt, key hierarchy
+│   ├── integrity_service.py           ← hash computation, tamper detection, quarantine
+│   ├── custody_service.py             ← _append_custody(), chain verification
+│   ├── pii_vault_service.py           ← mask/demask, pii_vault CRUD
+│   ├── text_extraction_service.py     ← pypdf, python-docx, openpyxl extractors
+│   └── virus_scan_service.py          ← ClamAV clamd integration
+│
+├── models/
+│   ├── evidence.py                    ← EvidenceUploadRequest, EvidenceResponse schemas
+│   ├── custody.py                     ← CustodyEntry, CustodyChainResponse
+│   └── pii.py                         ← PiiEntry, PiiVaultResponse
+│
+├── core/
+│   ├── minio_client.py                ← MinIO async client setup
+│   ├── encryption_keys.py             ← Master key loading, KEK operations
+│   └── evidence_reader.py             ← Internal agent read service (non-HTTP)
+│
+├── workers/
+│   ├── integrity_sweep.py             ← 6-hour sweep worker
+│   ├── pii_scan_worker.py             ← Post-upload PII scan background task
+│   └── virus_scan_worker.py           ← Async virus scan task
+│
+└── tests/
+    ├── test_evidence_upload.py        ← Happy path, all validation branches
+    ├── test_encryption.py             ← Key hierarchy, encrypt/decrypt round-trip
+    ├── test_integrity.py              ← Tamper detection, quarantine workflow
+    ├── test_custody_chain.py          ← Chain hash verification
+    ├── test_pii_vault.py              ← PII scan, mask/demask cycle
+    └── fixtures/
+        ├── sample_autopsy.pdf         ← 12-page real-structure test PDF
+        ├── sample_cdr.csv             ← 1000-row CDR test data
+        └── eicar_test.pdf             ← EICAR test virus string in PDF wrapper
+PART XII — SECURITY PROPERTIES SUMMARY
+text
+PROPERTY                        MECHANISM                                    WHERE
+────────────────────────────────────────────────────────────────────────────────────────
+Confidentiality at rest         AES-256-GCM per-file, per-case KEK          Phase 8
+Confidentiality in transit      TLS 1.3 (Layer 1 Nginx)                     Layer 1
+Upload integrity                SHA-256 client+server comparison             Phase 5
+Storage integrity                SHA-256 of ciphertext + GCM auth tag        Phase 3 (read)
+Tamper detection                 Hash mismatch → quarantine → audit → WS     Section 6.2
+Virus protection                 ClamAV pre-encryption scan                   Phase 6
+Path traversal prevention        Filename sanitization regex                  Phase 4.5
+MIME spoofing prevention         Magic bytes detection                        Phase 4
+Key isolation                    3-tier key hierarchy (master→kek→dek)        Section 2.3
+Custody immutability             DB trigger prevents UPDATE/DELETE            Section 3.3
+Integrity record immutability    DB trigger prevents UPDATE/DELETE            Section 3.2
+Audit immutability               DB trigger prevents UPDATE/DELETE            Layer 1 audit
+Soft-delete only                 No hard DELETE anywhere in codebase          Section 8.2
+Role-based download              ANALYST cannot download, MED_EXAM limited    Section 5.2
+Agent access control             mTLS task tokens, replay prevention          Section 5.3
+PII at rest                      AES-CBC encrypted in pii_vault               Section 4.2
+Duplicate upload detection       SHA-256 uniqueness per case                  Section 9
+Quota enforcement                Per-file 500MB, per-case 5GB                 Phase 3
+This is the complete, fully-specified Layer 2 — Evidence Ingestion & Integrity Layer covering every upload phase, every encryption operation, every integrity check, every decryption path, every custody chain append, every background task, every error branch, and every security control from file receipt through encrypted MinIO storage to PII vault bootstrap.

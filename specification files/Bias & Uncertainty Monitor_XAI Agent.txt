@@ -1,0 +1,505 @@
+1. Purpose of the Bias & Uncertainty Monitor Agent
+1.1 Problem it solves
+In AIVENTRA, many agents produce probabilistic outputs and scores:
+
+TOD Agent: TOD distributions, confidence bands.
+
+Timeline & Anomaly Agent: anomaly scores, fused AE+IF scores.
+
+Hotspot Agent: hotspot scores.
+
+Hypothesis Manager: probabilities over NATURAL/ACCIDENT/SUICIDE/HOMICIDE.
+
+Autopsy Agent: confidences for cause/manner-of-death, quality flags.
+
+The risk in forensics is over‑confident black‑box behavior: models output “0.95 probability of homicide” or “this anomaly is critical” without calibrated uncertainty, bias checks, or a principled “I don’t know / escalate” behaviour.
+
+The Bias & Uncertainty Monitor Agent exists to:
+
+Quantify uncertainty in a rigorous, cross‑agent way, not just read raw model scores.
+
+Calibrate confidence so that “0.8” really means “about 80% of such predictions are correct,” using calibration diagnostics like reliability diagrams, Brier scores, and local calibration metrics.
+
+Aggregate uncertainty across heterogeneous detectors (TOD, AE+IF, YOLO, LLM outputs), dealing with correlations and different score types.
+
+Detect and flag bias patterns, such as systematic over‑confidence, modality dominance, or evidence selection bias.
+
+Decide when the system should abstain or escalate to a human instead of guessing, following the “Don’t guess, escalate” guidance proposed for AI forensic agents.
+
+The outputs are not new “facts”; they’re meta‑evidence: warnings, uncertainty bands, calibration assessments, and bias flags that are visible in the UI, recorded in audit logs, and usable by NBE and Replay agents.
+
+2. Inputs and Outputs
+2.1 Inputs
+The agent subscribes to results streams from other agents. For each case or pipeline run it ingests:
+
+ts
+UncertaintyMonitorInput {
+  caseId: string;
+  pipelineRunId: string;
+
+  todResult: TodResult;
+  anomalies: AnomalyWindow[];
+  hotspots: Hotspot[];
+  hypotheses: HypothesisSummary[];
+  autopsyExtraction: AutopsyExtraction;
+  modelMetadata: ModelMetadata[];
+}
+Where:
+
+ts
+ModelMetadata {
+  modelId: string;          // e.g., "TOD_RF_v2", "AE_IF_v3", "YOLOv5s_v6"
+  modelType: "ML" | "LLM" | "RULE" | "HYBRID";
+  trainingDataNote: string; // domain, size, time
+  calibrationStatus: "UNCALIBRATED" | "CALIBRATED_GLOBAL" | "CALIBRATED_LOCAL";
+}
+It may also access historical performance data stored globally:
+
+Calibration curves, Brier scores, local calibration errors for each model.
+
+Known failure cases & drift metrics.
+
+2.2 Outputs
+For each case and run it produces a Uncertainty & Bias Report:
+
+ts
+UncertaintyReport {
+  caseId: string;
+  pipelineRunId: string;
+
+  modelAssessments: ModelUncertaintyAssessment[];
+  crossAgentFindings: CrossAgentFinding[];
+  biasFlags: BiasFlag[];
+  escalationRecommendations: EscalationRecommendation[];
+  explanationNarrative: string[];
+}
+2.2.1 ModelUncertaintyAssessment
+ts
+ModelUncertaintyAssessment {
+  modelId: string;
+  component: "TOD" | "ANOMALY" | "HOTSPOT" | "HYPOTHESIS" | "AUTOPSY" | "IMAGE";
+  calibrationQuality: "GOOD" | "QUESTIONABLE" | "POOR" | "UNKNOWN";
+  overconfidenceRisk: "LOW" | "MEDIUM" | "HIGH";
+  uncertaintySummary: string;    // natural language
+  metrics: {
+    globalBrierScore?: number;
+    ece?: number;    // expected calibration error, if applicable
+    localCalibrationFlags?: string[];
+  };
+}
+This aligns with the idea that forensic AI agents should provide calibrated confidence rather than raw scores, evaluated with proper scoring rules like Brier score and calibration errors.
+
+2.2.2 CrossAgentFinding
+ts
+CrossAgentFinding {
+  id: string;
+  type: "CONFLICT" | "CONVERGENCE" | "UNSUPPORTED_HIGH_CONFIDENCE" | "DATA_GAP";
+  description: string;
+  involvedComponents: ("TOD" | "ANOMALY" | "HOTSPOT" | "HYPOTHESIS" | "AUTOPSY")[];
+  severity: "INFO" | "WARN" | "CRITICAL";
+}
+Examples:
+
+TOD band and decomposition signs disagree.
+
+Hotspot score is very high but supporting anomalies are low‑confidence and uncalibrated.
+
+2.2.3 BiasFlag
+ts
+BiasFlag {
+  id: string;
+  category: "MODALITY_DOMINANCE" | "SELECTION_BIAS" | "DATASET_SHIFT" | "LLM_HALLUCINATION_RISK" | "HYPOTHESIS_PRIOR_BIAS";
+  description: string;
+  severity: "INFO" | "WARN" | "CRITICAL";
+  impactedComponents: string[];
+}
+These tie to XAI‑for‑forensics literature that stresses identifying bias sources and explaining them.
+
+2.2.4 EscalationRecommendation
+ts
+EscalationRecommendation {
+  id: string;
+  action: "HUMAN_REVIEW_REQUIRED" | "DO_NOT_AUTOMATE" | "COLLECT_MORE_DATA";
+  target: "CASE" | "HOTSPOT" | "HYPOTHESIS" | "TOD";
+  reason: string;
+}
+This embodies the “don’t guess, escalate” design: when uncertainty is high or conflict is severe, the system refuses to make strong automated claims and explicitly routes to human review.
+
+3. Internal Architecture
+Conceptually:
+
+text
+Inputs (TOD, anomalies, hotspots, hypotheses, autopsy, metadata)
+    ↓
+Model-level UQ & Calibration Analyzer
+    ↓
+Cross-agent Consistency Checker
+    ↓
+Bias Pattern Detector
+    ↓
+Escalation Decision Engine
+    ↓
+Narrative Generator & API
+3.1 Module 1: Model-level UQ & Calibration Analyzer
+This module interprets each score‑producing component (TOD model, AE+IF anomaly model, hotspot scorer, hypothesis updater) through the lens of uncertainty and calibration.
+
+3.1.1 Offline metrics repository
+Separately, during model development, we compute and store calibration metrics for each model:
+
+Brier score (proper scoring rule for probabilistic outputs).
+
+Expected calibration error (ECE) and/or local calibration errors on different slices.
+
+Reliability diagrams, z‑score–based diagnostics.
+
+This follows AI‑safety recommendations for “reliable uncertainty quantification”: probabilities should line up with actual error frequencies.
+
+These metrics sit in model_calibration_stats table and are referenced by modelId.
+
+3.1.2 Runtime assessment
+At runtime, for each component:
+
+Lookup calibration status (from metadata + calibration stats).
+
+Interpret current scores in terms of reliability:
+
+If model is globally well‑calibrated on similar data (same domain, no detected drift):
+
+Mark calibrationQuality = GOOD.
+
+If calibration is only known on a different domain or drift indicators fire:
+
+Mark as QUESTIONABLE or POOR, and raise overconfidenceRisk.
+
+Check local patterns (if enough cases accumulated):
+
+Example: TOD model is known to under‑estimate uncertainty in cold environments; if this case has low ambient temperature, raise a local flag.
+
+This corresponds to conditional / local calibration ideas: calibration may be good on average but bad in certain regions of feature space.
+
+The result is ModelUncertaintyAssessment for each component.
+
+3.2 Module 2: Cross‑Agent Consistency Checker
+Forensic AI agents paper emphasizes orchestration and uncertainty‑aware fusion: an orchestrator should look at heterogeneous detectors and decide if they agree or if the system should abstain.
+
+This module looks for:
+
+Conflicts between components
+
+Example patterns:
+
+TOD window suggests death between 03:00–05:00 with high confidence, but anomaly/hotspot cluster strongly at 21:00–22:00 and Hypothesis Manager leans heavily on those anomalies.
+
+Autopsy suggests NATURAL with high confidence while digital evidence and hotspots strongly support homicide, but there’s large data gaps near TOD.
+
+Unsupported high confidence
+
+A component reports high probability (>0.9) but:
+
+Its calibration quality is poor or unknown.
+
+It is the only component supporting that conclusion (no corroboration).
+
+Supporting evidence is sparse or low‑quality.
+
+Evidence gaps
+
+There is a wide TOD band but no digital evidence near its center (no phone, CCTV, IoT signals in that time region).
+
+Hypothesis Manager is forced to rely on limited early/late evidence.
+
+Algorithmically:
+
+Define comparability rules for pairs of components:
+
+TOD vs Autopsy vs Timeline vs Hypotheses.
+
+Compute difference measures:
+
+Overlap of TOD band with hotspots.
+
+Directional alignment of hypothesis updates vs evidence types.
+
+Then classify cases into CrossAgentFinding categories.
+
+3.3 Module 3: Bias Pattern Detector
+Building on XAI‑DF and broader XAI‑for‑forensics work, this module looks for systematic bias signals.
+
+Categories:
+
+Modality dominance
+
+One modality (e.g., digital anomalies) accounts for >X% of argument strength while another relevant modality (autopsy, scene context) is under‑used.
+
+Example: Hypothesis Manager’s homicide probability rests almost entirely on digital anomalies, with autopsy and TOD providing weak support.
+
+Selection bias / evidence cherry‑picking
+
+NBE has suggested additional evidence but it wasn’t fetched; yet strong claims are made.
+
+Certain types of evidence (e.g., exculpatory logs or cameras) are consistently absent.
+
+Dataset shift
+
+Calibration stats indicate model trained on a different population (e.g., temperate climate, different device ecosystem), while this case is out‑of‑distribution (e.g., extreme temperatures, unusual devices).
+
+LLM‑specific risks
+
+Long chains of LLM reasoning with:
+
+No strong data anchors (few numeric or grounded references).
+
+Heavy reliance on prior text patterns → risk of hallucinated explanations.
+
+Implementation:
+
+Heuristic rules + simple metrics + an LLM auditor:
+
+Heuristics flag candidate bias issues.
+
+LLM is given a structured snapshot and asked:
+
+“Do you see potential data or reasoning bias here? Explain and categorize.”
+
+Consistent with XAI‑DF frameworks that place bias analysis as a first‑class concern in forensic AI workflows.
+
+3.4 Module 4: Escalation Decision Engine
+This module operationalizes “Don’t guess, escalate”.
+
+Inputs:
+
+ModelUncertaintyAssessments.
+
+CrossAgentFindings.
+
+BiasFlags.
+
+Configurable policies.
+
+Rules:
+
+Hard escalation conditions (CRITICAL):
+
+Cross‑agent conflict with high severity (e.g., TOD and decomposition in strong contradiction).
+
+High‑impact hypothesis (e.g., homicide vs accident) backed mainly by poorly calibrated or biased models.
+
+Large data gaps in critical window (wide TOD, near‑zero evidence).
+
+Soft escalation conditions (WARN):
+
+One model is known poorly calibrated but another model partially supports it.
+
+Possible actions:
+
+HUMAN_REVIEW_REQUIRED for:
+
+Specific hotspots.
+
+Hypothesis decisions.
+
+TOD band acceptance.
+
+DO_NOT_AUTOMATE:
+
+System should not auto‑generate final legal narrative or classification; only exploratory suggestions.
+
+COLLECT_MORE_DATA:
+
+Trigger NBE suggestions to fill gaps (e.g., “consider retrieving CCTV for [time, location] to reduce uncertainty”).
+
+This line up with forensic XAI recommendations: AI should flag when it doesn’t “know” enough and must escalate.
+
+3.5 Module 5: Narrative Generator & UI Interface
+Based on the report structures, an LLM generates investigator‑friendly explanations:
+
+Section per component:
+
+“TOD estimation is fairly confident (window width 6 hours). The TOD model has been validated and calibrated on similar conditions, but ambient temperature differs slightly from its training distribution.”
+
+Cross‑agent summary:
+
+“Autopsy and TOD support an early‑morning death; digital evidence suggests a critical anomaly earlier in the night but with lower calibration confidence.”
+
+Bias & escalation section:
+
+“High homicide probability is primarily driven by digital anomalies; due to poor calibration and missing CCTV in the TOD window, we recommend human review before relying on this conclusion.”
+
+XAI‑for‑digital‑forensics papers emphasize that human‑readable explanations and bias/uncertainty annotations are key for legal admissibility and trust.
+
+4. Detailed Workflow for a Case
+Let’s run through a full example.
+
+4.1 Upstream context
+Assume:
+
+Autopsy Agent:
+
+Cause: blunt force trauma to head.
+
+Manner estimate: homicide 0.6, accident 0.3, others low.
+
+Good quality autopsy.
+
+TOD Agent:
+
+TOD median: 03:30.
+
+95% band: 23:30–07:00.
+
+Physics + ML agree reasonably; consistency with signs is good.
+
+Timeline & Anomaly Agent:
+
+High anomaly window 22:00–23:00: unusual movement and phone behavior.
+
+Another smaller anomaly at 03:15 near TOD but with moderate scores.
+
+Hotspot Agent:
+
+Hotspot #1: 22:00–23:00, score 0.87, strongly supports homicide.
+
+Hotspot #2: 03:00–04:00, score 0.65, weaker.
+
+Hypothesis Manager:
+
+Homicide: 0.8, Accident: 0.15, Natural/Suicide: low.
+
+4.2 Step 1 – Model-level UQ & Calibration
+TOD model:
+
+Calibrated on similar data; Brier score good. Marked GOOD calibration, low overconfidence risk.
+
+Anomaly AE+IF:
+
+Calibrated globally but domain difference: training came mainly from urban telecom logs; this case from rural environment. Mark QUESTIONABLE calibration due to mild dataset shift.
+
+Hotspot scorer:
+
+Recently trained; limited labeled hotspots → calibration uncertain (high Brier, high ECE). Mark POOR or UNKNOWN, high overconfidence risk.
+
+Hypothesis Manager:
+
+Uses heuristics + LLM; probabilities are meta‑inferred, not learnable calibration. Mark as UNKNOWN calibration, medium overconfidence risk.
+
+4.3 Step 2 – Cross‑Agent Consistency
+Findings:
+
+TOD vs Hotspots
+
+Hotspot #1 (22–23) is partially outside TOD band, mostly separated in time.
+
+Hotspot #2 overlaps strongly with TOD band.
+
+But Hotspot #1 has much higher score.
+
+Autopsy vs Hotspots
+
+Autopsy indicates high homicide likelihood but does not specify an exact event time; both hotspots are consistent with homicide mechanism.
+
+Hypothesis reliance
+
+Hypothesis Manager’s jump from homicide 0.6 → 0.8 occurred mainly after Hotspot #1, not after TOD update.
+
+CrossAgentFindings:
+
+CONFLICT: “Key hotspot driving homicide increase lies significantly before TOD median and partially outside TOD band.”
+
+UNSUPPORTED_HIGH_CONFIDENCE: “Hypothesis Manager heavily weights Hotspot #1 despite low calibration of hotspot scorer.”
+
+Severity: WARN or CRITICAL depending on thresholds.
+
+4.4 Step 3 – Bias Pattern Detection
+Patterns:
+
+Modality dominance:
+
+Digital anomalies & hotspot #1 contribution accounts for ~70% of argument strength; TOD & autopsy contribute the rest.
+
+Selection bias / data gaps:
+
+There is limited CCTV or phone data in TOD band; most data is earlier in the night.
+
+BiasFlags:
+
+MODALITY_DOMINANCE (WARN): digital anomalies overshadow core physical evidence.
+
+DATA_GAP (CRITICAL): sparse digital evidence between 02:30–04:30 around TOD.
+
+These concerns echo XAI frameworks that highlight modality balance and data completeness in forensic decision support.
+
+4.5 Step 4 – Escalation Decision
+Given:
+
+TOD is well‑calibrated and strongly points to 03:30 ± a few hours.
+
+The main homicide‑supporting hotspot is earlier and relies on a poorly calibrated scorer.
+
+There is sparse digital evidence in TOD band.
+
+The engine triggers:
+
+HUMAN_REVIEW_REQUIRED for:
+
+Hotspot #1 as a homicide‑critical hotspot.
+
+Hypothesis probabilities (0.8 homicide may be over‑confident).
+
+COLLECT_MORE_DATA suggesting:
+
+“Acquire additional digital evidence (CCTV, phone logs) in TOD band [02:00–05:00] if possible.”
+
+It may also recommend not using hotspot scores as sole justification in legal reports.
+
+This behaviour is exactly what uncertainty‑calibrated forensic orchestrator frameworks encourage: fusing heterogeneous cues, checking reliability, and abstaining when signals conflict or confidence is not backed by calibration.
+
+4.6 Step 5 – Narrative Output
+The Narrative Generator produces text for UI and audit:
+
+“The estimated TOD is between 23:30 and 07:00, centered around 03:30, with good model calibration. Anomaly and hotspot models highlight a notable pattern around 22:00–23:00, but these models are less well calibrated for this case’s data distribution. The current increase in homicide probability relies heavily on this earlier hotspot, while digital evidence around the likely time of death is sparse. We therefore flag a potential over‑reliance on digital anomalies and recommend human review and, where possible, collection of additional evidence near the TOD window.”
+
+This mirrors XAI‑for‑forensics systems that combine AI decisions with SHAP/LIME‑style explanations and explicit statements of reliability and limitations.
+
+5. How This Agent Interacts with Others
+TOD Agent
+
+Provides TOD distribution and model metadata.
+
+Receives “calibration quality” feedback in logs.
+
+Timeline & Anomaly Agent
+
+Supplies anomaly windows and calibration info.
+
+May adjust thresholds based on global calibration feedback over time.
+
+Hotspot & Correlation Agent
+
+Supplies hotspot scores and components; receives “over‑confidence” warnings.
+
+Hypothesis Manager
+
+Gets bias & uncertainty flags to show on graph nodes and adjust how aggressively it pushes probabilities into narrative.
+
+NBE Agent
+
+Uses DATA_GAP and calibration issues to propose new evidence collection.
+
+Replay/Reasoning Theater Agent
+
+Incorporates major warnings/escalations into the replay script: “At this point, the system recognized conflicting signals and flagged them for human review.”
+
+6. Implementation Considerations
+Data structures
+
+Calibration statistics per model stored in long‑term tables.
+
+Per‑case UncertaintyReports stored and referenced in audit logs.
+
+Metrics & tooling
+
+Use standard UQ and calibration toolkits for calculating Brier, ECE, reliability diagrams, z‑score diagnostics.
+
+Legal & ethical
+
+The agent’s outputs (warnings, calibration status, escalation decisions) are part of the defensible record of how AI was used, aligning with recommendations for XAI in forensic investigations and cybercrime analysis.

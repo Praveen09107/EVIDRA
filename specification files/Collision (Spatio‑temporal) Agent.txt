@@ -1,0 +1,640 @@
+The Collision (Spatio‑temporal) Agent is the glue between raw events (phone, CCTV, IoT, etc.) and higher‑level reasoning (hotspots, hypotheses). I’ll treat it as a full subsystem: purpose, contracts, architecture, algorithms for spatio‑temporal joins, patterns, and an end‑to‑end example.
+
+1. Purpose and Scope
+1.1 What the Collision Agent does
+The Collision Agent’s job is to answer questions of the form:
+
+“Who/what was co‑located with the victim at time 
+t
+t?”
+
+“Did the suspect and victim ever overlap in space and time?”
+
+“Which devices/streams agree or disagree about where the victim was at a given time?”
+
+Formally, it:
+
+Maintains a spatio‑temporal index of events from multiple sources (CCTV, phone, IoT, network, scene logs).
+
+Computes collision events: overlapping trajectories, contacts, presence in the same region within a time tolerance.
+
+Exposes these collisions as:
+
+KeyEvent objects for the Timeline & Hotspot agents.
+
+Structured edges (co‑presence, consistency, contradiction) for the Argument Graph.
+
+This is conceptually similar to hotspot and event‑correlation systems in operations/monitoring: they correlate multiple streams to find overlapping root causes or incidents.
+
+1.2 What it does not do
+It does not estimate TOD, anomaly scores, or hypotheses.
+
+It does not run image detection itself (that’s the Image Agent); it consumes tracks/positions from that agent.
+
+It does not produce final “guilt” judgments; it only outputs structured collision events that reasoning agents use.
+
+2. Data Contracts
+2.1 Inputs
+The Collision Agent consumes normalized spatio‑temporal tracks/events:
+
+ts
+CollisionInput {
+  caseId: string;
+  entities: EntityTrack[];           // person/device trajectories
+  regionDefinitions: RegionDef[];    // zones (rooms, streets, areas)
+  timeWindowsOfInterest?: TimeWindow[]; // e.g., TOD band, hotspots
+}
+2.1.1 EntityTrack
+Tracks represent the trajectory of a person, device, or object:
+
+ts
+EntityTrack {
+  entityId: string;       // "victim", "suspect_A", "device_IMEI_123", "cam_person_7"
+  kind: "PERSON" | "DEVICE" | "OBJECT";
+
+  source: "CCTV" | "PHONE" | "IOT" | "SCENE" | "MANUAL";
+  segments: TrackSegment[];
+  confidence: number;     // global track confidence 0–1
+}
+ts
+TrackSegment {
+  start: string;
+  end: string;
+
+  // One of:
+  regionId?: string;      // discrete zone (e.g. "Room-101", "Hallway-2")
+  location?: {
+    lat: number;
+    lon: number;
+    accuracyMeters?: number;
+  };
+
+  attributes?: Record<string, any>;  // camera ID, device type, etc.
+  confidence: number;
+}
+Tracks come from:
+
+Image Agent (CCTV person tracks, mapped to regions).
+
+Phone/IOT/scene logs converted into approximate regions or coordinates.
+
+2.1.2 Region definitions
+ts
+RegionDef {
+  id: string;            // "Room-101", "Entrance", "Parking-Lot-A"
+  label: string;
+  polygon?: LatLon[];    // if using geospatial coordinates
+  adjacency?: string[];  // neighboring regions
+  type?: "INTERIOR" | "EXTERIOR" | "STAIRS" | "ELEVATOR" | "OTHER";
+}
+2.1.3 Time windows of interest
+Typically from:
+
+TOD 95% band.
+
+Hotspot windows.
+
+Investigator‑selected intervals.
+
+ts
+TimeWindow {
+  id: string;
+  start: string;
+  end: string;
+  label?: string;        // "TOD_95", "Hotspot_1"
+}
+2.2 Outputs
+The core output is a set of CollisionEvents:
+
+ts
+CollisionResult {
+  caseId: string;
+  collisions: CollisionEvent[];
+}
+ts
+CollisionEvent {
+  id: string;
+  caseId: string;
+
+  timeWindow: { start: string; end: string };
+  regionId?: string;              // where collision occurred (if region-based)
+  locationEstimate?: { lat: number; lon: number; radiusMeters: number };
+
+  participants: CollisionParticipant[];
+  type: "CO_PRESENCE" | "NEAR_MISS" | "CONSISTENCY" | "CONTRADICTION";
+  sourceEvidence: DataReference[]; // which tracks/events support this
+  confidence: number;             // 0–1
+
+  explanation: string;            // narrative description
+}
+ts
+CollisionParticipant {
+  entityId: string;              // e.g., "victim", "suspect_A", "device_IMEI_..."
+  role: "VICTIM" | "SUSPECT" | "DEVICE" | "OTHER";
+  sources: ("CCTV" | "PHONE" | "IOT" | "SCENE" | "MANUAL")[];
+}
+Additionally, the agent can emit KeyEvents, which the rest of the system already uses:
+
+ts
+KeyEvent {
+  id: string;
+  caseId: string;
+  timestamp: string;             // typical center of collision window
+  type: "CCTV_CO_PRESENCE" | "PHONE_CCTVSYNC" | "DEVICE_LOCATION_CONFLICT" | ...;
+  severity: "INFO" | "INTERESTING" | "CRITICAL";
+  description: string;
+  attributes: Record<string, any>;  // regionId, entityIds, etc.
+}
+These KeyEvents are how Collision Agent feeds Timeline/Hotspot views and Hypothesis Manager.
+
+3. Internal Architecture
+High‑level:
+
+text
+Tracks + Regions + Time Windows
+    ↓
+Spatio-Temporal Index Builder
+    ↓
+Collision Engine (pairwise & group collisions)
+    ↓
+Consistency & Contradiction Analyzer
+    ↓
+Event Extraction & Explanation Layer
+    ↓
+CollisionResult + KeyEvents + graph edges
+This mirrors architectures in event‑correlation and hotspot localization systems, which build multi‑stream indices, then detect overlapping patterns, then localize anomalies/hotspots.
+
+3.1 Spatio‑Temporal Index Builder
+3.1.1 Time indexing
+Build an index over TrackSegments by time:
+
+E.g., interval tree or segment tree keyed by [start, end].
+
+This allows efficient queries:
+
+“What segments overlap with time 
+t
+t?”
+
+“Which entities are in region R between T1–T2?”
+
+3.1.2 Space indexing
+Two possible representations:
+
+Region‑based (discrete zones):
+
+Each TrackSegment has a regionId.
+
+For geospatial coordinates, pre‑map them to nearest region polygon (point‑in‑polygon, nearest facility, etc.).
+
+Coordinate‑based:
+
+Use a geospatial index (e.g., R‑tree) over (lat, lon, time).
+
+Define distance thresholds for “same place” (e.g. < 10–20 meters).
+
+Given we’re mostly on CCTV / indoor building context, region‑based is likely primary, with optional coordinate support outdoors.
+
+3.1.3 Uncertainty modeling
+Each segment has confidence and, for coordinates, accuracyMeters.
+
+We propagate these into collision confidence later.
+
+This is similar to multi‑modal data fusion frameworks which track uncertainty at the representation level and propagate it through detection.
+
+3.2 Collision Engine
+Core idea: find overlapping occupancy in space–time among relevant entities and devices.
+
+There are three primary classes:
+
+Co‑presence: victim and suspect/others in same region at overlapping times.
+
+Co‑support / consistency: different data sources (phone vs CCTV) agree on victim’s location.
+
+Contradiction: sources disagree (phone says far away, CCTV shows on‑scene).
+
+3.2.1 Co‑presence detection
+For all entity pairs (or specifically victim × others):
+
+Algorithm (region‑based):
+
+For entity A and B:
+
+Iterate their segments in sorted time order.
+
+For each segment pair 
+(
+s
+a
+,
+s
+b
+)
+(s 
+a
+​
+ ,s 
+b
+​
+ ):
+
+Compute temporal overlap:
+
+t
+s
+t
+a
+r
+t
+=
+max
+⁡
+(
+s
+a
+.
+s
+t
+a
+r
+t
+,
+s
+b
+.
+s
+t
+a
+r
+t
+)
+t 
+start
+​
+ =max(s 
+a
+​
+ .start,s 
+b
+​
+ .start)
+
+t
+e
+n
+d
+=
+min
+⁡
+(
+s
+a
+.
+e
+n
+d
+,
+s
+b
+.
+e
+n
+d
+)
+t 
+end
+​
+ =min(s 
+a
+​
+ .end,s 
+b
+​
+ .end)
+
+If 
+t
+e
+n
+d
+−
+t
+s
+t
+a
+r
+t
+>
+minOverlapDuration
+t 
+end
+​
+ −t 
+start
+​
+ >minOverlapDuration (e.g. 10–30s), proceed.
+
+Check spatial overlap:
+
+If region‑based: s_a.regionId == s_b.regionId.
+
+If coordinate‑based: distance between locations is below threshold.
+
+If both temporal and spatial overlap conditions hold, create a candidate co‑presence collision.
+
+Optionally, restrict to time windows of interest (TOD band, hotspots) to focus on relevant collisions.
+
+This is conceptually similar to hotspot localization algorithms that look for concurrent anomalies in multi‑KPI streams within spatial neighborhoods.
+
+3.2.2 Co‑support / consistency
+For a single entity (e.g., the victim), we compare tracks from different modalities:
+
+Example:
+
+Phone location track: region = “Home” between 01:00–03:00.
+
+CCTV track: victim in “Bar” at 02:15.
+
+We want to know:
+
+Where phone & CCTV both place the victim in same region/time.
+
+Where they diverge.
+
+Algorithm:
+
+For each entity:
+
+Merge all segments across sources into a per‑source list.
+
+For each time slice (e.g. 1‑min bucket):
+
+Gather sources’ locations.
+
+If multiple sources agree → generate CONSISTENCY collision (support).
+
+If they disagree beyond tolerance → CONTRADICTION collision.
+
+This is akin to multi‑sensor fusion and conflict detection: aligning different modalities and identifying conflicting evidence.
+
+3.2.3 Contradiction detection
+Explicit contradictions drive argument graph edges and bias checks:
+
+Victim’s phone is registered in cell ~10 km away while CCTV shows them at crime scene.
+
+Suspect claims to be at home (manual/scene claim node) but phone/CCTV collisions show them at location X.
+
+The Collision Agent:
+
+Emits CONTRADICTION CollisionEvents.
+
+Tags them with relevant claims/hypotheses (via Claim Extractor/Evidence–Claim Mapper downstream).
+
+3.3 Confidence & Scoring for CollisionEvents
+Each CollisionEvent gets a confidence score based on:
+
+Track confidence(s) and segment confidence(s).
+
+Number of modalities supporting the collision (multi‑modal collisions more robust).
+
+Spatial/temporal uncertainty (accuracyMeters, overlapping duration).
+
+Heuristic formula:
+
+conf
+=
+w
+1
+⋅
+temporalOverlapFactor
++
+w
+2
+⋅
+modalitiesFactor
++
+w
+3
+⋅
+trackConfidenceFactor
+conf=w 
+1
+​
+ ⋅temporalOverlapFactor+w 
+2
+​
+ ⋅modalitiesFactor+w 
+3
+​
+ ⋅trackConfidenceFactor
+Where:
+
+temporalOverlapFactor scales with duration of overlap.
+
+modalitiesFactor grows with number of agreeing sources (CCTV + phone + IoT).
+
+trackConfidenceFactor is some aggregate of segment/global confidences.
+
+These confidences later feed Hypothesis Manager and Bias Monitor.
+
+3.4 Event Extraction & Explanation Layer
+Once collision candidates are found:
+
+Filtering & aggregation
+
+Merge multiple small overlaps into a single CollisionEvent when:
+
+Same participants, region, near‑continuous time.
+
+Drop trivial collisions (low confidence, very short overlaps, far from TOD/hotspots).
+
+KeyEvent synthesis
+
+For important collisions (e.g., victim + suspect, or contradictions with claims), generate KeyEvents that appear in the timeline UI, like:
+
+“Victim and suspect A observed together in Stairwell 2 at 01:47 (CCTV).”
+
+“Victim’s phone location and CCTV disagree at 02:20.”
+
+Narrative explanation
+
+For each CollisionEvent, use an LLM to generate explanation, referencing:
+
+Participants, region, source modalities, time range, and relation to TOD/hotspots.
+
+Example:
+
+“Between 01:46 and 01:50, CCTV cameras in Stairwell 2 show the victim and suspect A in the same location. Phone logs place both devices near the building at this time, providing multi‑modal confirmation of co‑presence.”
+
+This aligns with event‑correlation best practices: similar systems generate human‑readable incident tickets summarizing correlated events.
+
+4. Integration with Other Agents
+4.1 Timeline & Anomaly Agent
+Receives KeyEvents from Collision Agent:
+
+They appear as overlay markers in the timeline (e.g., special icons or rows).
+
+Collision events can also influence anomaly interpretation:
+
+A time period with anomalies + collisions becomes a stronger candidate hotspot.
+
+4.2 Hotspot Agent
+Uses CollisionEvents as one of its input modalities:
+
+When scoring hotspots, collisions increase f_events term (see previous spec).
+
+Hotspots may require a minimum strength of collisions + anomalies + TOD overlap.
+
+4.3 Argument Graph & Hypothesis Manager
+CollisionEvents become EVIDENCE nodes:
+
+Co‑presence events support hypotheses about opportunity / contact.
+
+Contradiction events undermine exculpatory claims or strengthen suspicion.
+
+Evidence–Claim Mapper links collisions to claims such as:
+
+“Suspect A was not at the scene after 01:00” → contradicted by co‑presence event.
+
+Hypothesis Manager uses collisions as factors in computing homicide vs accident vs suicide probabilities.
+
+4.4 Bias & Uncertainty Monitor
+Reads collisions to:
+
+Flag when key hypotheses rely on single‑modality collisions (e.g., only CCTV, no phone corroboration).
+
+Highlight conflicting evidence streams that may require human review.
+
+5. Example End‑to‑End Collision Scenario
+Case context (simplified):
+
+Victim supposedly fell/staged incident in an industrial building.
+
+Suspect A claims to be at home all night.
+
+TOD median 03:30, 95% [23:30–07:00].
+
+CCTV cameras on entrance, lobby, stairwell, roof.
+
+Phone logs for victim and suspect.
+
+5.1 Tracks
+Victim track (CCTV):
+
+01:40–01:45 in Lobby (region Lobby).
+
+01:45–01:52 in Stairwell 2 (region Stairwell-2).
+
+01:52–02:00 on Roof (region Roof).
+
+Suspect A track (CCTV):
+
+01:47–01:51 in Stairwell 2.
+
+Victim phone:
+
+01:40–01:50 near building (region Outside / Lobby, coarse).
+
+Suspect phone:
+
+01:00–01:30 near “Home”.
+
+01:35–02:15 near industrial building.
+
+5.2 Collision Engine results
+Co‑presence:
+
+Victim + Suspect A overlapping 01:47–01:50 in Stairwell-2:
+
+From CCTV: two person tracks with same region/time.
+
+Victim + suspect devices near building at similar time: phone logs.
+
+Consistency:
+
+Victim CCTV & phone both near building during 01:40–01:50.
+
+Suspect CCTV & phone both near building during 01:40–02:00.
+
+Contradiction:
+
+Suspect’s prior claim (from Claim Extractor) that they stayed home:
+
+Collision evidence shows they were at the building; thus a contradiction.
+
+5.3 CollisionEvents
+Example co‑presence event:
+
+ts
+{
+  id: "coll-01",
+  caseId: "C123",
+  timeWindow: { start: "2026-05-09T01:47:00Z", end: "2026-05-09T01:50:00Z" },
+  regionId: "Stairwell-2",
+  participants: [
+    { entityId: "victim", role: "VICTIM", sources: ["CCTV", "PHONE"] },
+    { entityId: "suspect_A", role: "SUSPECT", sources: ["CCTV", "PHONE"] }
+  ],
+  type: "CO_PRESENCE",
+  sourceEvidence: [
+    { type: "TRACK", id: "track-victim-cctv-01" },
+    { type: "TRACK", id: "track-suspectA-cctv-02" },
+    { type: "TRACK", id: "track-victim-phone-01" },
+    { type: "TRACK", id: "track-suspectA-phone-01" }
+  ],
+  confidence: 0.95,
+  explanation: "Between 01:47 and 01:50, CCTV cameras in Stairwell 2 show both the victim and suspect A. Phone location data for both devices also places them near the building at this time, yielding high-confidence co-presence evidence."
+}
+Contradiction:
+
+ts
+{
+  id: "coll-02",
+  caseId: "C123",
+  timeWindow: { start: "2026-05-09T01:40:00Z", end: "2026-05-09T02:00:00Z" },
+  regionId: "Building",
+  participants: [
+    { entityId: "suspect_A", role: "SUSPECT", sources: ["CCTV", "PHONE"] }
+  ],
+  type: "CONTRADICTION",
+  sourceEvidence: [
+    { type: "CLAIM", id: "claim-suspectA-at-home" },
+    { type: "TRACK", id: "track-suspectA-cctv-02" },
+    { type: "TRACK", id: "track-suspectA-phone-01" }
+  ],
+  confidence: 0.9,
+  explanation: "Suspect A stated they remained at home throughout the night, but both CCTV and phone records place them at the industrial building between 01:40 and 02:00, contradicting their statement."
+}
+KeyEvents:
+
+CCTV_CO_PRESENCE at 01:48.
+
+DEVICE_LOCATION_CONFLICT if phone vs claim disagree.
+
+These are then surfaced in Timeline & Hotspot UI and used in argument graph updates.
+
+6. Implementation Notes
+Data structures
+
+Interval trees for time; dictionaries per region.
+
+If coordinates used, geospatial index (R‑tree or grid) for approximate nearest queries.
+
+Scalability
+
+Since per case event volumes are modest, O(N log N) pairwise segment scanning is fine.
+
+For large multi‑person cases, limit collisions to entities of interest (victim, suspects, key devices).
+
+Robustness
+
+Handle uncertain or missing coordinates by falling back to rough regions (e.g. cell tower area).
+
+Ensure collisions have explicit confidence and note when driven by single vs multiple modalities.
+
+Alignment with literature
+
+Follows multi‑modal fusion approaches: separate encoders for each modality, then fusion at intermediate layers (spatio‑temporal joins).
+
+Follows event‑correlation / hotspot frameworks which localize anomalies in multi‑KPI/multi‑stream scenarios.
+

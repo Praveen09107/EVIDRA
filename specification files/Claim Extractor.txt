@@ -1,0 +1,439 @@
+1. Purpose and Scope
+1.1 Why we need a Claim Extractor
+Most raw text in a case—witness statements, interview transcripts, police reports, chats, call notes—contains a mix of:
+
+Background description
+
+Feelings/opinions
+
+Claims: concrete factual assertions that can be supported or contradicted by evidence
+
+Argument mining research treats claim detection as a core step: identify the propositions that act as conclusions or key assertions in an argument, often followed by extracting premises and their support/attack relations.
+
+Fact‑checking and verification pipelines explicitly start with claim extraction, then do evidence retrieval and claim–evidence matching to decide if a claim is supported, refuted, or unverifiable.
+
+In AIVENTRA:
+
+The Claim Extractor converts free‑text (statements, reports, chat logs) into structured Claim objects.
+
+The Evidence–Claim Mapper (a separate agent) later decides whether each piece of evidence supports / contradicts / is neutral w.r.t. these claims via NLI‑style reasoning.
+
+The Argument Graph builder then uses claims as nodes, with edges from evidence and to hypotheses.
+
+The Claim Extractor’s goal is high recall, clean structure, and good alignment with entities/time/space, not final truth or support status.
+
+1.2 What counts as a claim here
+We define a claim as:
+
+A factual or quasi‑factual proposition about the world that could, in principle, be true or false and can be tied to evidence.
+
+Examples:
+
+“The victim left the bar alone at around 23:00.”
+
+“Suspect A was at home all night.”
+
+“The door was locked from the inside when police arrived.”
+
+This matches definitions in claim detection / argument mining and fact‑checking literature.
+
+We de‑prioritize:
+
+Pure opinions (“I think the victim was depressed”).
+
+Very vague statements without testable predicate (“Something felt wrong that night”), though we can keep some as soft context claims.
+
+2. Data Contracts
+2.1 Input
+At API level:
+
+ts
+ClaimExtractionRequest {
+  caseId: string;
+  documents: ClaimSourceDocument[];
+}
+ts
+ClaimSourceDocument {
+  id: string;
+  type: "WITNESS_STATEMENT" | "INTERVIEW_TRANSCRIPT" | "POLICE_REPORT" |
+        "CHAT_LOG" | "EMAIL" | "OTHER";
+  speakerId?: string;          // who wrote/said it
+  channel?: "TEXT" | "VOICE_ASR" | "REPORT";
+  language: string;            // "en", "ta", ...
+  content: string;             // raw text (already OCR/ASR'd)
+  timestamp?: string;          // when it was produced
+  meta?: Record<string, any>;  // interview number, etc.
+}
+We assume ASR/OCR + basic cleaning happened earlier.
+
+2.2 Output: Claim objects
+Core structure:
+
+ts
+ClaimExtractionResult {
+  caseId: string;
+  documentId: string;
+  claims: Claim[];
+}
+ts
+Claim {
+  id: string;
+  caseId: string;
+  sourceDocumentId: string;
+  sourceSpan: {
+    startChar: number;
+    endChar: number;
+    sentenceIndex: number;
+  };
+
+  text: string;                // original claim sentence or clause
+  normalizedText: string;      // canonical / simplified wording
+
+  subjectEntities: EntityRef[];  // victim, suspect_A, etc.
+  predicate: string;             // e.g. "was at location", "called", "paid money to"
+  objects: EntityRef[];          // location, other persons, objects
+
+  timeInfo?: ClaimTime;
+  locationInfo?: ClaimLocation;
+
+  polarity: "ASSERT" | "DENY" | "UNCERTAIN";
+  claimType: "EVENT" | "STATE" | "ALIBI" | "CAUSAL" | "MENTAL_STATE" | "NORMATIVE";
+  certainty: number;            // 0–1, from hedging/linguistic cues
+
+  argumentativeRole?: "MAIN_CLAIM" | "SUB_CLAIM" | "PREMISE" | "BACKGROUND";
+  speakerId?: string;           // from document metadata
+}
+ts
+EntityRef {
+  entityId?: string;           // internal case entity (victim, suspect_A, etc.)
+  surfaceForm: string;        // “he”, “John”, “the victim”
+  type: "PERSON" | "LOCATION" | "OBJECT" | "ORGANIZATION" | "EVENT";
+}
+
+ClaimTime {
+  rawText: string;            // "around 11 pm", "two hours earlier"
+  normalizedInterval?: { start: string; end: string }; // ISO if resolvable
+  relation: "EVENT_TIME" | "BEFORE_TOD" | "AFTER_TOD" | "UNSPECIFIED";
+}
+
+ClaimLocation {
+  rawText: string;            // "the bar", "at home", "Stairwell 2"
+  regionId?: string;          // mapped region (Collision Agent’s regionId)
+}
+This follows patterns from argument mining (claims vs premises) and structured fact‑checking tasks, where claims are normalized and coupled with entities/time/space for later verification.
+
+We may also maintain a ClaimGraph:
+
+ts
+ClaimGraph {
+  claims: Claim[];
+  edges: ClaimRelation[];
+}
+
+ClaimRelation {
+  id: string;
+  fromClaimId: string;
+  toClaimId: string;
+  relation: "CONTRADICTS" | "SUPPORTS" | "REFINES" | "TEMPORALLY_BEFORE";
+  confidence: number;
+}
+where CONTRADICTS is detected by an NLI model across statements (see §3.4). Legal NLP work has demonstrated that contradiction detection between statements using modern NLI models is feasible and useful in proceedings.
+
+3. Internal Architecture
+Pipeline:
+
+text
+Source doc
+  ↓
+Preprocessing & Segmentation
+  ↓
+Claim Candidate Detection (binary & multi-class)
+  ↓
+Claim Structuring & Canonicalization
+  ↓
+Entity Linking & Coreference
+  ↓
+Intra-text Claim-Claim Relations (optional)
+  ↓
+Validation & Deduplication
+  ↓
+Claims + ClaimGraph
+This mirrors high‑level AFC/argument‑mining pipelines: claim detection → structuring → relation extraction.
+
+3.1 Preprocessing & Segmentation
+Steps:
+
+Normalize text:
+
+Fix whitespace, remove OCR artifacts, run basic sentence boundary detection.
+
+Segment into units:
+
+Use sentence splitting appropriate for transcripts (speaker turns, punctuation).
+
+Optionally further split into clauses for complex sentences.
+
+Output: list of candidate utterances or clauses, each with speaker & offsets.
+
+Argument mining work typically treats sentences or clauses as units for claim detection.
+
+3.2 Claim Candidate Detection
+We want to label each utterance/clause with:
+
+isClaim yes/no, and
+
+claimType (event, alibi, causal, etc.), plus polarity/certainty.
+
+This stage corresponds to claim detection in AFC/argument mining frameworks.
+
+3.2.1 Model choice
+Use a transformer‑based classifier:
+
+Input: "[SPEAKER=John] I saw the victim leave the bar alone at around 11 pm."
+
+Output:
+
+isClaim = 1
+
+claimType = EVENT
+
+polarity = ASSERT
+
+certainty ~ 0.8
+
+Claim detection models trained on argumentation corpora and FEVER‑style data have shown strong ability to identify check‑worthy claims.
+
+For domain adaptation:
+
+Start with a general claim‑detection model (fine‑tuned BERT/RoBERTa).
+
+Fine‑tune on legal/forensic texts (online crime reports, legal decisions, etc.).
+
+3.2.2 Heuristics & thresholds
+Combine model outputs with heuristics:
+
+Discard sentences with no verb or only emotion (“I was shocked”) unless flagged as important by argument mining.
+
+Prioritize sentences containing:
+
+Named entities (people, locations).
+
+Time expressions.
+
+Verbs like “was”, “went”, “saw”, “called”, “paid”, “gave”, etc.
+
+This reflects observations that argumentative claims often have specific rhetorical structures and content cues, relatively domain‑independent.
+
+3.3 Claim Structuring & Canonicalization
+Once we know a unit is a claim, we want to structure it:
+
+Extract semantic roles:
+
+Subject (who).
+
+Predicate (what happened).
+
+Objects (to whom/what).
+
+Time and location.
+
+Normalize the text:
+
+Remove hedging phrases, reorder for canonical “subject–predicate–object” form.
+
+E.g. “I think that maybe John left sometime around 11 after talking with Sarah” →
+
+normalized: “John left the bar around 23:00 after talking with Sarah.”
+
+Approach:
+
+Use a combination of:
+
+Dependency parsing / SRL (semantic role labeling).
+
+LLM‑based semantic parsing to fill our Claim schema.
+
+Scientific/online crime report extraction systems follow very similar patterns: combine IE (NER/SRL) with argument schemes to populate structured propositions.
+
+3.4 Entity Linking & Coreference
+We need to connect surface mentions (“he”, “my friend”, “the victim”) to case entities:
+
+Use coreference resolution to cluster mentions referring to same person.
+
+Use case metadata to map clusters to canonical ids: victim, suspect_A, etc.
+
+Similarly for places:
+
+Map “the bar”, “XYZ Pub” to a location entity/region used in Collision/TOD/Timeline.
+
+Entity resolution is crucial for later mapping claims to evidence; argumentation‑driven IE for crime reports explicitly does this to tie propositions to participants (complainant, counterparty).
+
+3.5 Intra‑text claim‑claim relations (optional but powerful)
+Beyond extracting isolated claims, we can detect internal contradictions and support between statements, which helps the Gap Auditor and Bias Monitor later.
+
+Techniques:
+
+Use a pretrained NLI model (e.g., ALBERT/BERT fine‑tuned to detect contradictions) on pairs of claims:
+
+Hypothesis: claim A, Premise: claim B.
+
+Label: SUPPORT / CONTRADICT / NEUTRAL.
+
+Legal NLP work has built such contradiction detectors specifically for legal proceedings, showing good accuracy in identifying contradictory statements.
+
+Scientific/claim verification frameworks also treat claim verification as an NLI problem with labels support/contradict/no‑evidence.
+
+We then populate:
+
+ClaimRelation edges (SUPPORTS, CONTRADICTS) between claims with confidence.
+
+3.6 Validation & Deduplication
+Finally, we:
+
+Remove near‑duplicate claims:
+
+Same subject/location/time, slightly different phrasings.
+
+Keep one canonical claim and record others as paraphrases or supporting mentions.
+
+Discard extremely vague or ungroundable claims (no entities/time/location at all), unless flagged as important by a human.
+
+Ensure Claim IDs are stable and cross‑referencable for downstream mapping.
+
+4. How Claim Extractor Fits in the Overall System
+4.1 Upstream
+It receives texts from:
+
+Evidence ingestion (witness statements, reports).
+
+Autopsy narrative (optional; but often autopsy‑structured agent covers that).
+
+Digital text logs (chat, email) once pre‑parsed.
+
+4.2 Downstream
+Evidence–Claim Mapper
+
+Takes Claim objects and evidence objects (CollisionEvents, anomalies, autopsy findings, TOD results) and uses NLI/fact‑checking style models to classify each evidence–claim pair as SUPPORT/CONTRADICT/IRRELEVANT.
+
+Argument Graph Builder
+
+Uses ClaimGraph as intermediate:
+
+Nodes: hypothesis, claim, evidence.
+
+Edges: support/attack.
+
+Gap & Logic Auditor
+
+Inspects which hypotheses lack strong supporting claims, which claims are only supported by a single weak piece of evidence, and where contradictions remain unresolved.
+
+This is analogous to argumentation‑driven IE pipelines in legal/online crime contexts, where extracted propositions become nodes in a structured argument model.
+
+5. Example Walkthrough
+Consider a witness statement:
+
+“I was at the bar with the victim until about 10:30 pm. Around 11 pm I saw him leave alone, heading toward the parking lot. As far as I know, he didn’t meet anyone else there.”
+
+5.1 Segmentation
+Sentences:
+
+“I was at the bar with the victim until about 10:30 pm.”
+
+“Around 11 pm I saw him leave alone, heading toward the parking lot.”
+
+“As far as I know, he didn’t meet anyone else there.”
+
+5.2 Claim detection
+Classifier labels:
+
+isClaim=1, claimType=EVENT/STATE, polarity=ASSERT.
+
+isClaim=1, claimType=EVENT, polarity=ASSERT.
+
+isClaim=1, claimType=ALIBI/NEGATIVE_EVENT, polarity=DENY, certainty somewhat lower (hedge “as far as I know”).
+
+5.3 Structuring & entity linking
+Claims extracted:
+
+Claim C1
+
+text: “I was at the bar with the victim until about 10:30 pm.”
+
+normalized: “Witness and victim were at the bar until approximately 22:30.”
+
+subjectEntities: [witness, victim].
+
+predicate: “were_at_location_together”.
+
+objects: [location=bar].
+
+timeInfo: [start < unspecified; end ~ 22:30].
+
+claimType: EVENT/STATE, polarity=ASSERT.
+
+Claim C2
+
+text: “Around 11 pm I saw him leave alone, heading toward the parking lot.”
+
+normalized: “Victim left the bar alone around 23:00 heading toward parking lot.”
+
+subjectEntities: [victim].
+
+predicate: “left_location”.
+
+objects: [bar, parking_lot].
+
+timeInfo: ~23:00.
+
+claimType: EVENT, polarity=ASSERT.
+
+Claim C3
+
+text: “As far as I know, he didn’t meet anyone else there.”
+
+normalized: “Victim did not meet anyone else in the parking lot.”
+
+subjectEntities: [victim].
+
+predicate: “did_not_meet_person”.
+
+objects: [location=parking_lot, person=others].
+
+timeInfo: near 23:00 (implicit).
+
+claimType: ALIBI/NEGATIVE_EVENT, polarity=DENY, certainty lower.
+
+5.4 Claim relations
+C2 and C3 relate:
+
+C2: “victim went alone to parking lot.”
+
+C3: “victim did not meet others there.”
+
+We might treat C3 as supporting the proposition “victim was alone after leaving bar”, or as a refinement.
+
+Later, if Collision Agent finds a strong co‑presence event between victim and suspect A in the parking lot at 23:05, Evidence–Claim Mapper will mark:
+
+Evidence vs C3: CONTRADICT.
+
+Evidence vs claim “suspect A was at home” (from another witness or suspect) also CONTRADICT.
+
+6. Implementation Notes
+Models
+
+Sentence/clause segmentation → off‑the‑shelf or spaCy.
+
+Claim detection → transformer fine‑tuned on claim detection corpora (argument mining, FEVER).
+
+SRL/semantic parsing → either classical SRL models or LLM with function‑calling.
+
+NLI for claim‑claim and evidence‑claim relations → ALBERT/BERT‑style models fine‑tuned on contradiction/support tasks.
+
+Domain adaptation
+
+Incorporate legal/forensic corpora where arguments and claims are annotated (legal decisions, crime reports).
+
+Explainability
+
+Store source sentence and highlight spans for subject/time/location so UI can show “how the claim was parsed”, aligning with human‑centric XAI goals in claim‑level verification.
+

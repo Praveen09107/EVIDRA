@@ -1,0 +1,939 @@
+AIVENTRA — Evidence & Input Specification
+Complete Data Sources, Formats, Ingestion Pipeline & Usage Guide
+Document Type: Technical Input/Evidence Specification | Version: 1.0 | System: AIVENTRA Forensic Intelligence Platform
+
+PART I — MASTER EVIDENCE TAXONOMY
+AIVENTRA accepts six primary categories of forensic evidence. Every piece of evidence maps to exactly one category, one ingestion pathway, and one or more downstream agents.
+
+text
+EVIDENCE CATEGORY MAP
+═══════════════════════════════════════════════════════════════════════════
+Category A  │  Autopsy & Medical Documents
+Category B  │  Digital Communication Records (CDR / Call Detail Records)
+Category C  │  Location & GPS Data
+Category D  │  Financial Records
+Category E  │  Device & App Data
+Category F  │  Scene / Environmental Supplementary Documents
+═══════════════════════════════════════════════════════════════════════════
+Each category flows through a specific sub-pipeline of agents. Below is the master routing table:
+
+text
+CATEGORY → AGENT ROUTING
+═══════════════════════════════════════════════════════════════════════════════════════
+Category    │ Evidence Parser │ OCR │ Normalizer │ Autopsy │ TOD │ Digital │ Anomaly
+            │                 │     │            │  Agent  │     │Timeline │ Detector
+────────────┼─────────────────┼─────┼────────────┼─────────┼─────┼─────────┼─────────
+A (Autopsy) │      ✓          │  ✓  │     ✓      │    ✓    │  ✓  │    –    │    –
+B (CDR)     │      ✓          │  –  │     ✓      │    –    │  –  │    ✓    │    ✓
+C (Location)│      ✓          │  –  │     ✓      │    –    │  –  │    ✓    │    ✓
+D (Financial│      ✓          │  ✓  │     ✓      │    –    │  –  │    ✓    │    ✓
+E (Device)  │      ✓          │  ✓  │     ✓      │    –    │  –  │    ✓    │    ✓
+F (Scene)   │      ✓          │  ✓  │     ✓      │    ✓    │  ✓  │    –    │    –
+═══════════════════════════════════════════════════════════════════════════════════════
+All categories → Hotspot Correlator → Hypothesis Manager → Reasoning Replay → Report
+PART II — CATEGORY A: AUTOPSY & MEDICAL DOCUMENTS
+A.1 What It Is
+The official post-mortem examination report produced by a forensic pathologist. It is the single most important evidence category. It contains findings about cause of death, manner of death, time of death indicators (postmortem signs), injuries, toxicology, and body condition.
+
+A.2 Accepted Formats
+text
+FORMAT           │ MIME TYPE                   │ INGESTION PATH     │ OCR REQUIRED
+─────────────────┼─────────────────────────────┼────────────────────┼──────────────
+PDF (text-based) │ application/pdf             │ Direct text extract│ NO
+PDF (scanned)    │ application/pdf             │ PDF → image → OCR  │ YES
+DOCX             │ application/vnd.openxml…    │ python-docx extract│ NO
+JPG/PNG (scan)   │ image/jpeg, image/png       │ Direct OCR         │ YES
+TIFF             │ image/tiff                  │ Direct OCR         │ YES
+TXT              │ text/plain                  │ Direct read        │ NO
+Real-world note: In the Indian forensic context, most autopsy reports arrive as scanned PDFs (physical reports photographed or flatbed-scanned). The OCR agent handles these with Tesseract (base) + LLM correction pass.
+
+A.3 What Fields Are Extracted
+The Autopsy Agent extracts the following structured fields from the free-text report using GPT-4o class LLM with a forensic extraction prompt:
+
+text
+EXTRACTED FIELDS — AUTOPSY REPORT
+═══════════════════════════════════════════════════════════════════════════════════
+
+SECTION 1: IDENTIFICATION & METADATA
+───────────────────────────────────────────────────────────────────────────────
+Field                   │ Type     │ Example                  │ Used By
+────────────────────────┼──────────┼──────────────────────────┼────────────────
+pathologist_name        │ string   │ "Dr. R. Sharma"          │ Report (masked)
+autopsy_date            │ date     │ "2026-05-07"             │ Report, TOD
+autopsy_location        │ string   │ "AIIMS Delhi Mortuary"   │ Report
+report_reference_no     │ string   │ "PME/2026/04721"         │ Audit, Report
+examining_agency        │ string   │ "State Forensic Lab"     │ Report
+
+SECTION 2: CAUSE & MANNER OF DEATH
+───────────────────────────────────────────────────────────────────────────────
+Field                   │ Type     │ Example                  │ Used By
+────────────────────────┼──────────┼──────────────────────────┼────────────────
+cause_of_death_1a       │ string   │ "Haemorrhagic shock"     │ Autopsy Agent, Hypothesis
+cause_of_death_1b       │ string   │ "Stab wound to thorax"   │ Autopsy Agent, Hypothesis
+cause_of_death_1c       │ string   │ null                     │ Autopsy Agent
+cause_of_death_2        │ string   │ "Hypertension"           │ Autopsy Agent
+manner_of_death         │ enum     │ "HOMICIDE"               │ Hypothesis (primary signal)
+manner_confidence       │ 0.0–1.0  │ 0.91                     │ Hypothesis, Report
+
+SECTION 3: POSTMORTEM SIGNS (TOD INDICATORS)
+───────────────────────────────────────────────────────────────────────────────
+Field                   │ Type     │ Example                  │ Used By
+────────────────────────┼──────────┼──────────────────────────┼────────────────
+rigor_mortis_stage      │ enum     │ "FULL"                   │ TOD Agent (heuristic)
+livor_mortis_stage      │ enum     │ "EARLY"                  │ TOD Agent (heuristic)
+livor_distribution      │ string   │ "posterior, fixed"       │ TOD Agent
+algor_mortis_notes      │ string   │ "Body cold to touch"     │ TOD Agent
+decomposition_stage     │ enum     │ "NONE"                   │ TOD Agent (heuristic)
+rectal_temp_celsius     │ float    │ 30.0                     │ TOD Agent (Henssge)
+rectal_temp_time        │ datetime │ "2026-05-07T14:00:00Z"   │ TOD Agent (Henssge)
+body_weight_kg          │ float    │ 70.0                     │ TOD Agent (Henssge)
+
+SECTION 4: EXTERNAL EXAMINATION
+───────────────────────────────────────────────────────────────────────────────
+Field                   │ Type     │ Example                  │ Used By
+────────────────────────┼──────────┼──────────────────────────┼────────────────
+injuries_present        │ bool     │ true                     │ Hypothesis
+injury_list             │ [string] │ ["stab wound L thorax",  │ Hypothesis
+                        │          │  "contusion R temple"]   │
+defensive_wounds        │ bool     │ true                     │ Hypothesis (strong signal)
+defensive_wounds_detail │ string   │ "Linear cuts on R palm"  │ Hypothesis
+clothing_state          │ string   │ "Torn, bloodstained"     │ TOD, Hypothesis
+position_found          │ string   │ "Supine on bedroom floor"│ Report
+
+SECTION 5: INTERNAL EXAMINATION
+───────────────────────────────────────────────────────────────────────────────
+Field                   │ Type     │ Example                  │ Used By
+────────────────────────┼──────────┼──────────────────────────┼────────────────
+organ_findings          │ [string] │ ["Lungs: congested",     │ Autopsy, Report
+                        │          │  "Heart: 320g normal"]   │
+petechiae_present       │ bool     │ false                    │ Hypothesis
+hemorrhage_findings     │ string   │ "Haemothorax 500ml"      │ Hypothesis
+
+SECTION 6: TOXICOLOGY
+───────────────────────────────────────────────────────────────────────────────
+Field                   │ Type     │ Example                  │ Used By
+────────────────────────┼──────────┼──────────────────────────┼────────────────
+toxicology_performed    │ bool     │ true                     │ Autopsy, Report
+alcohol_present         │ bool     │ false                    │ Hypothesis
+alcohol_bac             │ float    │ null                     │ Hypothesis
+drugs_detected          │ [string] │ ["Alprazolam (trace)"]   │ Hypothesis
+drug_levels             │ [object] │ [{substance:"Alprazolam",│ Hypothesis
+                        │          │   level:"0.02 mg/L",     │
+                        │          │   significance:"TRACE"}] │
+poisons_detected        │ [string] │ []                       │ Hypothesis
+tox_report_reference    │ string   │ "TOX/2026/3812"          │ Report
+
+SECTION 7: SCENE / ENVIRONMENTAL (from autopsy report)
+───────────────────────────────────────────────────────────────────────────────
+Field                   │ Type     │ Example                  │ Used By
+────────────────────────┼──────────┼──────────────────────────┼────────────────
+ambient_temp_celsius    │ float    │ 18.0                     │ TOD Agent
+scene_type              │ enum     │ "INDOOR"                 │ TOD Agent
+body_surface            │ enum     │ "BED"                    │ TOD Agent
+clothing_insulation     │ enum     │ "MEDIUM"                 │ TOD Agent
+body_covered            │ enum     │ "NONE"                   │ TOD Agent
+immersion               │ enum     │ "NONE"                   │ TOD Agent
+last_seen_alive         │ datetime │ "2026-05-07T01:00:00Z"   │ TOD Agent (prior)
+found_dead_time         │ datetime │ "2026-05-07T14:00:00Z"   │ TOD Agent (prior)
+A.4 How It Flows Through the System
+text
+AUTOPSY DOCUMENT JOURNEY
+═══════════════════════════════════════════════════════════════════════════════
+
+1. UPLOAD (Layer 2)
+   └── Investigator uploads PDF via Layer 4 UI
+   └── Layer 2 receives file, computes SHA-256 hash
+   └── Encrypts with AES-256-GCM, stores in MinIO bucket "aiventra-evidence"
+   └── Inserts evidence_files record with:
+         {file_type: "AUTOPSY_REPORT", mime_type: "application/pdf",
+          file_size_bytes: N, sha256_hash: H, encryption_key_id: K}
+   └── Custody event logged: "UPLOADED" → "SYSTEM:upload"
+
+2. EVIDENCE PARSER (Agent 1)
+   └── Receives: {file_id, s3_key, mime_type: "application/pdf"}
+   └── Downloads encrypted file from MinIO, decrypts in-memory
+   └── Detects: is this PDF text-based or image-based?
+       ├── Text-based → extract text via pdfplumber
+       │     └── Returns {raw_text, page_count, confidence: 0.95}
+       └── Image-based → extract page images → route to OCR agent
+
+3. OCR AGENT (Agent 2) [only if scanned]
+   └── Receives: {images: [base64...], source: "AUTOPSY_REPORT"}
+   └── Tesseract pass: extracts raw text per page
+   └── Confidence check per page:
+       ├── If avg confidence < 0.75 → LLM correction pass
+       │     Prompt: "You are a forensic document OCR corrector.
+       │     Fix OCR errors in this medical text: [text]
+       │     Common fixes: 'rigor rnortis' → 'rigor mortis', etc."
+       └── Returns {corrected_text, ocr_confidence_avg}
+
+4. FORMAT NORMALIZER (Agent 3)
+   └── Receives: {raw_text, source_type: "AUTOPSY_REPORT"}
+   └── Detects autopsy report schema:
+       SCHEMA A: AIIMS/NIMHANS format
+       SCHEMA B: State hospital format
+       SCHEMA C: Free-form narrative
+       SCHEMA D: Fill-in-the-blank template form
+   └── Maps to AIVENTRA canonical autopsy schema (all fields above)
+   └── Returns: {canonical_autopsy_json, schema_detected, mapping_confidence}
+
+5. AUTOPSY AGENT (Agent 4)
+   └── Receives: {canonical_autopsy_json}
+   └── LLM extraction pass (for any fields still needing natural language parsing):
+       Prompt includes all 40+ fields listed above
+   └── Runs pathology cross-checks:
+       - COD vs injuries consistency
+       - Toxicology vs manner consistency
+       - Postmortem signs internal consistency
+   └── Returns: AutopsyResult {
+         mannerOfDeath, mannerConfidence,
+         causeChain, toxicologyFindings,
+         postmortemSigns, injuries, narrative
+       }
+
+6. TOD AGENT (Agent 5)
+   └── Receives: AutopsyResult (specifically postmortemSigns, bodyParams, environmentFactors)
+   └── Extracts: rectal_temp, ambient_temp, weight, rigor_stage, livor_stage, etc.
+   └── Runs Henssge numeric solver + heuristic signs model + ML surrogate
+   └── Monte Carlo uncertainty propagation → TOD posterior distribution
+   └── Returns: TodResult {todPointEstimate, todWindow95, consistency, warnings}
+
+7. HYPOTHESIS MANAGER (Agent 9)
+   └── Receives AutopsyResult signals:
+       {mannerOfDeath, defensiveWounds, toxicologyFindings, injuryList}
+   └── Applies Bayesian likelihood ratios:
+       - mannerOfDeath = HOMICIDE → LR_HOMICIDE = 15.0
+       - defensiveWounds = true  → LR_HOMICIDE *= 3.2
+       - drugsDetected   = trace → LR_SUICIDE += small positive weight
+   └── Updates posterior probabilities
+   └── Logs hypothesis snapshot to DB for trajectory chart
+
+8. REASONING REPLAY (Agent 10)
+   └── All 5 agents that processed this document log replay steps
+   └── Each step: {trigger_type, input_summary, interpretation, confidence}
+   └── Chain linked cryptographically
+
+9. REPORT GENERATOR (Agent 11)
+   └── Sections 2, 3 of final report populated from autopsy findings
+   └── LLM-generated executive summary includes:
+       "Postmortem examination indicates..."
+PART III — CATEGORY B: CDR (CALL DETAIL RECORDS)
+B.1 What It Is
+The raw call and SMS log exported by a telecom operator for a specific phone number and time window. It records every call made/received, every SMS sent/received, every data session, with timestamps, duration, and cell tower IDs. This is the richest digital evidence source.
+
+B.2 Accepted Formats
+text
+FORMAT                  │ MIME TYPE                        │ INGESTION PATH
+────────────────────────┼──────────────────────────────────┼─────────────────────────
+CSV (most common)       │ text/csv                         │ pandas read_csv
+XLSX / XLS              │ application/vnd.openxml…         │ pandas read_excel
+PDF (court-formatted)   │ application/pdf                  │ OCR + table detection
+TXT (pipe/tab delimited)│ text/plain                       │ pandas read_csv (sep auto)
+JSON (API export)       │ application/json                 │ json.loads
+XML                     │ application/xml                  │ xml.etree
+Most common real-world delivery: CSV or XLSX from Jio/Airtel/BSNL/Vi operators, forwarded by court order. Format varies per operator.
+
+B.3 Raw Input Structure (CSV — Most Common)
+Different telecom operators use different column names. The Format Normalizer maps all variants to the canonical schema. Here are the three most common raw formats:
+
+Airtel CDR Format
+text
+PhoneNumber,Date,Time,CallType,Duration,CalledNumber,TowerID,TowerLatitude,TowerLongitude,IMEI,IMSI
+9876543210,07/05/2026,02:15:33,MOC,127,9811234567,DEL-NW-0045,28.7041,77.1025,352999501234567,404201234567890
+9876543210,07/05/2026,02:18:44,SMS-MO,0,9811234567,DEL-NW-0045,28.7041,77.1025,352999501234567,404201234567890
+9876543210,07/05/2026,08:33:12,MTC,0,MISSED,DEL-SE-0187,28.5355,77.3910,352999501234567,404201234567890
+Jio CDR Format
+text
+MSISDN|CALL_DATE|CALL_TIME|CALL_TYPE|DURATION_SEC|B_PARTY|CELL_ID|CIRCLE|LAC|ROAMING
+9876543210|2026-05-07|02:15:33|VOICE_OUT|127|09811234567|JIO-DL-NW45|DL|23401|N
+BSNL CDR Format
+text
+"Subscriber No","Call Date","Call Time","Outgoing/Incoming","Called No","Duration","BTS ID","BTS Name"
+"09876543210","07-MAY-2026","02:15:33","O","09811234567","2:07","DEL_NW_0045","Pitampura"
+B.4 Canonical CDR Schema (After Normalization)
+The Format Normalizer maps all operator formats to this canonical structure:
+
+python
+CanonicalCdrEvent = {
+    "event_id":            UUID,             # generated
+    "case_id":             UUID,
+    "source_msisdn":       str,              # MASKED: "98XXXXXX10"
+    "event_timestamp":     datetime,         # ISO UTC — normalized from all date/time variants
+    "event_type":          enum {            # MOC = mobile originating call
+                             "MOC",          # MTC = mobile terminating call
+                             "MTC",          # SMS_MO = SMS sent
+                             "SMS_MO",       # SMS_MT = SMS received
+                             "SMS_MT",       # DATA = data session
+                             "DATA",
+                             "MISSED",
+                             "ROAMING_START",
+                             "ROAMING_END"
+                           },
+    "duration_seconds":    int,              # 0 for SMS
+    "counterparty_msisdn": str,              # MASKED
+    "cell_tower_id":       str,              # raw tower ID
+    "tower_latitude":      float,            # decimal degrees (if available)
+    "tower_longitude":     float,
+    "tower_name":          str,
+    "imei":                str,              # MASKED: "35299950XXXXXXX"
+    "data_volume_kb":      int | None,       # only for DATA events
+    "raw_source_operator": str,              # "AIRTEL" | "JIO" | "BSNL" | "VI" | "UNKNOWN"
+    "raw_row_index":       int,              # original row number for traceback
+    "normalization_confidence": float        # 0.0–1.0
+}
+B.5 How CDR Is Used
+text
+CDR JOURNEY THROUGH AGENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+1. UPLOAD (Layer 2)
+   └── CSV/XLSX uploaded, SHA-256 computed
+   └── Stored encrypted in MinIO
+   └── evidence_files.file_type = "CDR"
+
+2. EVIDENCE PARSER (Agent 1)
+   └── Detects schema: CSV/XLSX → pandas load
+   └── If PDF → routes to OCR agent for table extraction
+   └── Extracts: row count, date range, MSISDN count
+   └── Returns: {raw_dataframe_json (up to 50k rows), row_count, date_range}
+
+3. FORMAT NORMALIZER (Agent 3)
+   └── Operator detection:
+       ├── Column headers match → AIRTEL / JIO / BSNL / VI
+       └── Unknown → fuzzy column mapping + confidence score
+   └── Date/time parsing: 30+ date format variants handled
+       {"07/05/2026", "07-MAY-2026", "2026-05-07", "20260507", ...}
+   └── Event type mapping:
+       {"MOC" → "MOC", "O" → "MOC", "VOICE_OUT" → "MOC", "MO" → "MOC"}
+   └── MSISDN normalization:
+       {"09876543210", "9876543210", "+919876543210"} → canonical "919876543210"
+   └── Tower coordinate enrichment:
+       If tower_id present but lat/lon missing → look up in tower_registry DB table
+   └── Outputs: [CanonicalCdrEvent] × N rows
+
+4. DIGITAL TIMELINE AGENT (Agent 6)
+   └── Receives: list of CanonicalCdrEvents
+   └── Sorts by event_timestamp ASC
+   └── Builds timeline structure:
+       {
+         events:          [TimelineEvent],
+         time_range:      {start, end},
+         unique_contacts: int,             # how many different numbers called
+         silence_windows: [SilenceWindow], # gaps > threshold_minutes
+         call_freq_by_hour: {0:N, 1:N, ...23:N}  # hourly activity histogram
+       }
+   └── Silence detection: gaps > 4h flagged as SILENCE_ANOMALY
+   └── Pattern rules applied (15 rules):
+       Rule 1:  Late-night calls (00:00–04:00)
+       Rule 2:  Rapid sequential calls (< 3 min apart)
+       Rule 3:  Very short calls (< 10 sec) — may be signaling
+       Rule 4:  SMS burst (5+ SMS in < 30 min)
+       Rule 5:  Last communication before silence
+       Rule 6:  First communication after long silence
+       Rule 7:  Calls to same number within TOD window
+       Rule 8:  Roaming state change
+       Rule 9:  IMEI change (device swap)
+       Rule 10: New number first contact
+       Rule 11: Call immediately after financial transaction
+       Rule 12: Location jump without travel time
+       Rule 13: Call during documented "victim last seen" window
+       Rule 14: Calls to known emergency services
+       Rule 15: Communication pattern break (normal daily pattern stops)
+
+5. ANOMALY DETECTOR (Agent 7)
+   └── Receives: TimelineOutput with flagged events
+   └── ML models:
+       - Autoencoder (reconstruction error): flags events that don't fit
+         learned communication patterns
+       - Isolation Forest: identifies statistically rare event combinations
+   └── Per-event anomaly scores computed
+   └── Threshold: anomaly_score > 0.75 → is_anomalous = true
+
+6. HOTSPOT CORRELATOR (Agent 8)
+   └── Receives: AnomalyOutput + TOD window
+   └── Finds: which CDR anomalies fall inside TOD window?
+   └── Creates hotspot windows where:
+       - Multiple anomalous CDR events cluster temporally
+       - AND overlap with TOD credible interval
+
+7. HYPOTHESIS MANAGER (Agent 9)
+   └── CDR-derived signals used:
+       - last_contact_before_death: WHO was last contact?
+       - communication_cessation_time: WHEN did phone go silent?
+       - late_night_contact_pattern: unusual nighttime activity?
+       - contact_frequency_anomaly: sudden change in calling pattern?
+   └── These signals adjust Bayesian posteriors:
+       - Last contact 30min before estimated TOD → LR_HOMICIDE boost
+       - Complete communication cessation = TOD → consistent with all hypotheses
+       - Unusual contact pattern change days before death → LR_HOMICIDE moderate boost
+PART IV — CATEGORY C: LOCATION & GPS DATA
+C.1 What It Is
+Geographic coordinate records over time. Sources include: phone GPS logs, Google Timeline exports, CDR tower triangulation data, vehicle GPS tracker dumps, geofence logs, or location sharing app exports.
+
+C.2 Accepted Formats
+text
+FORMAT                     │ MIME TYPE            │ SOURCE
+───────────────────────────┼──────────────────────┼─────────────────────────────────
+Google Takeout JSON        │ application/json      │ Google Timeline export
+GPX (GPS Exchange Format)  │ application/gpx+xml   │ Fitness apps, car GPS
+KML                        │ application/vnd.kml   │ Google Earth, mapping apps
+CSV (lat/lon/timestamp)    │ text/csv              │ Custom GPS trackers, IoT devices
+GeoJSON                    │ application/geo+json  │ Developer/API exports
+Cell Tower CSV             │ text/csv              │ Operator tower logs
+XLSX                       │ application/vnd.open… │ Vehicle fleet GPS systems
+C.3 Raw Input Structure
+Google Takeout Location History (JSON)
+json
+{
+  "locations": [
+    {
+      "timestampMs": "1746547200000",
+      "latitudeE7":  287041000,
+      "longitudeE7": 771025000,
+      "accuracy":    15,
+      "altitude":    225,
+      "velocity":    0,
+      "heading":     null,
+      "activitys": [
+        {
+          "timestampMs": "1746547180000",
+          "activities": [
+            {"type": "STILL", "confidence": 95},
+            {"type": "IN_VEHICLE", "confidence": 5}
+          ]
+        }
+      ]
+    }
+  ]
+}
+GPX Format
+xml
+<?xml version="1.0"?>
+<gpx version="1.1">
+  <trk>
+    <trkseg>
+      <trkpt lat="28.7041" lon="77.1025">
+        <time>2026-05-07T02:15:00Z</time>
+        <ele>225</ele>
+        <speed>0.0</speed>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>
+C.4 Canonical Location Schema (After Normalization)
+python
+CanonicalLocationEvent = {
+    "event_id":         UUID,
+    "case_id":          UUID,
+    "timestamp":        datetime,         # UTC
+    "latitude":         float,            # decimal degrees
+    "longitude":        float,
+    "accuracy_meters":  int | None,
+    "altitude_meters":  float | None,
+    "speed_kmh":        float | None,
+    "heading_degrees":  float | None,
+    "activity_type":    enum {            # inferred from Google data or null
+                          "STILL",
+                          "WALKING",
+                          "RUNNING",
+                          "IN_VEHICLE",
+                          "ON_BICYCLE",
+                          "UNKNOWN"
+                        },
+    "activity_confidence": int | None,   # 0–100
+    "source_type":      str,             # "GOOGLE_TIMELINE" | "GPX" | "CELL_TOWER" | "DEVICE_GPS"
+    "place_name":       str | None,      # reverse geocoded (optional enrichment)
+    "geofence_zone":    str | None,      # if tagged in source data
+    "raw_source":       str
+}
+C.5 How Location Data Is Used
+text
+LOCATION DATA USAGE
+═══════════════════════════════════════════════════════════════════════════════
+
+DIGITAL TIMELINE AGENT:
+  Key analyses performed on location data:
+  ─────────────────────────────────────────
+  1. PRESENCE AT SCENE
+     └── Was the phone/device at the crime scene location
+         during the TOD window?
+     └── Algorithm: compute distance from each location fix
+         to scene GPS coordinates. If distance < 200m
+         during TOD window → flag as SCENE_PRESENCE
+
+  2. MOVEMENT TRAJECTORY
+     └── Build movement path: sequence of lat/lon points
+     └── Detect: was the device moving or stationary?
+     └── Speed between consecutive points:
+         speed = distance(p1, p2) / time_delta
+         If speed > 150 km/h → IMPOSSIBLE_MOVEMENT flag
+         If speed implies teleportation → LOCATION_JUMP flag
+
+  3. UNUSUAL LOCATION
+     └── Build "home range" from 30-day history (if available)
+     └── Locations outside normal range → UNUSUAL_LOCATION flag
+
+  4. LAST KNOWN LOCATION
+     └── Final GPS fix before communication silence
+     └── Used as: "last confirmed alive at [coordinates]"
+     └── Fed to TOD Agent as additional prior constraint
+
+  5. ALIBI CORROBORATION / CONTRADICTION
+     └── If suspect phone location contradicts stated alibi
+         → flag for investigator review
+
+HYPOTHESIS MANAGER:
+  ─────────────────────────────────────────
+  - device_at_scene_during_tod_window → TRUE  → LR_HOMICIDE boost
+  - device_left_scene_immediately_after_estimated_tod → TRUE → LR_HOMICIDE strong boost
+  - device_never_left_home → TRUE → LR_SUICIDE / NATURAL boost
+  - impossible_movement detected → flag for manual review
+PART V — CATEGORY D: FINANCIAL RECORDS
+D.1 What It Is
+Transaction logs from bank accounts, UPI apps (PhonePe, GPay, Paytm), credit cards, or NEFT/RTGS records obtained under court order. Shows financial behavior patterns immediately before death.
+
+D.2 Accepted Formats
+text
+FORMAT                     │ SOURCE
+───────────────────────────┼─────────────────────────────────────────────────
+CSV / XLSX bank statement  │ SBI, HDFC, ICICI, Axis, PNB statements
+PDF bank statement         │ Bank-issued statements (OCR required)
+UPI transaction JSON       │ PhonePe/GPay export (via court order)
+JSON (FinTech API export)  │ Razorpay, Cashfree merchant records
+NEFT/RTGS statement CSV    │ Bank RTGS transaction logs
+D.3 Raw Input Structure
+HDFC Bank Statement CSV
+text
+Date,Narration,Chq./Ref.No.,Value Date,Withdrawal Amt.(INR ),Deposit Amt.(INR ),Closing Balance(INR )
+07/05/26,UPI/CR/PHONEPEPHILIP/9876543210,,07/05/26,,50000.00,87500.00
+07/05/26,ATM WDL 23:47 PITAMPURA DEL,,07/05/26,10000.00,,77500.00
+06/05/26,NEFT/IN234567890/RAMESH KUMAR,,06/05/26,250000.00,,87500.00
+PhonePe JSON Export
+json
+{
+  "transactions": [
+    {
+      "transactionId":   "T2026050700123456",
+      "timestamp":       "2026-05-07T23:47:15+05:30",
+      "type":            "DEBIT",
+      "amount":          10000.00,
+      "currency":        "INR",
+      "status":          "SUCCESS",
+      "merchantName":    "ATM CASH WITHDRAWAL",
+      "merchantVpa":     null,
+      "senderVpa":       "9876543210@ybl",
+      "receiverVpa":     null,
+      "upiRefNo":        "604712345678"
+    }
+  ]
+}
+D.4 Canonical Financial Schema (After Normalization)
+python
+CanonicalFinancialEvent = {
+    "event_id":              UUID,
+    "case_id":               UUID,
+    "timestamp":             datetime,         # UTC
+    "transaction_type":      enum {
+                               "DEBIT",        # money out
+                               "CREDIT",       # money in
+                               "TRANSFER_OUT",
+                               "TRANSFER_IN",
+                               "ATM_WITHDRAWAL",
+                               "UPI_SEND",
+                               "UPI_RECEIVE",
+                               "NEFT_OUT",
+                               "NEFT_IN",
+                               "RTGS_OUT",
+                               "RTGS_IN"
+                             },
+    "amount_inr":            Decimal(10,2),
+    "balance_after":         Decimal(12,2) | None,
+    "counterparty_masked":   str,              # PII-masked name/VPA
+    "narration_cleaned":     str,              # original narration, PII stripped
+    "channel":               str,             # "UPI" | "NEFT" | "ATM" | "CARD" | "BRANCH"
+    "reference_no":          str,
+    "location_hint":         str | None,       # e.g. "PITAMPURA DEL" from ATM record
+    "source_institution":    str,             # "HDFC" | "SBI" | "PHONEPE" | "PAYTM"
+    "normalization_confidence": float
+}
+D.5 How Financial Records Are Used
+text
+FINANCIAL DATA USAGE
+═══════════════════════════════════════════════════════════════════════════════
+
+DIGITAL TIMELINE AGENT:
+  ─────────────────────────────────────────
+  Pattern Rules Applied to Financial Events:
+
+  1. LARGE_WITHDRAWAL_BEFORE_DEATH
+     Threshold: > ₹50,000 within 72h before TOD estimate
+     Signal: Could indicate preparation for travel/escape,
+             or coercion/extortion scenario
+
+  2. UNUSUAL_TRANSFER_OUT
+     Large NEFT/RTGS out of character with account history
+     (2 standard deviations above 30-day average)
+
+  3. FINANCIAL_ACTIVITY_NEAR_TOD
+     Any transaction within ±2h of TOD point estimate
+     CRITICAL FLAG: proves device/person was active near TOD time
+
+  4. ATM_WITHDRAWAL_LOCATION
+     ATM city/area from narration can corroborate/contradict
+     location data (CDR tower)
+
+  5. CEASED_FINANCIAL_ACTIVITY
+     No transactions after a specific time → consistent with death
+     (Silence in financial = another dimension of "last active" time)
+
+  6. INCOMING_CREDIT_AFTER_DEATH
+     Money received AFTER estimated TOD → account was used by someone else
+     → STRONG ANOMALY → flag for investigation
+
+ANOMALY DETECTOR:
+  ─────────────────────────────────────────
+  ML model flags transactions that are:
+  - Anomalous in amount (isolation forest on transaction amounts)
+  - Anomalous in time (transaction at 3 AM when never before)
+  - Anomalous in counterparty (new payee never used before)
+
+HYPOTHESIS MANAGER:
+  ─────────────────────────────────────────
+  - large_cash_withdrawal_before_death → possible INSURANCE/DEBT motive
+  - incoming_large_credit_before_death → could be insurance payout setup
+  - financial_activity_proves_alive_time → narrows TOD window lower bound
+  - financial_cessation_at_specific_time → corroborates TOD estimate
+PART VI — CATEGORY E: DEVICE & APP DATA
+E.1 What It Is
+Digital extracts from the victim's or suspect's mobile device — app activity logs, messaging app exports, social media data, email metadata, or mobile forensics tool extracts (Cellebrite, UFED output).
+
+E.2 Accepted Formats
+text
+FORMAT                        │ SOURCE
+──────────────────────────────┼────────────────────────────────────────────
+WhatsApp chat export (.txt)   │ WhatsApp "Export Chat" feature
+Telegram JSON export          │ Telegram "Export Chat History"
+iMessage/SMS backup XML       │ iPhone backup (iTunes/iCloud XML)
+Cellebrite UFED report (PDF)  │ Mobile forensics platform output
+Android backup XML            │ ADB backup extract
+Email MBOX/EML                │ Email client export
+Social media JSON             │ Facebook/Instagram data export (court order)
+App-specific CSV              │ Dating apps, ride-hailing logs
+SQLite database dumps         │ Direct device forensics (app databases)
+E.3 Raw Input Structure
+WhatsApp Export (TXT)
+text
+07/05/2026, 02:17 - Messages and calls are end-to-end encrypted.
+07/05/2026, 02:17 - Ravi: Hey, still awake?
+07/05/2026, 02:19 - You: yeah can we talk tomorrow
+07/05/2026, 02:19 - Ravi: Sure. you ok?
+07/05/2026, 02:20 - You: not really. later
+07/05/2026, 02:21 - Ravi: 🙏
+07/05/2026, 09:45 - Ravi: Hello?
+07/05/2026, 11:23 - Ravi: Please call me back
+Telegram JSON Export
+json
+{
+  "name": "Personal Chat — Priya",
+  "type": "personal_chat",
+  "messages": [
+    {
+      "id":       12345,
+      "type":     "message",
+      "date":     "2026-05-07T02:15:00",
+      "from":     "You",
+      "from_id":  "user123456",
+      "text":     "I can't do this anymore"
+    },
+    {
+      "id":       12346,
+      "type":     "message",
+      "date":     "2026-05-07T02:15:44",
+      "from":     "Priya",
+      "text":     "What do you mean? Are you ok??"
+    }
+  ]
+}
+E.4 Canonical Device/App Event Schema
+python
+CanonicalDeviceEvent = {
+    "event_id":          UUID,
+    "case_id":           UUID,
+    "timestamp":         datetime,         # UTC
+    "event_type":        enum {
+                           "MESSAGE_SENT",
+                           "MESSAGE_RECEIVED",
+                           "CALL_PLACED",
+                           "CALL_RECEIVED",
+                           "APP_OPENED",
+                           "APP_CLOSED",
+                           "PHOTO_TAKEN",
+                           "FILE_ACCESSED",
+                           "EMAIL_SENT",
+                           "EMAIL_RECEIVED",
+                           "SEARCH_QUERY",    # flagged for sensitivity
+                           "BROWSER_VISIT",
+                           "SOCIAL_POST",
+                           "NOTE_CREATED",
+                           "ALARM_SET",
+                           "LOCATION_TAGGED"
+                         },
+    "app_name":          str,              # "WhatsApp" | "Telegram" | "Chrome" | etc.
+    "platform":          str,             # "ANDROID" | "IOS" | "WEB"
+    "content_masked":    str,             # text content with PII stripped (max 200 chars)
+    "content_sentiment": enum {           # LLM-assigned sentiment
+                           "POSITIVE",
+                           "NEUTRAL",
+                           "NEGATIVE",
+                           "DISTRESSED",  # used for suicide hypothesis signals
+                           "THREATENING"  # used for homicide hypothesis signals
+                         },
+    "counterparty_masked":str | None,
+    "media_type":        str | None,       # "TEXT" | "IMAGE" | "VIDEO" | "AUDIO"
+    "message_deleted":   bool,             # was this message later deleted?
+    "source_file_id":    UUID,
+    "normalization_confidence": float
+}
+E.5 Sensitive Content Handling
+text
+DEVICE DATA SPECIAL RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+1. CONTENT MASKING
+   All actual message text is:
+   - PII-stripped (names replaced with [CONTACT_1], [CONTACT_2], etc.)
+   - Stored in masked form only in canonical events
+   - Original text retained ONLY in encrypted raw storage (MinIO)
+   - Agents receive: content_masked, content_sentiment, NOT original text
+
+2. SENTIMENT ANALYSIS
+   Each message passes through sentiment classifier:
+   - Gemini Flash with prompt:
+     "Classify this message as: POSITIVE, NEUTRAL, NEGATIVE,
+     DISTRESSED (signs of hopelessness/farewell), or
+     THREATENING (violence/coercion). Output JSON only."
+   - Result: {sentiment, confidence, flags: [str]}
+   - DISTRESSED flag → Hypothesis: suicide signal
+   - THREATENING flag → Hypothesis: homicide signal
+
+3. DELETED MESSAGE DETECTION
+   If source is Cellebrite UFED or SQLite dump:
+   - Can detect messages marked as deleted but not overwritten
+   - message_deleted = true → STRONG anomaly flag
+   - Deleted messages near TOD → very high anomaly score
+
+4. SEARCH QUERY SENSITIVITY
+   If SEARCH_QUERY events present:
+   - Queries are redacted in all reports/UI except to LEAD_INVESTIGATOR+
+   - Content pattern matching: "how to" + violence keywords → flag
+   - Stored in PII vault, access logged
+E.6 How Device Data Is Used
+text
+DEVICE DATA → DIGITAL TIMELINE:
+  - Every event placed on timeline by timestamp
+  - Last message/activity → corroborates "last active" time
+  - Communication pattern analysis (same as CDR but for app-layer)
+  - Distressed message near TOD → hypothesis signal
+  - Search queries for methods → hypothesis signal (suicide/homicide prep)
+  - Deleted messages near TOD → strong anomaly
+
+DEVICE DATA → ANOMALY DETECTOR:
+  - Unusual app usage patterns (autoencoder)
+  - Sudden cessation of normally-active apps
+
+DEVICE DATA → HYPOTHESIS MANAGER:
+  - distressed_content_score → LR_SUICIDE boost
+  - threatening_content_received → LR_HOMICIDE boost
+  - farewell_message_detected → LR_SUICIDE strong boost
+  - evidence_deletion_near_tod → LR_HOMICIDE moderate boost
+PART VII — CATEGORY F: SCENE & ENVIRONMENTAL DOCUMENTS
+F.1 What It Is
+Supplementary documents that describe the physical environment: scene examination reports, temperature logs, crime scene photographs metadata, scene sketches, first responder reports, witness statements (metadata only — content redacted per privacy rules).
+
+F.2 Accepted Formats
+text
+FORMAT                      │ CONTENT
+────────────────────────────┼──────────────────────────────────────────────────
+PDF (scene examination)     │ First responding officer's scene report
+PDF (FSL scene report)      │ Forensic Science Lab scene examination
+DOCX (witness statement)    │ Recorded statement — content masked, metadata only
+CSV (temperature logger)    │ IoT temperature logger data (if crime scene sealed)
+JPG/PNG (photo metadata)    │ EXIF metadata only (GPS, timestamp) — not image content
+TXT (scene notes)           │ Hand-typed scene notes
+F.3 Extracted Fields
+text
+SCENE REPORT EXTRACTION
+═══════════════════════════════════════════════════════════════════════════════
+
+From First Responder / Scene Report:
+──────────────────────────────────────────────────────────────
+scene_type:                enum {INDOOR, OUTDOOR, VEHICLE, PUBLIC}
+discovery_time:            datetime      → Used as TOD prior upper bound
+first_responder_arrival:   datetime      → Timeline anchor
+ambient_temp_at_scene:     float         → TOD Agent (Henssge parameter)
+humidity_at_scene:         float         → TOD Agent (ML feature)
+windows_open:              bool          → TOD Agent (affects cooling rate)
+heating_cooling_on:        bool          → TOD Agent (affects ambient stability)
+body_position:             string        → Autopsy corroboration
+scene_sealed_at:           datetime      → Evidence integrity reference
+items_found_near_body:     [string]      → Hypothesis signals
+signs_of_struggle:         bool          → Hypothesis: HOMICIDE signal
+door_lock_state:           string        → Hypothesis: locked-room scenario
+blood_spatter_present:     bool          → Hypothesis signal
+footprints_present:        bool          → Hypothesis: third party present
+
+From Photo EXIF Metadata (image content NOT processed):
+──────────────────────────────────────────────────────────────
+photo_timestamp:           datetime      → Timeline anchor (when photos taken)
+photo_gps_lat:             float         → Scene GPS confirmation
+photo_gps_lon:             float
+camera_device:             string        → Chain of custody verification
+
+From Temperature Logger CSV (if available):
+──────────────────────────────────────────────────────────────
+timestamp:                 datetime
+temperature_celsius:       float
+humidity_percent:          float
+→ Used by TOD Agent as: ambientTemperatureSeries (most accurate input possible)
+→ Enables extended Henssge model with variable ambient temp
+PART VIII — INPUT COMBINATION MATRIX
+Not every case will have all six categories. The system handles partial evidence gracefully. This matrix shows how agent behavior changes:
+
+text
+AVAILABLE EVIDENCE → AGENT CAPABILITY MATRIX
+═══════════════════════════════════════════════════════════════════════════════════════════════════
+Available          │TOD       │ TOD Mode       │ Hypothesis    │ Timeline  │ Report
+Evidence           │Confidence│                │ Confidence    │ Richness  │ Quality
+───────────────────┼──────────┼────────────────┼───────────────┼───────────┼──────────────────────
+A only             │ MEDIUM   │ PHYSICS_ONLY   │ MEDIUM        │ MINIMAL   │ ADEQUATE
+A + B              │ MEDIUM   │ PHYSICS_ONLY   │ MEDIUM-HIGH   │ MODERATE  │ GOOD
+A + B + C          │ MEDIUM   │ PHYSICS_ONLY   │ HIGH          │ RICH      │ GOOD
+A + B + C + D      │ MEDIUM   │ PHYSICS_ONLY   │ HIGH          │ RICH      │ VERY GOOD
+A + B + C + D + E  │ MEDIUM   │ HYBRID         │ HIGH          │ VERY RICH │ EXCELLENT
+ALL (A–F)          │ HIGH     │ HYBRID         │ VERY HIGH     │ FULL      │ OPTIMAL
+B + C only         │ NONE     │ NONE           │ LOW           │ MODERATE  │ LIMITED
+F only             │ LOW      │ SIGNS_CONSTR.  │ VERY LOW      │ NONE      │ MINIMAL
+═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+DEGRADED MODE RULES:
+─────────────────────
+• No autopsy (Cat A) → TOD Agent skipped. TOD = "UNDETERMINED".
+• No CDR/Location/Financial/Device (Cat B/C/D/E) → Timeline Agent
+  produces minimal output with only scene anchors.
+• No autopsy + no digital → Hypothesis confidence < 40%, report
+  includes HIGH severity warning: "INSUFFICIENT_EVIDENCE_FOR_RELIABLE_ASSESSMENT"
+• Minimum viable case: Category A alone → adequate for cause/manner,
+  TOD range from postmortem signs only, no digital timeline.
+PART IX — COMPLETE FIELD-TO-AGENT TRACE TABLE
+This is the definitive map of every extracted field to the agent(s) that consume it:
+
+text
+FIELD                        │ SOURCE CAT │ EXTRACTED BY    │ CONSUMED BY
+─────────────────────────────┼────────────┼─────────────────┼──────────────────────────────
+manner_of_death              │ A          │ Autopsy Agent   │ Hypothesis (primary)
+cause_of_death               │ A          │ Autopsy Agent   │ Hypothesis, Report
+defensive_wounds             │ A          │ Autopsy Agent   │ Hypothesis (+LR_HOMICIDE 3.2)
+toxicology_drugs             │ A          │ Autopsy Agent   │ Hypothesis
+rigor_mortis_stage           │ A          │ Autopsy Agent   │ TOD (heuristic likelihood)
+livor_mortis_stage           │ A          │ Autopsy Agent   │ TOD (heuristic likelihood)
+decomposition_stage          │ A          │ Autopsy Agent   │ TOD (heuristic likelihood)
+rectal_temp_celsius          │ A          │ Autopsy/Norm.   │ TOD (Henssge core)
+ambient_temp_celsius         │ A / F      │ Autopsy/Scene   │ TOD (Henssge parameter)
+body_weight_kg               │ A          │ Autopsy Agent   │ TOD (Henssge parameter)
+clothing_insulation          │ A / F      │ Autopsy/Scene   │ TOD (correction factor)
+last_seen_alive              │ A / F      │ Autopsy/Scene   │ TOD (prior upper bound)
+found_dead_time              │ A / F      │ Autopsy/Scene   │ TOD (prior lower bound)
+signs_of_struggle            │ F          │ Scene Agent     │ Hypothesis (HOMICIDE signal)
+─────────────────────────────┼────────────┼─────────────────┼──────────────────────────────
+cdr_event_timestamp          │ B          │ Normalizer      │ Digital Timeline, Anomaly
+cdr_event_type               │ B          │ Normalizer      │ Digital Timeline, Anomaly
+cdr_duration_seconds         │ B          │ Normalizer      │ Digital Timeline (rules 2,3)
+cdr_cell_tower_id            │ B          │ Normalizer      │ Location enrichment
+cdr_counterparty             │ B          │ Normalizer      │ Hypothesis (masked)
+cdr_last_event               │ B          │ Timeline Agent  │ TOD (alive-time corroboration)
+cdr_silence_windows          │ B          │ Timeline Agent  │ Anomaly, Hotspot
+─────────────────────────────┼────────────┼─────────────────┼──────────────────────────────
+location_timestamp           │ C          │ Normalizer      │ Digital Timeline, Anomaly
+location_lat_lon             │ C          │ Normalizer      │ Digital Timeline (scene check)
+location_speed               │ C          │ Normalizer      │ Anomaly (impossible movement)
+location_activity_type       │ C          │ Normalizer      │ Digital Timeline
+─────────────────────────────┼────────────┼─────────────────┼──────────────────────────────
+financial_timestamp          │ D          │ Normalizer      │ Digital Timeline, Anomaly
+financial_amount             │ D          │ Normalizer      │ Anomaly (unusual amounts)
+financial_type               │ D          │ Normalizer      │ Hypothesis signals
+financial_location_hint      │ D          │ Normalizer      │ Location corroboration
+financial_last_transaction   │ D          │ Timeline Agent  │ TOD (alive-time constraint)
+─────────────────────────────┼────────────┼─────────────────┼──────────────────────────────
+message_timestamp            │ E          │ Normalizer      │ Digital Timeline, Anomaly
+message_sentiment            │ E          │ OCR/LLM         │ Hypothesis (DISTRESSED=suicide)
+message_deleted              │ E          │ Normalizer      │ Anomaly (STRONG flag)
+search_query_flags           │ E          │ Normalizer      │ Hypothesis (method search)
+farewell_detected            │ E          │ LLM/Classifier  │ Hypothesis (SUICIDE boost)
+─────────────────────────────┼────────────┼─────────────────┼──────────────────────────────
+ambient_temp_series          │ F          │ Normalizer      │ TOD (extended Henssge)
+humidity                     │ F          │ Normalizer      │ TOD (ML feature)
+scene_sealed_at              │ F          │ Scene normalizer│ Audit, Evidence integrity
+photo_exif_timestamp         │ F          │ Evidence parser │ Timeline anchor
+PART X — DATA VALIDATION & QUALITY GATES
+Every piece of evidence passes through three quality gates before being used:
+
+text
+GATE 1: INTEGRITY (Layer 2)
+─────────────────────────────────────────────────────────────────────────────
+Check 1: SHA-256 hash verification (file not corrupted in transit)
+Check 2: File size > 0 bytes
+Check 3: MIME type matches file extension (no spoofing)
+Check 4: Malware scan (ClamAV) — quarantine if infected
+Check 5: File size < 500MB per file (system limit)
+Result: PASS → proceed │ FAIL → QUARANTINED, never processed
+
+GATE 2: PARSABILITY (Evidence Parser + Normalizer)
+─────────────────────────────────────────────────────────────────────────────
+Check 1: File readable (not password-protected, not corrupted)
+Check 2: Encoding detected and decodable (UTF-8, UTF-16, CP-1252, ISO-8859)
+Check 3: At least 1 data row parseable (not completely empty)
+Check 4: Date fields parseable (at least 80% of rows have valid timestamps)
+Check 5: Schema confidence > 0.50 (Normalizer can map to canonical schema)
+Result: PASS → proceed │ PARTIAL → proceed with warnings │ FAIL → skip this file
+
+GATE 3: USEFULNESS (Per-Agent)
+─────────────────────────────────────────────────────────────────────────────
+For TOD Agent:
+  Check: At least one of {rectal_temp, rigor_stage, livor_stage} present
+  If NONE → mode = "SIGNS_CONSTRAINED", warning added
+
+For Digital Timeline Agent:
+  Check: At least 5 events with valid timestamps
+  If FAIL → timeline output = "INSUFFICIENT_DATA", agent marked SKIPPED
+
+For Hypothesis Manager:
+  Check: At least 2 Bayesian signals available (from any category)
+  If FAIL → posteriors = uniform {0.2 each}, HIGH severity warning added
+PART XI — PII HANDLING ACROSS ALL INPUT TYPES
+All personally identifiable information is masked before any agent processes it:
+
+text
+PII MASKING RULES (Applied by Format Normalizer)
+═══════════════════════════════════════════════════════════════════════════════
+
+PII TYPE           │ RAW VALUE            │ MASKED VALUE        │ STORED WHERE
+───────────────────┼──────────────────────┼─────────────────────┼──────────────────
+Phone number       │ 9876543210           │ 98XXXXXX10          │ Canonical events
+Counterparty name  │ "Ramesh Kumar"       │ [CONTACT_1]         │ Canonical events
+Bank account       │ 0123456789012        │ XXXXXXX9012         │ Canonical events
+UPI VPA            │ 9876@ybl             │ 9[MASKED]@ybl       │ Canonical events
+IMEI               │ 352999501234567      │ 35299950XXXXXXX     │ Canonical events
+Email address      │ user@gmail.com       │ [EMAIL_MASKED]      │ Canonical events
+GPS coordinates    │ 28.7041, 77.1025     │ KEPT (not PII)      │ Canonical events
+Message content    │ "I hate you Priya"   │ "I hate you [C1]"   │ Canonical events
+Original full text │ (everything above)   │ N/A                 │ MinIO encrypted only
+
+ACCESS TO ORIGINAL PII:
+─────────────────────────────────────────────────────────────────────────────
+Role              │ Sees masked │ Can access original │ Access logged
+──────────────────┼─────────────┼─────────────────────┼────────────────────
+VIEWER            │ YES         │ NO                  │ –
+INVESTIGATOR      │ YES         │ NO                  │ –
+LEAD_INVESTIGATOR │ YES         │ YES (with reason)   │ YES (audit)
+ADMIN             │ YES         │ YES (unrestricted)  │ YES (audit)
+This document defines every input, every format, every field, every transformation, and every downstream usage across all six evidence categories in the AIVENTRA system. Every agent in the system can be traced back to the exact raw field(s) it depends on, and every forensic conclusion in the final report traces back to exactly which evidence file and field produced it.

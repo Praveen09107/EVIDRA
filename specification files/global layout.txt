@@ -1,0 +1,319 @@
+
+Global Layout
+Left sidebar: top‑level sections (Command Center, Cases, Agents, Labs, Replay, Reports, Analytics, Settings).
+
+Top bar: current case context, search, user profile, “Run pipeline” / “Re‑run selected agents” buttons.
+
+Consistent visual grammar: graphs for relationships, timelines for sequences, maps for locations, with focus+context and progressive disclosure.
+
+Section 1 — Orchestration & Overview
+1. Command Center (Global Multi‑Agent Dashboard)
+Purpose: Show the entire “AI fleet” and system health across all cases, like a control tower for 10+ agents.
+
+Key elements:
+
+Agent Status Grid
+
+Each agent (Autopsy, TOD, Timeline/Anomaly, Correlation, Claim Extractor, Evidence–Claim Mapper, Hypothesis Manager, Bias Monitor, Replay, Image Agent) as a card.
+
+Status: Idle / Running / Degraded / Error.
+
+Per‑agent metrics: last run time, #cases touched today, avg latency, token usage.
+
+Live Activity Stream
+
+Chronological log: “TOD Agent ran for Case #23 (1.8s)”, “Timeline Agent flagged 2 anomalies”, etc.
+
+Filter by agent or case.
+
+Pipeline Heatmap
+
+Cases vs agents matrix: color intensity = how often each agent was involved / currently running.
+
+From here you can click into Agent Profiles (see Section 3) or into specific cases.
+
+2. Case Lobby (Global Case List)
+Already strong, but now we enhance it for agent focus:
+
+Case cards show:
+
+Overall risk level.
+
+Small pipeline completion bar: which agents have run for that case (e.g., Autopsy ✓, TOD ✓, Timeline ⚠, Hypothesis ⏸).
+
+Mini line chart: anomaly intensity over time (preview of timeline).
+
+Filters:
+
+By which agents have already run (e.g., “Show cases where TOD Agent differs from Autopsy time by > 2h”).
+
+This makes it obvious from the first screen that you have multi‑agent coverage, not just static cases.
+
+3. Case Workspace (Per‑Case Master View)
+This is still your main cockpit, but we push it further:
+
+Top strip: Case header + Pipeline status bar
+
+Case metadata + hypothesis probability chips.
+
+Pipeline bar: each agent node in sequence with status and clickable badges.
+
+Center: Three major tabs
+
+Timeline
+
+Advanced multi‑lane timeline (as before) with TOD band, anomalies, and event list.
+
+Collisions & Hotspots
+
+Ranked list + time‑linked cards for collisions (as before), but also:
+
+“Agent contribution view”: for each hotspot, list which agents contributed (TOD, Anomaly, Image, etc.).
+
+Causal Graph
+
+Graph of hypotheses, claims, and evidence, with focus+context highlighting and explanation panel.
+
+Right inspector panel:
+
+Contextual: if you click an event, hotspot, or node, you can:
+
+Jump to the originating agent (direct link to that agent’s lab, see below).
+
+See explanation and uncertainty from Bias Monitor / XAI view.
+
+Section 2 — Evidence & Domain Labs
+These are content‑focused studios; each also exposes its underlying agent(s).
+
+4. Autopsy & TOD Lab
+Purpose: Deep, visually rich analysis of autopsy and time‑of‑death, highlighting II‑Medical‑32B and your hybrid TOD model.
+
+Tabs within the page:
+
+Autopsy View
+
+Left: autopsy text with inline highlighted extractions (cause, injuries, toxicology).
+
+Right: structured autopsy summary + per‑field confidence.
+
+Switch to “RAW Agent Output” to see II‑Medical‑32B’s JSON.
+
+TOD View
+
+TOD distribution chart (Monte Carlo).
+
+Henssge-only vs RF/GBM‑augmented overlay toggle.
+
+Feature importance plot (RF/GBM) + plain‑language explanation.
+
+Consistency check vs rigor/livor states (traffic‑light chips).
+
+At the top of this page: a small band showing which agents are powering this lab:
+
+Autopsy Agent, TOD Agent → click their badges to jump into their dedicated Agent Labs.
+
+5. Digital Forensics Lab (Timeline + Vision)
+Purpose: Dedicated exploration for all digital sources.
+
+Sub‑sections:
+
+Event Timeline
+
+Digital-only lanes: phone metadata, app logs, network, CCTV frame events.
+
+Anomaly heat strips where Autoencoder score is high.
+
+Anomaly Explorer
+
+Table of anomalous windows with:
+
+AE score, IF score, fused score.
+
+Top contributing features (with SHAP/LIME snippet if you want to go that far).
+
+Clicking an anomaly window highlights that segment on the timeline.
+
+CCTV / Image Panel
+
+Video player with YOLOv8/DETR overlays for objects/persons.
+
+Track snakes (per-entity timeline): when each person/vehicle is present in each camera.
+
+Again, top band lists powering agents (Timeline & Anomaly Agent, Image Agent) with links to their individual labs.
+
+Section 3 — Agents & Pipelines (Per‑Agent Experience)
+Here’s where you satisfy “individually access every agent separately along with full pipeline”.
+
+6. Agent Directory
+Purpose: A catalog of agents with access to each individually, like ClawPort or AgentOS dashboards.
+
+Grid/list of all agents:
+
+Name, short description, key metrics (avg latency, use count, error rate).
+
+“Open Lab” button → goes to that agent’s dedicated page.
+
+Model info: which LLM/model this agent uses (DeepSeek Flash, II‑Medical‑32B, YOLOv8, RF/GBM, Autoencoder).
+
+You can filter by type: NLP, Vision, Tabular, Orchestrator, XAI.
+
+7. Agent Lab Template (per agent)
+Each agent gets its own Agent Lab page following a common template:
+
+Common sections:
+
+Agent Summary Header
+
+Name, role, model, tools.
+
+Diagram placing this agent in the global pipeline (highlighted node in a mini pipeline graph).
+
+Test Bench (local sandbox for that agent)
+
+Input form tailored to that agent:
+
+For TOD Agent: temperature, weight, clothing, environment sliders + “Run TOD Agent”.
+
+For Timeline Agent: paste logs / events + run anomaly detection.
+
+For Image Agent: upload frame / use sample footage.
+
+Shows:
+
+Raw output JSON.
+
+Pretty / human‑friendly interpretation.
+
+XAI snippet (feature attribution, detection confidence, etc.).
+
+Recent Runs
+
+Table of recent invocations of that agent across cases:
+
+Case ID, input summary, result summary, latency, status.
+
+Click → jump back to Case Workspace at the relevant place.
+
+Configuration & Limits
+
+Hyperparameters (e.g., RF/GBM depth, Autoencoder threshold) with read‑only or simple controls.
+
+Model version info.
+
+You will have distinct Agent Lab views for:
+
+Autopsy Analysis Agent (II‑Medical‑32B)
+
+TOD Agent (Henssge + RF/GBM)
+
+Timeline & Anomaly Agent (Autoencoder + IF)
+
+Correlation Engine
+
+Claim Extractor
+
+Evidence–Claim Mapper
+
+Hypothesis Manager
+
+Bias & Uncertainty Monitor
+
+Reasoning Replay Agent
+
+Image Agent (YOLO/DETR)
+
+This is the piece that most teams will not even think of, and it’s directly aligned with multi-agent dashboard best practices.
+
+8. Pipeline Explorer (Full Pipeline Page)
+Purpose: Show all agents together in the context of a specific case, with more depth than the small strip in the workspace.
+
+For a chosen case:
+
+Large DAG view of your pipeline:
+
+Nodes = agents/tools.
+
+Edges show data flow; animated when re‑running.
+
+Timeline at bottom:
+
+Vertical markers showing when each agent ran relative to the case timeline.
+
+Side panel:
+
+Click a node → show my last run’s input/output summary, errors, and link to that agent’s lab.
+
+You can also “Step through run” like a debugger: one agent at a time lights up, enabling judges to watch the orchestration.
+
+Section 4 — Reasoning, XAI & Storytelling
+9. XAI & Uncertainty Studio
+Purpose: Dedicated space for explainability and uncertainty, required to build trust in forensic AI.
+
+Tabs:
+
+Per-Agent Explanations
+
+Cards for TOD, Anomaly, Hypothesis.
+
+Top‑k SHAP/LIME features per important decision (why anomaly X, why TOD range Y).
+
+Uncertainty Dashboard
+
+For each major output:
+
+TOD: distribution, CI, sources of uncertainty.
+
+Hypotheses: probability intervals, sensitivity sliders (“what if we remove CCTV evidence?”).
+
+Link to arXiv work on uncertainty‑calibrated forensic agents as conceptual inspiration.
+
+This gives a big, visually distinct page just about transparency, which is heavily emphasized in forensic XAI literature and dashboards.
+
+10. Reasoning Replay Theater
+As before, but upgraded:
+
+Left: stepper list of reasoning steps.
+
+Center: slide‑like stage that changes view per step (timeline snapshot, causal graph, hotspot focus).
+
+Right: natural-language explanation with small metadata (which agents contributed).
+
+Add controls:
+
+Play / pause animation.
+
+Jump to “Agent view” for a step (open relevant Agent Lab with pre‑filled inputs).
+
+This looks like a built‑in “cinematic walkthrough” of the case.
+
+Section 5 — Output & Governance
+11. Report Builder
+As before; just ensure:
+
+Each section lets you insert explanation snippets and charts from XAI Studio, TOD Lab, and Timeline Lab.
+
+You can “pin” specific agent outputs into the report (e.g., TOD Agent explanation block).
+
+12. Audit & Chain‑of‑Custody
+Purpose: Forensic‑grade traceability.
+
+Timeline of ALL system actions for a case:
+
+When each agent was run.
+
+What versions, what configs.
+
+Who triggered it (user id).
+
+Downloadable machine‑readable log.
+
+This page does not have to be fully implemented, but visually it signals legal awareness and alignment with forensic best practice.
+
+How This Meets Your Requirements
+“Advanced and many pages” → 12+ distinct, purposeful screens (Command Center, Case Lobby, Case Workspace, Autopsy/TOD Lab, Digital Forensics Lab, Agent Directory, 10+ Agent Labs, Pipeline Explorer, XAI Studio, Replay Theater, Report Builder, Audit).
+
+“Individually access every agent separately” → Agent Directory + dedicated Agent Lab template for each agent.
+
+“Full pipeline view” → Pipeline strip in Case Workspace + deep Pipeline Explorer.
+
+“Frontend is most important” → Multiple highly visual, research‑inspired UIs: graphs + timelines + XAI panels + replay, reflecting best practices from multi‑agent dashboards, graph visualization UX, and forensic XAI dashboards.

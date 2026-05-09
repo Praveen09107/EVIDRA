@@ -1,0 +1,517 @@
+1. Purpose and Role
+1.1 What problem it solves
+Investigators constantly face the question: given everything we know so far, what is the most useful next piece of work or evidence?
+
+The NBE Agent’s job is to:
+
+Systematically identify evidence gaps and high‑value unanswered questions from the argument graph, hotspots, TOD band, digital timeline, and autopsy.
+
+Generate a ranked list of concrete actions (e.g., “pull CCTV from camera X between T1–T2”, “run advanced toxicology”, “request further phone records for contact Y”).
+
+Balance expected information gain (how much this action could reduce uncertainty or discriminate between hypotheses) with cost/feasibility, similar to active learning and bandit approaches that pick the most informative or cost‑effective next query.
+
+Learn over time from past cases and investigator feedback which suggestions were actually helpful, like forensic recommender systems that propose clues based on prior cases.
+
+It operates on top of everything else: it doesn’t “discover” facts, it decides where to probe next.
+
+1.2 Interaction with other agents
+Reads:
+
+Gap & Logic Auditor output (missing claims/evidence in the argument graph).
+
+Bias & Uncertainty Report (where we are over‑confident / under‑informed).
+
+TOD band & Hotspots (where in time space is promising but under‑explored).
+
+Digital anomalies & key events (which locations/devices/contacts are suspicious).
+
+Writes:
+
+A ranked list of NbeSuggestion objects.
+
+Feedback tags when investigators accept/ignore suggestions, feeding the learning loop.
+
+2. Data Contracts
+2.1 Inputs
+For each case (and optionally per pipeline run):
+
+ts
+NbeInput {
+  caseId: string;
+  pipelineRunId: string;
+
+  todResult?: TodResult;
+  hotspots?: Hotspot[];
+  anomalies?: AnomalyWindow[];
+  hypotheses?: HypothesisSummary[];       // NATURAL / ACCIDENT / SUICIDE / HOMICIDE
+  argumentGraph?: CausalGraph;            // nodes & edges
+  gapFindings?: GapFinding[];             // from Gap & Logic Auditor
+  uncertaintyReport?: UncertaintyReport;  // from Bias & Uncertainty Monitor
+  evidenceInventory?: EvidenceInventory;  // what is already present/ingested
+  historicalCaseStats?: HistoricalStats;  // optional, for learning
+}
+Representative types (simplified):
+
+ts
+GapFinding {
+  id: string;
+  type: "MISSING_EVIDENCE" | "UNCHECKED_HYPOTHESIS" | "WEAK_SUPPORT" | "CONTRADICTION_UNRESOLVED";
+  description: string;
+  target: "HYPOTHESIS" | "CLAIM" | "TIME_WINDOW" | "LOCATION" | "ENTITY";
+  targetRefId?: string;          // e.g., hypothesisKey, claimId, timeWindowId
+  severity: "INFO" | "WARN" | "CRITICAL";
+}
+
+EvidenceInventory {
+  items: EvidenceItem[];
+}
+
+EvidenceItem {
+  id: string;
+  type: "AUTOPSY" | "CCTV" | "PHONE" | "IOT" | "SCENE_PHOTO" | "REPORT" | "OTHER";
+  scope: {
+    timeWindow?: { start: string; end: string };
+    locations?: string[];
+  };
+  status: "INGESTED" | "AVAILABLE_NOT_INGESTED" | "UNAVAILABLE" | "REQUESTED";
+}
+
+HistoricalStats {
+  suggestions: HistoricalSuggestionRecord[];
+}
+
+HistoricalSuggestionRecord {
+  suggestionType: string;   // e.g., "CCTV_TIME_WINDOW", "TOXICOLOGY_PANEL"
+  contextFeatures: Record<string, any>; // case-level context snapshot
+  outcome: "HELPFUL" | "NOT_HELPFUL" | "UNKNOWN";
+}
+Historical data lets the NBE agent move from heuristic ranking to a true recommender / bandit over time.
+
+2.2 Outputs
+ts
+NbeSuggestionList {
+  caseId: string;
+  pipelineRunId: string;
+  generatedAt: string;
+  suggestions: NbeSuggestion[];
+}
+ts
+NbeSuggestion {
+  id: string;
+  kind: "COLLECT_EVIDENCE" | "RUN_AGENT" | "HUMAN_QUESTION" | "SCENARIO_ANALYSIS";
+
+  label: string;              // UI title
+  description: string;        // what & why
+  action: EvidenceAction;     // machine-readable action
+
+  expectedInfoGain: number;   // 0–1
+  expectedCost: number;       // normalized 0–1
+  priorityScore: number;      // fused score (higher = more urgent/useful)
+
+  targets: TargetRef[];       // time-window, location, device, person, hypothesis
+  dependencies?: string[];    // suggestion IDs that should be done first
+}
+ts
+EvidenceAction {
+  type: "REQUEST_CCTV" | "REQUEST_PHONE_RECORDS" | "REQUEST_TOXICOLOGY" |
+        "REQUEST_SCENE_PHOTOS" | "RUN_AGENT" | "ASK_EXPERT" | "OTHER";
+
+  parameters: Record<string, any>;  // structured: time range, camera IDs, contact IDs, etc.
+}
+
+TargetRef {
+  type: "TIME_WINDOW" | "LOCATION" | "DEVICE" | "PERSON" | "HYPOTHESIS" | "CLAIM";
+  id?: string;            // e.g. hotspotId, anomalyId, graph node id
+  timeWindow?: { start: string; end: string };
+  location?: string;
+}
+Investigator feedback is captured as:
+
+ts
+NbeFeedback {
+  suggestionId: string;
+  caseId: string;
+  actionTaken: "ACCEPTED" | "IGNORED" | "REJECTED" | "NOT_POSSIBLE";
+  outcome?: "HELPFUL" | "NOT_HELPFUL" | "UNKNOWN";
+}
+This closes the learning loop, analogous to recommender systems & bandit frameworks that update their policies based on user responses.
+
+3. Internal Architecture
+High‑level pipeline:
+
+text
+Inputs (TOD, hotspots, gaps, uncertainty, inventory, history)
+    ↓
+Opportunity Extractor (where are the gaps?)
+    ↓
+Candidate Generator (what concrete actions could fill those?)
+    ↓
+Scoring Engine (information gain vs cost, plus learned priors)
+    ↓
+Ranker & Deduplicator
+    ↓
+Suggestion Formatter (narratives, parameters)
+    ↓
+NbeSuggestionList
+3.1 Opportunity Extractor
+Goal: convert gaps + uncertainty + argument graph structure into abstract information needs.
+
+Gaps from Gap Auditor
+
+MISSING_EVIDENCE on a hypothesis node with high uncertainty → “we need data that speaks to this hypothesis.”
+
+WEAK_SUPPORT for a critical claim (“victim was alone at home”) → “need independent corroborating evidence.”
+
+Uncertainty hotspots
+
+Wide TOD band; low evidence density inside band.
+
+Bias flags about modality dominance (“only digital evidence, no physical corroboration”).
+
+Temporal & spatial holes
+
+From evidence inventory and anomalies:
+
+Time segments near TOD with no CCTV/phone logs.
+
+Places where victim is present (from autopsy/scene/phone) but no digital coverage.
+
+The output is a set of Information Needs:
+
+ts
+InformationNeed {
+  id: string;
+  type: "TIME_WINDOW_CLARIFICATION" | "HYPOTHESIS_DISAMBIGUATION" |
+        "ALIBI_VERIFICATION" | "MECHANISM_CONFIRMATION" | "BIAS_REDUCTION";
+  target: TargetRef;
+  description: string;
+  severity: "INFO" | "WARN" | "CRITICAL";
+}
+This is analogous to the “clues recommendation” concept in forensic recommendation frameworks where features of current case vs past cases define which missing clues would be most informative.
+
+3.2 Candidate Generator
+For each InformationNeed, we synthesize candidate actions.
+
+3.2.1 Action Templates
+Define a library of templates:
+
+For TIME_WINDOW_CLARIFICATION near TOD:
+
+REQUEST_CCTV(time, locations around scene)
+
+REQUEST_PHONE_RECORDS(time, victim / key contacts)
+
+RUN_AGENT (e.g., re-run Timeline & Anomaly with finer resolution).
+
+For ALIBI_VERIFICATION:
+
+REQUEST_CCTV(time, suspect’s claimed location)
+
+REQUEST_PHONE_RECORDS(time, suspect’s device).
+
+For MECHANISM_CONFIRMATION (e.g. suspected poisoning):
+
+REQUEST_TOXICOLOGY(panel=extended)
+
+REQUEST_SCENE_PHOTOS(location=kitchen/bathroom).
+
+For BIAS_REDUCTION:
+
+ASK_EXPERT (e.g., a pathologist or digital forensics analyst)
+
+COLLECT_EVIDENCE from an under‑used modality (physical vs digital).
+
+These templates are generic; the candidate generator fills parameters from TOD band, hotspots, anomaly windows, and known device/camera inventories.
+
+3.2.2 Heuristic + LLM synthesis
+For basic patterns, deterministic rules suffice (“no CCTV in TOD window → suggest CCTV”).
+
+For complex scenarios, an LLM gets:
+
+Argument graph snippet, gaps, TOD, hotspots, and inventory.
+
+Prompt: “List 3–5 concrete evidence collection actions that could most reduce uncertainty or discriminate between homicide vs accident.”
+This follows the idea of recommendation of clues tailored by similarity to past cases.
+
+Output: set of CandidateSuggestion objects with type and parameters, but not yet scored.
+
+3.3 Scoring Engine: Information Gain vs Cost
+This is the core of NBE.
+
+We assign each candidate an estimated Expected Information Gain (EIG) and cost, then combine.
+
+3.3.1 Information Gain (IG) heuristic
+Approximate IG with:
+
+Hypothesis entropy reduction
+
+Compute current entropy 
+H
+(
+hyp
+)
+H(hyp) from Hypothesis Manager.
+
+Estimate how much this action could reduce entropy if evidence comes back in a range of plausible ways.
+
+This is analogous to active learning’s uncertainty‑sampling / entropy‑based query strategies: we prefer queries that, if labeled, would most reduce model uncertainty.
+
+Simplified approach:
+
+Location in hypothesis space:
+
+If a suggestion directly targets a specific hypothesis or key discriminating claim (“Was victim alone at 23:00?”), assign higher potential IG.
+
+Overlap with TOD & hotspots:
+
+Evidence that covers TOD band or top hotspots has higher IG potential.
+
+Modality coverage:
+
+Actions that bring in missing modalities (e.g. physical evidence when only digital exists) reduce bias and thus have high IG for robustness.
+
+Quantitatively: we can start with a heuristic IG score in combining those factors, and later refine using learned models.
+
+3.3.2 Cost modeling
+We estimate normalized cost in:
+
+Low: re-running an internal agent; simple database queries.
+
+Medium: requesting additional logs or CCTV that are readily accessible.
+
+High: field evidence collection, extended toxicology, cross‑jurisdictional subpoenas.
+
+Cost can be manually parameterized per action type and per jurisdiction/hardware constraints.
+
+3.3.3 Priority score
+We then compute:
+
+priorityScore
+=
+α
+⋅
+EIG
+−
+β
+⋅
+Cost
+priorityScore=α⋅EIG−β⋅Cost
+with optional penalty or bonus terms for severity (e.g., CRITICAL InformationNeeds).
+
+This mirrors bandit / active learning trade‑offs where you balance exploration / information gain vs cost/regret.
+
+3.3.4 Learning from history (recommender / bandit layer)
+Over time, we want the scoring to learn from actual outcomes:
+
+From NbeFeedback: which suggestion types in which contexts tended to be helpful.
+
+From historical performance: e.g., “CCTV from TOD band was highly informative in 75% of similar homicide cases.”
+
+We can implement:
+
+A contextual bandit:
+
+Arms: suggestion types / templates.
+
+Context: features derived from case (hypothesis distribution, TOD width, available modalities, etc.).
+
+Reward: HELPFUL vs NOT_HELPFUL outcomes.
+
+Policies: UCB / Thompson sampling / more advanced bandit algorithms, similar to threat‑hunting bandit approaches that prioritize data collection actions.
+
+Or a recommender:
+
+Memory‑based: nearest neighbor similarity to past cases; reuse suggestions that worked before in similar contexts, as described in forensic clue‑recommendation work.
+
+Thus EIG estimate gets two components:
+
+A knowledge‑driven heuristic part (entropy, TOD overlap, bias reduction).
+
+A data‑driven part learned from prior cases.
+
+3.4 Ranker & Deduplicator
+This module:
+
+Sorts candidates by priorityScore.
+
+Removes duplicates (e.g., multiple templates produce nearly identical CCTV requests).
+
+Applies diversity constraints:
+
+Ensure the top‑K suggestions are not all of the same type (e.g., all CCTV); we want a mix across modalities, similar to diversity sampling in active learning to prevent bias and encourage broad coverage.
+
+Optionally enforce budgets:
+
+E.g., “at most 3 high‑cost suggestions”.
+
+3.5 Suggestion Formatter
+Final step:
+
+Converts each candidate into a polished NbeSuggestion:
+
+Human‑readable label and description.
+
+Structured action and targets.
+
+Clear “why we suggest this” narrative connecting back to gaps and uncertainty.
+
+For example:
+
+label: “Request CCTV from loading bay cameras between 02:00 and 04:00.”
+
+description: “There is a high‑scoring digital hotspot around 02:30 that lies inside the TOD window, but no CCTV data currently covers this period. Video from the loading bay may show whether the victim or other individuals entered or exited the building, significantly clarifying whether the death was accidental or homicidal.”
+
+4. Interaction Patterns
+4.1 Batch mode (after pipeline run)
+After a full pipeline run completes, Orchestrator calls NBE Agent.
+
+NBE returns a sorted list of suggestions.
+
+UI shows them in NBE panel, grouped by priority and type.
+
+Investigator can click any suggestion to:
+
+See a mini‑explanation.
+
+Confirm action (which sets EvidenceItem.status="REQUESTED" or triggers an external workflow).
+
+4.2 Interactive mode (copilot)
+In the Case Copilot UI, user can ask:
+
+“What should I do next?”
+
+“How can I reduce uncertainty about homicide vs accident?”
+
+Copilot uses NBE suggestions behind the scenes and maps them into conversational responses.
+
+5. End‑to‑End Example
+Case context (similar to earlier examples):
+
+TOD median 03:30, 95% band 23:30–07:00.
+
+Hotspot #1: 01:40–04:00, high fusedScore.
+
+Digital evidence dense at 01:40–02:10, sparse 02:10–04:00.
+
+No CCTV covering interior of building for 02:00–04:00; only exterior camera earlier in evening.
+
+Hypothesis Manager: homicide 0.8, accident 0.15.
+
+Gap Auditor:
+
+MISSING_EVIDENCE for “no direct visual confirmation of victim’s condition near TOD”.
+
+Uncertainty Report:
+
+Bias flags for modality dominance and data gaps in TOD band.
+
+5.1 Opportunity Extraction
+InformationNeeds:
+
+IN1 – TIME_WINDOW_CLARIFICATION
+
+target: TOD 95% band, especially 02:00–04:00.
+
+severity: CRITICAL.
+
+IN2 – MECHANISM_CONFIRMATION
+
+target: homicide vs accident.
+
+severity: WARN.
+
+5.2 Candidate Generation
+From IN1:
+
+S1: Request CCTV from internal cameras for 02:00–04:00 (if exist but not ingested).
+
+S2: Request additional phone tower logs for victim and key contact during 02:00–04:00.
+
+S3: Run Timeline & Anomaly Agent with finer time resolution in 02:00–04:00.
+
+From IN2:
+
+S4: Request extended toxicology panel (if mechanism unclear).
+
+S5: Ask pathologist to review whether injuries are more aligned with fall vs assault (HUMAN_QUESTION).
+
+5.3 Scoring
+Heuristic IG:
+
+S1 (CCTV in TOD band): very high IG; direct visual evidence; inside TOD band; addresses critical gap.
+
+S2 (phone logs): high IG; digital co‑evidence; still good.
+
+S3 (re‑run agent): medium IG; uses existing data only.
+
+S4 & S5: medium; may clarify mechanism but less targeted in time.
+
+Costs:
+
+S1: medium–high (depends on availability/infrastructure).
+
+S2: medium.
+
+S3: low.
+
+S4: high (lab resources).
+
+S5: low–medium (expert time).
+
+PriorityScore (conceptually):
+
+S1: 0.9 IG − 0.4 cost → ~0.5 (but with high severity, boosted).
+
+S2: 0.8 IG − 0.3 cost → ~0.5.
+
+S3: 0.5 IG − 0.1 cost → ~0.4.
+
+S4: 0.6 IG − 0.7 cost → ~low.
+
+S5: 0.5 IG − 0.2 cost → medium.
+
+Bandit/recommender tweak:
+
+Suppose historical data shows CCTV in TOD windows often extremely helpful; S1 gets additional uplift.
+
+Final ranking: S1, S2, S3, S5, S4.
+
+5.4 Final Suggestions (human‑friendly)
+Example top two:
+
+Suggestion S1
+
+label: “Obtain CCTV for interior hallways between 02:00 and 04:00.”
+
+description: “There is a high‑priority hotspot overlapping the estimated time of death, but we have no interior CCTV for this period. Video here could confirm whether the victim or other individuals were present near the time of death, strongly discriminating between accident and homicide.”
+
+expectedInfoGain: 0.92, expectedCost: 0.45, priorityScore: 0.83.
+
+action: REQUEST_CCTV with parameters: { cameras: ["Hallway-1","Stairwell-2"], start: "02:00", end: "04:00" }.
+
+targets: TOD band, Hotspot #1.
+
+Suggestion S2
+
+label: “Retrieve detailed phone logs for victim and contact X between 02:00 and 04:00.”
+
+description: “Call and location logs during this window could reveal whether the victim was communicating or moving, filling current gaps near the estimated time of death and providing independent support or contradiction for the hotspot narrative.”
+
+expectedInfoGain: 0.85, expectedCost: 0.35, priorityScore: 0.78.
+
+action: REQUEST_PHONE_RECORDS with structured parameters.
+
+UI shows these; investigator chooses to act on S1 and S2; NBE gets feedback later when these turned out to be highly informative (or not), updating its policy.
+
+6. Implementation Notes
+Service placement: NBE can be a stateless microservice triggered by orchestrator after each major reasoning cycle.
+
+Storage:
+
+nbe_suggestions table with context features and scores (good for later analysis).
+
+nbe_feedback table for bandit/recommender updates.
+
+Learning pipeline:
+
+Batch job that re‑fits contextual bandit / recommendation models periodically based on accumulated feedback, similar to forensic recommender frameworks that exploit past case data.

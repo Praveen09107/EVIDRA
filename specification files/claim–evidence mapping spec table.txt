@@ -1,0 +1,103 @@
+Here’s a concrete spec table for how different evidence types map into claim–evidence stance decisions. This is meant to guide implementation of the Evidence–Claim Mapper across all the modalities you have (Autopsy, TOD, Collision, Anomaly, Timeline, Text), aligned with fact‑checking / NLI pipelines.
+
+1. Legend
+Claim domain: what the claim is about.
+
+Evidence type: structured object class.
+
+Mapping strategy: how to build the (premise, hypothesis) pair + structured features.
+
+Typical stance outcomes: SUPPORTS / REFUTES / NOT_ENOUGH_INFO patterns.
+
+Notes: edge cases and priority rules.
+
+2. Mapping Spec Table by Evidence Type
+2.1 Autopsy Evidence → Claims
+Aspect	Spec
+Claim domains	Cause of death, manner (homicide/accident/suicide/natural), injuries, toxicology, time windows compatible with physiological state.
+Evidence type	AUTOPSY (structured findings + narrative summaryText).
+Mapping strategy	Premise = autopsy summary text (plus specific finding if needed: “Cause of death: blunt force trauma”; “Blood alcohol: 0.18”). Hypothesis = claim normalized text. Include structured fields (COD, manner, injury list, tox panel) as auxiliary features. Use NLI stance model to classify.
+SUPPORT patterns	Claim: “Victim died from blunt force trauma” ↔ autopsy COD = blunt trauma. Claim: “Victim had very high blood alcohol” ↔ BAL above threshold. Claim: “There are defensive wounds on victim’s forearms” ↔ injuries noted.
+REFUTE patterns	Claim: “Victim died of poisoning” but autopsy finds no toxic agents and clear mechanical cause. Claim: “No injuries were present” yet injuries documented.
+NOT_ENOUGH_INFO	Claim mentions highly specific mechanism not resolved in report (e.g., exact weapon) or degree of intoxication beyond measured value.
+Notes	Autopsy often treated as high‑reliability evidence with strong weight in aggregation. Mapper should prefer REFUTE from autopsy over weak supports from other sources when conflicting.
+2.2 TOD (Time‑of‑Death) → Claims
+Aspect	Spec
+Claim domains	When death occurred (absolute or relative), whether victim was alive at time t, compatibility of alibi timelines.
+Evidence type	TODResult (posterior distribution, 68/95% intervals).
+Mapping strategy	Premise = textual summary: “Time of death estimated between 23:30 and 07:00, centered at 03:30, moderate uncertainty.” Hypothesis = claim: “Victim died around midnight”, “Victim died after 06:00”, “Victim was alive at 23:00”. Use interval logic + NLI to decide if claim’s time is inside, near, or clearly outside credible TOD band.
+SUPPORT patterns	Claim time inside TOD 68% band strongly supports; inside 95% band moderately supports. Claim that victim was alive well before TOD window is compatible (NOT_REFUTE).
+REFUTE patterns	Claim: “Victim died at 10:00 next morning” while TOD 95% band ends at 07:00. Claim: “Victim was alive at 04:30” when TOD posterior mass is concentrated before 04:30 and other evidence aligns.
+NOT_ENOUGH_INFO	Very broad or vague claims (“sometime at night”), or TOD distribution extremely wide so it doesn’t meaningfully constrain.
+Notes	Mapper should use numeric interval reasoning (not only text) to guide stance, but feed both into the NLI/verification model as context.
+2.3 Collision (Spatio‑temporal Co‑presence) → Claims
+Aspect	Spec
+Claim domains	Presence/absence of suspect/victim at a location/time, co‑presence (“X met Y”), movement (“X was never in building”), alibis.
+Evidence type	COLLISION (co‑presence/co‑absence events) and KeyEvents derived from collision.
+Mapping strategy	Premise = collision summary: “Between 01:47 and 01:50, CCTV shows victim and suspect A in Stairwell 2; phone data corroborates building presence.” Hypothesis = claim: “Suspect A was at home all night”, “Suspect A never met the victim at the building”, “Victim met suspect A only once earlier in the evening.” Use NLI + structured features (time window, region, participants) to classify.
+SUPPORT patterns	Claim: “Victim and suspect A were together in Stairwell 2 around 01:45” ↔ high‑confidence co‑presence collision at that time and region. Claim: “Suspect A was at the building at 01:50” ↔ collision placing suspect at building.
+REFUTE patterns	Claim: “Suspect A was at home all night” ↔ collision showing suspect at building 01:40–02:00. Claim: “Victim never met suspect A” ↔ multiple co‑presence collisions. Claim: “Victim left alone after bar” ↔ collision showing victim + third party.
+NOT_ENOUGH_INFO	Collision only weakly constrains claim time (e.g., one co‑presence far outside claimed period), or evidence is low confidence.
+Notes	Collision evidence should be treated as strong for spatio‑temporal claims, especially when multi‑modal (CCTV + phone) corroborate. Mapper must handle negated claims and alibis carefully via NLI (“did not meet”, “never was”).
+2.4 Anomaly / Hotspot → Claims
+Aspect	Spec
+Claim domains	Behavioral patterns: “no unusual activity”, “victim behaved normally”, “no communication with X”, presence of suspicious patterns.
+Evidence type	ANOMALY windows and HOTSPOTs (fused anomalies + collisions + TOD overlap).
+Mapping strategy	Premise = textual summary: “There is a high anomaly window between 01:40 and 04:00: unusual phone usage, movement to unfamiliar location, then digital silence, overlapping TOD band.” Hypothesis = claim: “The victim behaved normally that night”, “There were no unusual movements or communications after leaving the bar”, “Victim did not go to any unfamiliar locations.” Use NLI to judge whether anomaly/hotspot meaningfully contradicts such claims.
+SUPPORT patterns	Claim: “Victim moved to an unfamiliar area around 02:00” ↔ hotspot describing exactly that. Claim: “There were unusual movements before death” ↔ high anomaly score near TOD.
+REFUTE patterns	Claim: “There was no unusual activity after 23:00” ↔ strong anomaly/hotspot features after 23:00. Claim: “Victim did not leave home after midnight” ↔ anomaly showing travel away from home.
+NOT_ENOUGH_INFO	Anomalies that are minor or not clearly linked to claim content, or claims very high‑level (“victim was under stress”) that anomalies can’t directly address.
+Notes	Anomalies are inherently probabilistic; stance confidence should be lower than for direct evidence like collision or autopsy. Mapper should prefer PARTIAL_SUPPORT/REFUTE for anomaly‑based links, and surface uncertainty in explanation.
+2.5 Timeline Events (Digital / Physical) → Claims
+Aspect	Spec
+Claim domains	Specific actions: calls, messages, app usage, transactions, arrivals/ departures, digital alibis.
+Evidence type	TIMELINE_EVENT (phone call, message, app event, door access, IoT event).
+Mapping strategy	Premise = event summary: “At 23:05, suspect A’s phone placed a call to victim lasting 4 minutes.” Hypothesis = claim: “Suspect A did not contact the victim after 23:00”, “Victim received no calls after leaving the bar”. Use NLI on textual pair; also do logical matching (time, participants, action) via structured fields.
+SUPPORT patterns	Claim: “Suspect A called the victim around 23:00” ↔ call at 23:05; claim: “No calls after 23:30” supported if no events after that. Claims about order (“X called before Y returned home”) can be supported by precise timestamps.
+REFUTE patterns	Claim: “There was no contact between suspect A and victim after 23:00” ↔ call at 23:05. Claim: “Victim did not leave the building after midnight” ↔ access‑control swipe or GPS event at 00:30 leaving.
+NOT_ENOUGH_INFO	Claims are too vague (“they were in touch that week”) or events insufficient to confirm/deny (one missed call vs “long conversation”).
+Notes	For simple time‑bounded claims about presence/communication, mapper can often do purely symbolic reasoning without heavy NLI, but NLI helps with varied phrasings and negations.
+2.6 Textual Snippets (Reports, Chats) → Claims
+Aspect	Spec
+Claim domains	Nearly any factual proposition: who did what, where, when, relationships, reported states.
+Evidence type	TEXT_SNIPPET from witness statements, reports, chats, emails.
+Mapping strategy	Standard claim verification / NLI: Premise = text snippet, Hypothesis = claim. Use specialized NLI/verification model (legal/forensic‑adapted). Aggregate multiple snippets where needed, similar to document‑level fact‑checking architectures.
+SUPPORT patterns	Snippet explicitly or implicitly states the same proposition (“I saw him leave alone at 11 pm” supporting “victim left bar alone at 23:00”).
+REFUTE patterns	Contradictory statements: one witness says “victim was alone”, another “victim left with suspect A”; mapper marks cross‑witness contradictions, as in legal NLI contradiction detection.
+NOT_ENOUGH_INFO	Snippets not addressing the claim, or ambiguous/hedged statements.
+Notes	Here we fully leverage NLI + multi‑snippet aggregation methods (e.g., attention‑based, as in document‑level AFC) to compute evidence‑level and claim‑level verdicts.
+2.7 Graph Nodes / Derived Hypotheses → Claims
+Aspect	Spec
+Claim domains	Higher‑level hypotheses (homicide vs accident, motive, opportunity), intermediate inferences (“suspect A had opportunity”, “victim was incapacitated”).
+Evidence type	GRAPH_NODE / derived nodes from Hypothesis Manager or Argument Graph (e.g., “opportunity: HIGH”).
+Mapping strategy	Premise = node description (e.g., “System currently estimates homicide probability at 0.8 due to autopsy classification and co‑presence hotspots”). Hypothesis = claim (“This was probably a homicide”). Here the stance is more meta; typically mapper uses these nodes to support or contextualize claims about the system’s own beliefs, not physical‑world facts.
+SUPPORT/REFUTE patterns	SUPPORT for claims about system’s current assessment (“system considers homicide the most likely scenario”). Not used to directly support/contradict raw factual claims about the world (those should rely on primary evidence).
+NOT_ENOUGH_INFO	For real‑world claims, graph nodes are not primary evidence; treat as NOT_ENOUGH_INFO or context only.
+Notes	Keep a clean separation between “evidence about the world” vs “evidence about system beliefs”. Only the former should inform case hypotheses directly.
+3. Priority / Weighting Guidance Across Evidence Types
+When multiple evidence items map to a claim with different stances, the aggregator (not the Mapper itself) needs weights. But the Mapper can recommend default relative reliability:
+
+Evidence type	Typical weight (relative)	Rationale
+Autopsy	Very high	Expert, physical, direct causal info.
+TOD	High for time constraints	Physics + multiple modalities; still uncertain but strong for ruling out impossible times.
+Collision (multi‑modal)	High	Direct co‑presence from CCTV+phone; strong for alibi/contact claims.
+Collision (single modality)	Medium–high	Still strong, but more error/bias risk.
+Timeline digital events	Medium–high	Logs are reliable but need context (e.g., phone vs person).
+Anomaly/Hotspot	Medium	Indirect behavioral patterns; good for “unusual activity” but weaker for crisp factual claims.
+Textual snippets (witness)	Medium	Prone to bias/error; best when corroborated.
+Graph nodes / derived	Low for real‑world claims	System beliefs, not ground evidence.
+These relative weights can guide the later claim‑level verdict aggregation similar to AFC systems that combine evidence‑level stances with source reliability.
+
+4. Implementation Tips
+Implement per‑type mappers that:
+
+Generate summaryText (premise) and structured features.
+
+Encode simple domain rules (e.g., time interval overlap, location equality).
+
+Call a unified NLI/verifier where needed.
+
+Keep mapping logic data‑driven but explicit, similar to modular AFC pipelines: each module has a clear contract and can be evaluated independently.
+
+For explainability, mirror ClaimVer / CorXFact / JustiLM: highlight the specific evidence phrases or numeric constraints that drive SUPPORT/REFUTE labels and produce brief justifications.
+

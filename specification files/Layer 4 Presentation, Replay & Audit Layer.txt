@@ -1,0 +1,1655 @@
+AIVENTRA — Layer 4: Presentation, Replay & Audit Layer
+Full Technical Specification
+Layer: 4 of 4 | Domain: Report Viewer, Reasoning Replay Viewer, Timeline Explorer, Hypothesis Dashboard, Audit Trail, WebSocket Client, Export Engine
+Runtime: Next.js 15 (App Router) + React 19 | Port: 3000
+
+PART I — LAYER PURPOSE & BOUNDARIES
+Layer 4 is the human intelligence interface of AIVENTRA. It takes every structured output from Layer 3 and renders it into a coherent, interactive, audit-ready investigation workspace. It never writes to the database directly — all mutations go through Layer 1's API. All reads are authenticated REST calls that Layer 1 proxies.
+
+Six core responsibilities:
+
+Forensic Report Viewer — structured rendering of all 9 report sections with collapsible panels, confidence indicators, and inline evidence links
+
+Reasoning Replay Viewer (RRV) — step-by-step playback of every inference decision with cryptographic chain verification badges, agent timeline, and hypothesis trajectory chart
+
+Timeline Explorer — zoomable, filterable event timeline with anomaly overlay and hotspot highlighting
+
+Hypothesis Dashboard — live-updating Bayesian posterior chart, evidence signal table, and trajectory animation
+
+Audit Trail Viewer — immutable audit log per case with actor, action, and timestamp
+
+Export Engine — PDF export of the full forensic report with evidence integrity certificates
+
+Boundary contracts:
+
+Reads from: Layer 1 REST API (/api/v1/*) — all authenticated, RBAC-enforced
+
+Real-time: Layer 1 WebSocket (/ws/cases/{case_id}) for live pipeline updates
+
+Writes to: Layer 1 REST API only (case notes, status updates, export requests)
+
+Never: direct DB access, direct MinIO access, direct agent calls
+
+PART II — APPLICATION ARCHITECTURE
+2.1 Next.js App Router Structure
+text
+aiventra-frontend/
+├── app/
+│   ├── layout.tsx                    ← Root layout (AuthProvider, WSProvider, ThemeProvider)
+│   ├── page.tsx                      ← Dashboard / case list
+│   ├── auth/
+│   │   └── login/page.tsx            ← Login page (AIVENTRA-branded)
+│   ├── cases/
+│   │   ├── page.tsx                  ← Case list with search + filters
+│   │   ├── new/page.tsx              ← Create case form
+│   │   └── [caseId]/
+│   │       ├── layout.tsx            ← Case shell (sidebar nav + WS subscription)
+│   │       ├── page.tsx              ← Case overview (redirect to /report)
+│   │       ├── report/
+│   │       │   └── page.tsx          ← Forensic Report Viewer
+│   │       ├── replay/
+│   │       │   └── page.tsx          ← Reasoning Replay Viewer
+│   │       ├── timeline/
+│   │       │   └── page.tsx          ← Timeline Explorer
+│   │       ├── hypothesis/
+│   │       │   └── page.tsx          ← Hypothesis Dashboard
+│   │       ├── evidence/
+│   │       │   ├── page.tsx          ← Evidence inventory
+│   │       │   └── [fileId]/page.tsx ← Evidence detail + custody chain
+│   │       └── audit/
+│   │           └── page.tsx          ← Audit trail viewer
+│   └── admin/
+│       ├── users/page.tsx            ← User management (ADMIN only)
+│       └── system/page.tsx           ← System health + agent status
+├── components/
+│   ├── case/
+│   │   ├── CaseShell.tsx             ← Sidebar + header for case workspace
+│   │   ├── CaseSidebar.tsx           ← Navigation links + pipeline status badge
+│   │   └── PipelineStatusBar.tsx     ← Live agent progress bar
+│   ├── report/
+│   │   ├── ReportViewer.tsx          ← Full 9-section report renderer
+│   │   ├── ReportSection.tsx         ← Collapsible section wrapper
+│   │   ├── MannerOfDeathBadge.tsx    ← Color-coded badge
+│   │   ├── HypothesisPosteriorTable.tsx
+│   │   ├── TodBand.tsx               ← Visual TOD window renderer
+│   │   └── WarningsPanel.tsx
+│   ├── replay/
+│   │   ├── ReplayViewer.tsx          ← Main RRV container
+│   │   ├── ReplayTimeline.tsx        ← Vertical step-by-step timeline
+│   │   ├── ReplayStepCard.tsx        ← Individual step card
+│   │   ├── ChainIntegrityBadge.tsx   ← Valid/Broken visual indicator
+│   │   ├── HypothesisTrajectory.tsx  ← Animated chart
+│   │   ├── AgentActivityBar.tsx      ← Horizontal agent execution swimlane
+│   │   └── ReplayControls.tsx        ← Play/pause/step/speed controls
+│   ├── timeline/
+│   │   ├── TimelineExplorer.tsx      ← Main timeline container
+│   │   ├── TimelineCanvas.tsx        ← SVG/Canvas render layer
+│   │   ├── EventDot.tsx              ← Individual event dot with tooltip
+│   │   ├── AnomalyOverlay.tsx        ← Shaded anomaly windows
+│   │   ├── HotspotBand.tsx           ← Hotspot highlight band
+│   │   ├── TodWindowOverlay.tsx      ← TOD confidence band
+│   │   └── TimelineFilters.tsx       ← Source/type/anomaly filter chips
+│   ├── hypothesis/
+│   │   ├── HypothesisDashboard.tsx   ← Full dashboard
+│   │   ├── PosteriorBarChart.tsx     ← Live bar chart
+│   │   ├── SignalTable.tsx           ← Evidence signal update table
+│   │   └── TrajectoryChart.tsx       ← Hypothesis evolution line chart
+│   ├── evidence/
+│   │   ├── EvidenceList.tsx
+│   │   ├── EvidenceCard.tsx
+│   │   ├── CustodyChain.tsx          ← Visual timeline of custody events
+│   │   └── IntegrityBadge.tsx
+│   ├── audit/
+│   │   ├── AuditTrail.tsx
+│   │   └── AuditLogEntry.tsx
+│   └── shared/
+│       ├── ConfidenceBar.tsx         ← Horizontal confidence indicator
+│       ├── HashFingerprint.tsx       ← Truncated + copyable hash display
+│       ├── SignatureBadge.tsx        ← Verified/Unverified/Broken
+│       ├── LiveBadge.tsx             ← Pulsing "LIVE" indicator
+│       ├── AgentStatusChip.tsx       ← PENDING/RUNNING/DONE/FAILED chip
+│       └── ExportButton.tsx
+├── hooks/
+│   ├── useWebSocket.ts               ← WS connection + reconnect + event dispatch
+│   ├── usePipelineEvents.ts          ← Subscribe to pipeline events
+│   ├── useReplayPlayback.ts          ← Replay step-by-step playback state
+│   ├── useTimelineZoom.ts            ← Zoom/pan state for timeline
+│   └── useHypothesisStream.ts        ← Live hypothesis updates
+├── lib/
+│   ├── api/
+│   │   ├── client.ts                 ← Axios-based API client with token refresh
+│   │   ├── cases.ts                  ← Case CRUD API calls
+│   │   ├── reports.ts                ← Report fetch API
+│   │   ├── replay.ts                 ← Replay chain fetch + verify API
+│   │   ├── timeline.ts               ← Timeline events API
+│   │   ├── hypothesis.ts             ← Hypothesis snapshots API
+│   │   ├── evidence.ts               ← Evidence API
+│   │   └── audit.ts                  ← Audit log API
+│   ├── crypto/
+│   │   └── verifyChain.ts            ← Client-side replay chain verifier
+│   ├── export/
+│   │   └── pdfExport.ts              ← PDF generation via API trigger
+│   └── utils/
+│       ├── formatTod.ts              ← TOD window formatter
+│       ├── maskPii.ts                ← PII display helpers
+│       └── confidenceColor.ts        ← Confidence → CSS color mapping
+├── store/
+│   ├── pipelineStore.ts              ← Zustand: pipeline run state
+│   ├── replayStore.ts                ← Zustand: replay playback state
+│   └── caseStore.ts                  ← Zustand: active case metadata
+└── types/
+    ├── report.ts                     ← ForensicReport TypeScript types
+    ├── replay.ts                     ← ReplayStep, ChainResult types
+    ├── timeline.ts                   ← TimelineEvent types
+    └── hypothesis.ts                 ← HypothesisSnapshot, Posterior types
+2.2 State Management Architecture
+text
+ZUSTAND STORES (no Redux, no Context for data — only for UI theme):
+──────────────────────────────────────────────────────────────────────
+
+pipelineStore:
+  {
+    pipelineRunId:    string | null,
+    status:           "IDLE" | "QUEUED" | "RUNNING" | "DONE" | "FAILED",
+    agentStatuses:    Record<AgentId, AgentStatus>,
+    agentDurations:   Record<AgentId, number>,       ← ms
+    totalTokens:      number,
+    totalDurationMs:  number,
+    lastEvent:        WsEvent | null,
+    todEstimate:      TodEstimate | null,
+    latestHypothesis: HypothesisPosteriors | null,
+    reportReady:      boolean,
+    reportId:         string | null,
+    warnings:         PipelineWarning[]
+  }
+
+replayStore:
+  {
+    steps:            ReplayStep[],
+    currentSeq:       number,
+    isPlaying:        boolean,
+    playbackSpeed:    1 | 2 | 4,        ← steps/second
+    chainValid:       boolean,
+    totalSteps:       number,
+    filterAgent:      string | null,
+    filterTrigger:    TriggerType | null,
+    hypothesisTrajectory: HypothesisSnapshot[]
+  }
+
+caseStore:
+  {
+    caseId:           string | null,
+    caseTitle:        string,
+    status:           CaseStatus,
+    lastReportId:     string | null,
+    evidenceCount:    number,
+    wsConnected:      boolean,
+    wsReconnecting:   boolean
+  }
+PART III — WEBSOCKET CLIENT
+3.1 Connection Management
+typescript
+// hooks/useWebSocket.ts
+
+const WS_RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]; // ms
+
+export function useWebSocket(caseId: string) {
+  const ws = useRef<WebSocket | null>(null);
+  const reconnectAttempt = useRef(0);
+  const reconnectTimer = useRef<NodeJS.Timeout>();
+  const [connected, setConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const { dispatch } = usePipelineStore();
+  const { accessToken } = useAuth();
+
+  const connect = useCallback(() => {
+    // Attach JWT as query param (WS doesn't support Authorization header):
+    const url = `${WS_BASE_URL}/ws/cases/${caseId}?token=${accessToken}`;
+    ws.current = new WebSocket(url);
+
+    ws.current.onopen = () => {
+      setConnected(true);
+      setReconnecting(false);
+      reconnectAttempt.current = 0;
+      caseStore.setState({ wsConnected: true, wsReconnecting: false });
+      // Send ping every 25s to keep connection alive:
+      startHeartbeat();
+    };
+
+    ws.current.onmessage = (event) => {
+      try {
+        const msg: WsEvent = JSON.parse(event.data);
+        handleWsEvent(msg);
+      } catch (e) {
+        console.error("WS parse error:", e);
+      }
+    };
+
+    ws.current.onclose = (event) => {
+      setConnected(false);
+      stopHeartbeat();
+      if (!event.wasClean) {
+        scheduleReconnect();
+      }
+    };
+
+    ws.current.onerror = () => {
+      ws.current?.close();
+    };
+  }, [caseId, accessToken]);
+
+  const scheduleReconnect = useCallback(() => {
+    const delay = WS_RECONNECT_DELAYS[
+      Math.min(reconnectAttempt.current, WS_RECONNECT_DELAYS.length - 1)
+    ];
+    reconnectAttempt.current += 1;
+    setReconnecting(true);
+    caseStore.setState({ wsReconnecting: true });
+    reconnectTimer.current = setTimeout(connect, delay);
+  }, [connect]);
+
+  function handleWsEvent(event: WsEvent) {
+    switch (event.event_type) {
+      case "PIPELINE_STARTED":
+        pipelineStore.setState({ status: "RUNNING", pipelineRunId: event.payload.pipeline_run_id });
+        break;
+      case "AGENT_STARTED":
+        pipelineStore.setState(s => ({
+          agentStatuses: { ...s.agentStatuses, [event.payload.agent_id]: "RUNNING" }
+        }));
+        break;
+      case "AGENT_COMPLETE":
+        pipelineStore.setState(s => ({
+          agentStatuses:  { ...s.agentStatuses, [event.payload.agent_id]: "DONE" },
+          agentDurations: { ...s.agentDurations, [event.payload.agent_id]: event.payload.duration_ms },
+          totalTokens:    s.totalTokens + (event.payload.llm_tokens || 0)
+        }));
+        break;
+      case "AGENT_ERROR":
+        pipelineStore.setState(s => ({
+          agentStatuses: { ...s.agentStatuses, [event.payload.agent_id]: "FAILED" }
+        }));
+        toast.error(`Agent ${event.payload.agent_id} failed: ${event.payload.error_summary}`);
+        break;
+      case "AGENT_RETRYING":
+        pipelineStore.setState(s => ({
+          agentStatuses: { ...s.agentStatuses, [event.payload.agent_id]: "RETRYING" }
+        }));
+        break;
+      case "TOD_UPDATED":
+        pipelineStore.setState({ todEstimate: event.payload });
+        break;
+      case "HYPOTHESIS_UPDATED":
+        pipelineStore.setState({ latestHypothesis: event.payload });
+        break;
+      case "ANOMALY_FLAGGED":
+        toast.info(`${event.payload.anomalous_event_count} anomalous events detected`);
+        break;
+      case "HOTSPOT_IDENTIFIED":
+        toast.warning(`${event.payload.critical_count} critical hotspot windows identified`);
+        break;
+      case "REPORT_READY":
+        pipelineStore.setState({
+          status:       "DONE",
+          reportReady:  true,
+          reportId:     event.payload.report_id
+        });
+        toast.success("Forensic report ready");
+        break;
+      case "PIPELINE_COMPLETE":
+        pipelineStore.setState({
+          status:          "DONE",
+          totalDurationMs: event.payload.total_duration_ms,
+          totalTokens:     event.payload.total_llm_tokens_used
+        });
+        break;
+      case "PIPELINE_FAILED":
+        pipelineStore.setState({ status: "FAILED" });
+        toast.error(`Pipeline failed: ${event.payload.error}`);
+        break;
+    }
+  }
+
+  useEffect(() => { connect(); return () => { ws.current?.close(); stopHeartbeat(); }; }, [caseId]);
+
+  return { connected, reconnecting };
+}
+PART IV — PIPELINE STATUS BAR
+The PipelineStatusBar renders at the top of every case page when a pipeline is running or recently completed. It shows the 11-agent DAG execution state in real-time.
+
+typescript
+// components/case/PipelineStatusBar.tsx
+
+const AGENT_TIERS = {
+  1: ["evidence_parser", "ocr", "format_normalizer"],
+  2: ["autopsy", "tod", "digital_timeline", "anomaly_detector"],
+  3: ["hotspot_correlation", "hypothesis_manager", "reasoning_replay", "report_generator"]
+};
+
+const AGENT_LABELS: Record<string, string> = {
+  evidence_parser:     "Evidence Parser",
+  ocr:                 "OCR",
+  format_normalizer:   "Normalizer",
+  autopsy:             "Autopsy",
+  tod:                 "TOD Estimator",
+  digital_timeline:    "Digital Timeline",
+  anomaly_detector:    "Anomaly Detector",
+  hotspot_correlation: "Hotspot Correlator",
+  hypothesis_manager:  "Hypothesis Engine",
+  reasoning_replay:    "Replay Chain",
+  report_generator:    "Report Generator"
+};
+
+export function PipelineStatusBar() {
+  const { status, agentStatuses, agentDurations, totalTokens, totalDurationMs }
+    = usePipelineStore();
+
+  if (status === "IDLE") return null;
+
+  const completedCount = Object.values(agentStatuses).filter(s => s === "DONE").length;
+  const totalAgents    = Object.keys(agentStatuses).length;
+  const overallPct     = Math.round((completedCount / totalAgents) * 100);
+
+  return (
+    <div className="pipeline-status-bar" data-status={status}>
+      {/* Overall progress strip */}
+      <div className="pipeline-progress-track">
+        <div className="pipeline-progress-fill" style={{ width: `${overallPct}%` }} />
+      </div>
+
+      {/* Tier swimlanes */}
+      <div className="pipeline-tiers">
+        {[1, 2, 3].map(tier => (
+          <div key={tier} className="pipeline-tier">
+            <span className="tier-label">Tier {tier}</span>
+            <div className="tier-agents">
+              {AGENT_TIERS[tier].map(agentId => (
+                <AgentStatusChip
+                  key={agentId}
+                  agentId={agentId}
+                  label={AGENT_LABELS[agentId]}
+                  status={agentStatuses[agentId] ?? "PENDING"}
+                  durationMs={agentDurations[agentId]}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Stats row */}
+      {status === "DONE" && (
+        <div className="pipeline-stats">
+          <span>{completedCount}/{totalAgents} agents completed</span>
+          <span>{(totalDurationMs / 1000).toFixed(1)}s total</span>
+          <span>{totalTokens.toLocaleString()} LLM tokens</span>
+        </div>
+      )}
+
+      {/* Live badge if running */}
+      {status === "RUNNING" && <LiveBadge />}
+    </div>
+  );
+}
+
+// AgentStatusChip renders per-agent state:
+export function AgentStatusChip({ agentId, label, status, durationMs }) {
+  const COLOR_MAP = {
+    PENDING:  "--color-text-faint",
+    RUNNING:  "--color-primary",
+    RETRYING: "--color-warning",
+    DONE:     "--color-success",
+    FAILED:   "--color-error",
+    SKIPPED:  "--color-text-faint"
+  };
+
+  return (
+    <div className={`agent-chip agent-chip--${status.toLowerCase()}`}
+         title={durationMs ? `${durationMs}ms` : status}>
+      <div className="agent-chip-dot"
+           style={{ backgroundColor: `var(${COLOR_MAP[status]})` }}>
+        {status === "RUNNING" && <div className="agent-chip-pulse" />}
+      </div>
+      <span className="agent-chip-label">{label}</span>
+      {status === "DONE" && durationMs && (
+        <span className="agent-chip-duration">{(durationMs/1000).toFixed(1)}s</span>
+      )}
+    </div>
+  );
+}
+PART V — FORENSIC REPORT VIEWER
+5.1 Report Section Architecture
+typescript
+// components/report/ReportViewer.tsx
+
+export function ReportViewer({ reportId }: { reportId: string }) {
+  const { data: report, isLoading } = useQuery({
+    queryKey: ["report", reportId],
+    queryFn:  () => api.reports.getReport(reportId),
+    staleTime: Infinity    // reports are immutable once generated
+  });
+
+  if (isLoading) return <ReportSkeleton />;
+  if (!report)   return <EmptyState title="Report not found" />;
+
+  return (
+    <div className="report-viewer">
+      {/* Header band */}
+      <ReportHeader
+        caseTitle       = {report.caseTitle}
+        generatedAt     = {report.generatedAt}
+        topHypothesis   = {report.topHypothesis}
+        topConfidence   = {report.topConfidence}
+        chainValid      = {report.chainValid}
+        pipelineRunId   = {report.pipelineRunId}
+      />
+
+      {/* Executive summary */}
+      <ReportSection id="executive-summary" title="Executive Summary" defaultOpen>
+        <p className="executive-summary-text">{report.executiveSummary}</p>
+      </ReportSection>
+
+      {/* Section 1 — Case Overview */}
+      <ReportSection id="case-overview" title="Case Overview" defaultOpen>
+        <CaseOverviewSection data={report.sections.caseOverview} />
+      </ReportSection>
+
+      {/* Section 2 — Autopsy & Toxicology */}
+      <ReportSection id="autopsy" title="Autopsy & Toxicology" defaultOpen>
+        <AutopsySection data={report.sections.autopsyToxicology} />
+      </ReportSection>
+
+      {/* Section 3 — Time of Death */}
+      <ReportSection id="tod" title="Time of Death Estimate" defaultOpen>
+        <TodSection data={report.sections.timeOfDeath} />
+      </ReportSection>
+
+      {/* Section 4 — Digital Timeline */}
+      <ReportSection id="digital-timeline" title="Digital Timeline Analysis">
+        <DigitalTimelineSection data={report.sections.digitalTimeline} />
+      </ReportSection>
+
+      {/* Section 5 — Hotspot Analysis */}
+      <ReportSection id="hotspots" title="Hotspot Analysis">
+        <HotspotSection data={report.sections.hotspotAnalysis} />
+      </ReportSection>
+
+      {/* Section 6 — Hypothesis Assessment */}
+      <ReportSection id="hypothesis" title="Hypothesis Assessment" defaultOpen>
+        <HypothesisSection data={report.sections.hypothesisAssessment} />
+      </ReportSection>
+
+      {/* Section 7 — Reasoning Transparency */}
+      <ReportSection id="reasoning" title="Reasoning Transparency">
+        <ReasoningSection data={report.sections.reasoningTransparency}
+                          pipelineRunId={report.pipelineRunId} />
+      </ReportSection>
+
+      {/* Section 8 — Evidence Integrity */}
+      <ReportSection id="integrity" title="Evidence Integrity">
+        <EvidenceIntegritySection data={report.sections.evidenceIntegrity} />
+      </ReportSection>
+
+      {/* Section 9 — Warnings */}
+      {report.sections.warningsLimitations.warnings.length > 0 && (
+        <ReportSection id="warnings" title="Warnings & Limitations">
+          <WarningsPanel warnings={report.sections.warningsLimitations.warnings} />
+        </ReportSection>
+      )}
+
+      {/* Export strip */}
+      <div className="report-export-strip">
+        <ExportButton reportId={reportId} />
+        <span className="report-chain-note">
+          {report.chainValid
+            ? "✓ Reasoning chain cryptographically verified"
+            : "⚠ Chain verification failed — consult administrator"}
+        </span>
+      </div>
+    </div>
+  );
+}
+5.2 Key Section Components
+TOD Section
+typescript
+// components/report/TodSection.tsx
+
+export function TodSection({ data }: { data: TodSectionData }) {
+  const { todPointEstimate, todWindow95, todWindow68,
+          pmiMeanHours, componentContributions,
+          consistency, warnings } = data;
+
+  return (
+    <div className="tod-section">
+      {/* Visual TOD band */}
+      <TodBand
+        pointEstimate = {todPointEstimate}
+        lower95       = {todWindow95.start}
+        upper95       = {todWindow95.end}
+        lower68       = {todWindow68?.start}
+        upper68       = {todWindow68?.end}
+      />
+
+      {/* Summary row */}
+      <div className="tod-summary-row">
+        <div className="tod-stat">
+          <span className="tod-stat-label">Point Estimate</span>
+          <span className="tod-stat-value">
+            {formatTod(todPointEstimate)}
+          </span>
+        </div>
+        <div className="tod-stat">
+          <span className="tod-stat-label">95% Window</span>
+          <span className="tod-stat-value tod-stat-value--muted">
+            {formatTodWindow(todWindow95.start, todWindow95.end)}
+          </span>
+        </div>
+        <div className="tod-stat">
+          <span className="tod-stat-label">PMI Mean</span>
+          <span className="tod-stat-value">{pmiMeanHours.toFixed(1)}h</span>
+        </div>
+      </div>
+
+      {/* Component contributions */}
+      <div className="tod-components">
+        <h4>Estimation Components</h4>
+        {componentContributions.map(c => (
+          <div key={c.component} className="tod-component-row">
+            <span className="tod-component-name">{formatComponentName(c.component)}</span>
+            <ConfidenceBar value={c.weight} label={`${(c.weight * 100).toFixed(0)}% weight`} />
+            <span className="tod-component-desc">{c.description}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Consistency check */}
+      <div className="tod-consistency">
+        <h4>Postmortem Sign Consistency</h4>
+        <div className="consistency-grid">
+          {Object.entries(consistency).filter(([k]) => k !== "comments").map(([sign, status]) => (
+            <div key={sign} className={`consistency-item consistency-item--${status.toLowerCase()}`}>
+              <span className="consistency-icon">
+                {status === "CONSISTENT"         ? "✓"
+               : status === "INCONSISTENT"       ? "⚠"
+               :                                   "–"}
+              </span>
+              <span className="consistency-label">{formatSignName(sign)}</span>
+              <span className="consistency-status">{status}</span>
+            </div>
+          ))}
+        </div>
+        {consistency.comments.length > 0 && (
+          <ul className="consistency-comments">
+            {consistency.comments.map((c, i) => <li key={i}>{c}</li>)}
+          </ul>
+        )}
+      </div>
+
+      {warnings.length > 0 && <WarningsPanel warnings={warnings} compact />}
+    </div>
+  );
+}
+
+// TodBand: renders the visual time-of-death window
+export function TodBand({ pointEstimate, lower95, upper95, lower68, upper68 }) {
+  const totalSpanMs = new Date(upper95).getTime() - new Date(lower95).getTime();
+  const pctOf = (t: string) =>
+    ((new Date(t).getTime() - new Date(lower95).getTime()) / totalSpanMs) * 100;
+
+  return (
+    <div className="tod-band" role="img" aria-label="Time of death window visualization">
+      {/* 95% CI band */}
+      <div className="tod-band-track">
+        <div className="tod-band-95"
+             style={{ left: "0%", width: "100%" }}
+             title={`95% CI: ${formatTodWindow(lower95, upper95)}`} />
+        {/* 68% CI band */}
+        {lower68 && upper68 && (
+          <div className="tod-band-68"
+               style={{
+                 left:  `${pctOf(lower68)}%`,
+                 width: `${pctOf(upper68) - pctOf(lower68)}%`
+               }}
+               title={`68% CI: ${formatTodWindow(lower68, upper68)}`} />
+        )}
+        {/* Point estimate needle */}
+        <div className="tod-band-needle"
+             style={{ left: `${pctOf(pointEstimate)}%` }}
+             title={`Estimate: ${formatTod(pointEstimate)}`} />
+      </div>
+
+      {/* Axis labels */}
+      <div className="tod-band-axis">
+        <span>{formatTod(lower95)}</span>
+        <span className="tod-band-axis-center">← 95% Credible Interval →</span>
+        <span>{formatTod(upper95)}</span>
+      </div>
+    </div>
+  );
+}
+Hypothesis Assessment Section
+typescript
+// components/report/HypothesisSection.tsx
+
+const HYPOTHESIS_COLORS = {
+  HOMICIDE:     "var(--color-error)",
+  SUICIDE:      "var(--color-warning)",
+  ACCIDENT:     "var(--color-orange)",
+  NATURAL:      "var(--color-success)",
+  UNDETERMINED: "var(--color-text-muted)"
+};
+
+export function HypothesisSection({ data }: { data: HypothesisSectionData }) {
+  const sorted = Object.entries(data.posteriors)
+    .sort(([,a], [,b]) => b - a);
+
+  return (
+    <div className="hypothesis-section">
+      {/* Top hypothesis callout */}
+      <div className="hypothesis-top-callout"
+           style={{ borderColor: HYPOTHESIS_COLORS[data.topHypothesis] }}>
+        <span className="hypothesis-top-label">Most Likely</span>
+        <span className="hypothesis-top-value"
+              style={{ color: HYPOTHESIS_COLORS[data.topHypothesis] }}>
+          {data.topHypothesis}
+        </span>
+        <ConfidenceBar
+          value={data.topConfidence}
+          color={HYPOTHESIS_COLORS[data.topHypothesis]}
+          label={`${(data.topConfidence * 100).toFixed(1)}% posterior`}
+        />
+      </div>
+
+      {/* All posteriors */}
+      <div className="hypothesis-bars">
+        {sorted.map(([h, p]) => (
+          <div key={h} className="hypothesis-bar-row">
+            <span className="hypothesis-bar-label">{h}</span>
+            <div className="hypothesis-bar-track">
+              <div className="hypothesis-bar-fill"
+                   style={{
+                     width:           `${p * 100}%`,
+                     backgroundColor: HYPOTHESIS_COLORS[h as keyof typeof HYPOTHESIS_COLORS]
+                   }} />
+            </div>
+            <span className="hypothesis-bar-pct">{(p * 100).toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Evidence signals table */}
+      <table className="signal-table">
+        <thead>
+          <tr>
+            <th>Evidence Signal</th>
+            <th>Value</th>
+            <th>Confidence</th>
+            <th>Effect on Leading Hypothesis</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.evidenceSignals.map((s, i) => (
+            <tr key={i}>
+              <td>{formatSignalName(s.evidenceSignal)}</td>
+              <td>{s.signalValue}</td>
+              <td><ConfidenceBar value={s.signalConfidence} compact /></td>
+              <td className={s.direction === "INCREASED" ? "text-success" : "text-muted"}>
+                {s.direction === "INCREASED"
+                  ? `↑ +${(s.posteriorDelta * 100).toFixed(1)}%`
+                  : `→ ${(s.posteriorDelta * 100).toFixed(1)}%`}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* LLM narrative */}
+      <div className="hypothesis-narrative">
+        <h4>Analytical Assessment</h4>
+        {data.narrative.split("\n\n").map((para, i) => (
+          <p key={i}>{para}</p>
+        ))}
+      </div>
+
+      {/* Link to full trajectory */}
+      <div className="hypothesis-link-row">
+        <Link href={`../hypothesis`}>
+          View full Bayesian trajectory →
+        </Link>
+      </div>
+    </div>
+  );
+}
+PART VI — REASONING REPLAY VIEWER (RRV)
+The RRV is the most complex component in Layer 4. It renders the full cryptographic inference chain as an interactive, playable step-by-step visualization.
+
+6.1 Data Fetch & Chain Verification
+typescript
+// app/cases/[caseId]/replay/page.tsx
+
+export default async function ReplayPage({ params }) {
+  return (
+    <Suspense fallback={<ReplaySkeleton />}>
+      <ReplayLoader caseId={params.caseId} />
+    </Suspense>
+  );
+}
+
+// Client component:
+export function ReplayLoader({ caseId }) {
+  const { pipelineRunId } = usePipelineStore();
+
+  const { data: replayData, isLoading } = useQuery({
+    queryKey: ["replay", pipelineRunId],
+    queryFn:  () => api.replay.getReplayChain(pipelineRunId),
+    enabled:  !!pipelineRunId
+  });
+
+  // Client-side independent chain verification:
+  const chainVerification = useMemo(() => {
+    if (!replayData) return null;
+    return verifyReplayChain(replayData);
+  }, [replayData]);
+
+  if (isLoading) return <ReplaySkeleton />;
+  if (!replayData) return <EmptyState title="No replay data" description="Run the pipeline first." />;
+
+  return (
+    <ReplayViewer
+      steps              = {replayData.steps}
+      chainValid         = {replayData.chain_valid}
+      clientVerification = {chainVerification}
+      genesisHash        = {replayData.genesis_hash}
+      totalSteps         = {replayData.total_steps}
+    />
+  );
+}
+6.2 Client-Side Chain Verifier
+typescript
+// lib/crypto/verifyChain.ts
+
+import { sha256 } from "js-sha256";   // tiny browser-compatible SHA-256
+
+export interface ChainVerificationResult {
+  valid:        boolean;
+  totalSteps:   number;
+  verifiedSteps:number;
+  brokenAtSeq:  number | null;
+  error:        string | null;
+}
+
+export function verifyReplayChain(replayData: ReplayChainResponse): ChainVerificationResult {
+  const { steps, genesis_hash } = replayData;
+  const sorted = [...steps].sort((a, b) => a.seq - b.seq);
+
+  let prevHash = genesis_hash;
+  let brokenAtSeq: number | null = null;
+
+  for (const step of sorted) {
+    // 1. Reconstruct canonical content (must match server logic exactly):
+    const stepContent = JSON.stringify({
+      seq:            step.seq,
+      agent_id:       step.agent_id,
+      trigger_type:   step.trigger_type,
+      input_summary:  step.input_summary,
+      interpretation: step.interpretation,
+      confidence:     step.confidence !== null ? String(step.confidence) : "null",
+      timestamp:      step.timestamp
+    }, null);    // sort_keys is implicit since we define key order here
+
+    // 2. Compute hash:
+    const computedHash = sha256(stepContent);
+
+    // 3. Verify step hash matches:
+    if (computedHash !== step.step_hash) {
+      brokenAtSeq = step.seq;
+      return {
+        valid:          false,
+        totalSteps:     steps.length,
+        verifiedSteps:  step.seq,
+        brokenAtSeq,
+        error:          `Step ${step.seq} hash mismatch (content tampered)`
+      };
+    }
+
+    // 4. Verify chain linkage:
+    if (step.prev_step_hash !== prevHash) {
+      brokenAtSeq = step.seq;
+      return {
+        valid:          false,
+        totalSteps:     steps.length,
+        verifiedSteps:  step.seq,
+        brokenAtSeq,
+        error:          `Step ${step.seq} chain broken (prev_hash mismatch)`
+      };
+    }
+
+    // Note: RSA signature verification is skipped client-side
+    // (private key never leaves server; server pre-verified).
+    // We verify content integrity + chain linkage client-side.
+
+    prevHash = step.step_hash;
+  }
+
+  return {
+    valid:          true,
+    totalSteps:     steps.length,
+    verifiedSteps:  steps.length,
+    brokenAtSeq:    null,
+    error:          null
+  };
+}
+6.3 ReplayViewer Main Component
+typescript
+// components/replay/ReplayViewer.tsx
+
+export function ReplayViewer({
+  steps, chainValid, clientVerification, genesisHash, totalSteps
+}: ReplayViewerProps) {
+  const {
+    currentSeq, isPlaying, playbackSpeed,
+    filterAgent, filterTrigger
+  } = useReplayStore();
+
+  const [viewMode, setViewMode] = useState<"TIMELINE" | "SWIMLANE">("TIMELINE");
+
+  // Filtered steps:
+  const displaySteps = useMemo(() =>
+    steps.filter(s =>
+      (!filterAgent   || s.agent_id     === filterAgent) &&
+      (!filterTrigger || s.trigger_type === filterTrigger)
+    ), [steps, filterAgent, filterTrigger]);
+
+  // Auto-scroll to current step:
+  const currentStepRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (isPlaying && currentStepRef.current) {
+      currentStepRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [currentSeq, isPlaying]);
+
+  return (
+    <div className="replay-viewer">
+      {/* Header */}
+      <div className="replay-header">
+        <div className="replay-header-left">
+          <h2>Reasoning Replay</h2>
+          <span className="replay-step-count">{totalSteps} inference steps</span>
+        </div>
+        <div className="replay-header-right">
+          <ChainIntegrityBadge
+            serverValid  = {chainValid}
+            clientResult = {clientVerification}
+            genesisHash  = {genesisHash}
+          />
+        </div>
+      </div>
+
+      {/* Controls + filters */}
+      <ReplayControls totalSteps={totalSteps} />
+
+      {/* View mode toggle */}
+      <div className="replay-view-toggle">
+        <button onClick={() => setViewMode("TIMELINE")}
+                className={viewMode === "TIMELINE" ? "active" : ""}>
+          Step Timeline
+        </button>
+        <button onClick={() => setViewMode("SWIMLANE")}
+                className={viewMode === "SWIMLANE" ? "active" : ""}>
+          Agent Swimlanes
+        </button>
+      </div>
+
+      {/* Filter bar */}
+      <ReplayFilterBar steps={steps} />
+
+      {/* Main content */}
+      <div className="replay-main">
+        {viewMode === "TIMELINE" ? (
+          <div className="replay-step-list">
+            {displaySteps.map((step, i) => (
+              <ReplayStepCard
+                key       = {step.id}
+                step      = {step}
+                isActive  = {step.seq === currentSeq}
+                isPast    = {step.seq < currentSeq}
+                ref       = {step.seq === currentSeq ? currentStepRef : null}
+              />
+            ))}
+          </div>
+        ) : (
+          <AgentActivityBar steps={steps} currentSeq={currentSeq} />
+        )}
+
+        {/* Hypothesis trajectory (right panel) */}
+        <div className="replay-side-panel">
+          <HypothesisTrajectory currentSeq={currentSeq} />
+        </div>
+      </div>
+    </div>
+  );
+}
+6.4 ReplayStepCard
+typescript
+// components/replay/ReplayStepCard.tsx
+
+const TRIGGER_ICONS: Record<TriggerType, string> = {
+  INPUT:               "→",
+  RULE:                "⚙",
+  MODEL_OUTPUT:        "◈",
+  BAYESIAN_UPDATE:     "∝",
+  LLM_EXTRACTION:      "✦",
+  LLM_NARRATIVE:       "✦",
+  CONSISTENCY_CHECK:   "⊞",
+  INTEGRITY_GATE:      "⎈",
+  ANOMALY_DETECTED:    "◉",
+  HOTSPOT_IDENTIFIED:  "⬡"
+};
+
+const TRIGGER_COLORS: Record<TriggerType, string> = {
+  INPUT:               "var(--color-text-muted)",
+  RULE:                "var(--color-blue)",
+  MODEL_OUTPUT:        "var(--color-purple)",
+  BAYESIAN_UPDATE:     "var(--color-primary)",
+  LLM_EXTRACTION:      "var(--color-gold)",
+  LLM_NARRATIVE:       "var(--color-gold)",
+  CONSISTENCY_CHECK:   "var(--color-orange)",
+  INTEGRITY_GATE:      "var(--color-success)",
+  ANOMALY_DETECTED:    "var(--color-error)",
+  HOTSPOT_IDENTIFIED:  "var(--color-warning)"
+};
+
+export const ReplayStepCard = forwardRef<HTMLDivElement, ReplayStepCardProps>(
+  ({ step, isActive, isPast }, ref) => {
+  const [expanded, setExpanded] = useState(false);
+  const isChainOk = step.chain_ok;
+
+  return (
+    <div
+      ref       = {ref}
+      className = {cn(
+        "replay-step-card",
+        isActive && "replay-step-card--active",
+        isPast   && "replay-step-card--past",
+        !isChainOk && "replay-step-card--broken"
+      )}
+      onClick={() => setExpanded(!expanded)}
+    >
+      {/* Sequence indicator + chain link */}
+      <div className="step-seq-column">
+        <div className="step-seq-number">{step.seq}</div>
+        <div className="step-chain-line" />
+        {!isChainOk && (
+          <div className="step-chain-broken-indicator" title="Chain linkage broken at this step" />
+        )}
+      </div>
+
+      {/* Trigger type badge */}
+      <div className="step-trigger-badge"
+           style={{ color: TRIGGER_COLORS[step.trigger_type as TriggerType] }}>
+        <span className="step-trigger-icon">
+          {TRIGGER_ICONS[step.trigger_type as TriggerType]}
+        </span>
+        <span className="step-trigger-label">{step.trigger_type.replace("_", " ")}</span>
+      </div>
+
+      {/* Content */}
+      <div className="step-content">
+        {/* Agent chip */}
+        <div className="step-agent-chip">{step.agent_id.replace("_", " ")}</div>
+
+        {/* Input → Interpretation */}
+        <div className="step-reasoning">
+          <div className="step-input">
+            <span className="step-input-label">Input</span>
+            <span className="step-input-text">{step.input_summary}</span>
+          </div>
+          <div className="step-arrow">→</div>
+          <div className="step-interpretation">
+            <span className="step-interp-label">Conclusion</span>
+            <span className="step-interp-text">{step.interpretation}</span>
+          </div>
+        </div>
+
+        {/* Confidence bar */}
+        {step.confidence !== null && (
+          <ConfidenceBar value={step.confidence} compact />
+        )}
+
+        {/* Expandable detail */}
+        {expanded && (
+          <div className="step-detail" onClick={e => e.stopPropagation()}>
+            <div className="step-hashes">
+              <div className="hash-row">
+                <span className="hash-label">Step Hash</span>
+                <HashFingerprint hash={step.step_hash} />
+              </div>
+              <div className="hash-row">
+                <span className="hash-label">Prev Hash</span>
+                <HashFingerprint hash={step.prev_step_hash} />
+              </div>
+            </div>
+            <SignatureBadge
+              signature  = {step.signature}
+              chainOk    = {step.chain_ok}
+            />
+            <span className="step-timestamp">
+              {new Date(step.timestamp).toLocaleTimeString("en-IN", {
+                hour: "2-digit", minute: "2-digit", second: "2-digit"
+              })}
+            </span>
+            {step.evidence_ids.length > 0 && (
+              <div className="step-evidence-links">
+                {step.evidence_ids.map(id => (
+                  <Link key={id} href={`../evidence/${id}`}>
+                    Evidence {id.slice(0, 8)}…
+                  </Link>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+6.5 ReplayControls
+typescript
+// components/replay/ReplayControls.tsx
+
+export function ReplayControls({ totalSteps }) {
+  const { currentSeq, isPlaying, playbackSpeed, setSeq, setPlaying, setSpeed }
+    = useReplayStore();
+
+  // Auto-advance when playing:
+  useEffect(() => {
+    if (!isPlaying) return;
+    const interval = setInterval(() => {
+      setSeq(s => {
+        if (s >= totalSteps - 1) { setPlaying(false); return s; }
+        return s + 1;
+      });
+    }, 1000 / playbackSpeed);
+    return () => clearInterval(interval);
+  }, [isPlaying, playbackSpeed, totalSteps]);
+
+  return (
+    <div className="replay-controls">
+      {/* Step slider */}
+      <input
+        type    = "range"
+        min     = {0}
+        max     = {totalSteps - 1}
+        value   = {currentSeq}
+        onChange= {e => setSeq(Number(e.target.value))}
+        className="replay-slider"
+        aria-label="Replay position"
+      />
+
+      {/* Playback buttons */}
+      <div className="replay-buttons">
+        <button onClick={() => setSeq(0)}           aria-label="Go to start">⏮</button>
+        <button onClick={() => setSeq(s => Math.max(0, s - 1))}  aria-label="Step back">⏪</button>
+
+        <button
+          onClick   = {() => setPlaying(!isPlaying)}
+          className = {`replay-play-btn ${isPlaying ? "replay-play-btn--playing" : ""}`}
+          aria-label= {isPlaying ? "Pause" : "Play"}
+        >
+          {isPlaying ? "⏸" : "▶"}
+        </button>
+
+        <button onClick={() => setSeq(s => Math.min(totalSteps - 1, s + 1))} aria-label="Step forward">⏩</button>
+        <button onClick={() => setSeq(totalSteps - 1)} aria-label="Go to end">⏭</button>
+      </div>
+
+      {/* Speed selector */}
+      <div className="replay-speed">
+        <span>Speed:</span>
+        {[1, 2, 4].map(s => (
+          <button
+            key       = {s}
+            onClick   = {() => setSpeed(s)}
+            className = {playbackSpeed === s ? "active" : ""}
+          >
+            {s}×
+          </button>
+        ))}
+      </div>
+
+      {/* Step counter */}
+      <span className="replay-step-counter">
+        Step {currentSeq + 1} of {totalSteps}
+      </span>
+    </div>
+  );
+}
+6.6 Hypothesis Trajectory Chart
+typescript
+// components/replay/HypothesisTrajectory.tsx
+// Renders animated line chart of hypothesis posteriors as Bayesian updates apply.
+
+export function HypothesisTrajectory({ currentSeq }: { currentSeq: number }) {
+  const { data: snapshots } = useQuery({
+    queryKey: ["hypothesis-snapshots", pipelineRunId],
+    queryFn:  () => api.hypothesis.getSnapshots(pipelineRunId)
+  });
+
+  // Map each Bayesian update seq → hypothesis posteriors
+  // currentSeq in replay corresponds to bayesian_update steps only
+  const visibleSnapshots = useMemo(() =>
+    snapshots?.filter(s => s.replaySeq <= currentSeq) ?? [],
+    [snapshots, currentSeq]
+  );
+
+  const chartData = useMemo(() => ({
+    labels: visibleSnapshots.map(s => s.evidenceSignal.replace("_", " ")),
+    datasets: Object.keys(HYPOTHESIS_COLORS).map(h => ({
+      label:           h,
+      data:            visibleSnapshots.map(s => s[`post_${h.toLowerCase()}`] * 100),
+      borderColor:     HYPOTHESIS_COLORS[h as keyof typeof HYPOTHESIS_COLORS],
+      backgroundColor: HYPOTHESIS_COLORS[h as keyof typeof HYPOTHESIS_COLORS] + "33",
+      tension:         0.4,
+      fill:            false,
+      pointRadius:     4,
+      pointHoverRadius:6
+    }))
+  }), [visibleSnapshots]);
+
+  const options = {
+    responsive:     true,
+    maintainAspectRatio: false,
+    animation:      { duration: 300, easing: "easeInOutQuart" },
+    scales: {
+      y: {
+        min:     0,
+        max:     100,
+        title:   { display: true, text: "Posterior (%)" },
+        ticks:   { callback: (v: number) => `${v}%` }
+      },
+      x: {
+        title:   { display: true, text: "Evidence Signal Applied" },
+        ticks:   { maxRotation: 30 }
+      }
+    },
+    plugins: {
+      legend:  { position: "top" },
+      tooltip: {
+        callbacks: {
+          label: (ctx: any) =>
+            `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}%`
+        }
+      }
+    }
+  };
+
+  return (
+    <div className="hypothesis-trajectory">
+      <h3>Hypothesis Evolution</h3>
+      {visibleSnapshots.length === 0 ? (
+        <div className="trajectory-empty">
+          <p>Advance to a Bayesian Update step to see hypothesis evolution.</p>
+        </div>
+      ) : (
+        <div className="trajectory-chart-wrap">
+          <Line data={chartData} options={options} />
+        </div>
+      )}
+    </div>
+  );
+}
+PART VII — TIMELINE EXPLORER
+7.1 Timeline Architecture
+typescript
+// components/timeline/TimelineExplorer.tsx
+
+export function TimelineExplorer({ caseId }) {
+  const [zoom, setZoom]         = useState<TimelineZoom>({ startMs: 0, endMs: 0 });
+  const [filters, setFilters]   = useState<TimelineFilters>({
+    sources:    ["CDR", "LOCATION_DATA", "FINANCIAL_RECORDS"],
+    types:      ["CALL", "SMS", "LOCATION_FIX", "FINANCIAL_TRANSACTION"],
+    anomalyOnly:false
+  });
+  const [hoveredEvent, setHovered] = useState<TimelineEvent | null>(null);
+
+  // Fetch all timeline events (paginated, up to 10k):
+  const { data: timelineData, isLoading } = useQuery({
+    queryKey: ["timeline", caseId, filters],
+    queryFn:  () => api.timeline.getEvents(caseId, filters)
+  });
+
+  // Fetch TOD window + hotspots:
+  const { data: overlays } = useQuery({
+    queryKey: ["timeline-overlays", caseId],
+    queryFn:  () => api.timeline.getOverlays(caseId)
+  });
+
+  if (isLoading) return <TimelineSkeleton />;
+
+  const { events, totalCount } = timelineData;
+
+  return (
+    <div className="timeline-explorer">
+      {/* Stats bar */}
+      <div className="timeline-stats">
+        <span>{totalCount.toLocaleString()} total events</span>
+        <span>{events.filter(e => e.is_anomalous).length} anomalous</span>
+        <span>{overlays?.hotspots.filter(h => h.priority === "CRITICAL").length ?? 0} critical windows</span>
+      </div>
+
+      {/* Filters */}
+      <TimelineFilters filters={filters} onChange={setFilters} events={events} />
+
+      {/* Main canvas */}
+      <TimelineCanvas
+        events      = {events}
+        zoom        = {zoom}
+        onZoomChange= {setZoom}
+        overlays    = {overlays}
+        onHover     = {setHovered}
+      />
+
+      {/* Event detail tooltip */}
+      {hoveredEvent && (
+        <EventTooltip event={hoveredEvent} />
+      )}
+
+      {/* Legend */}
+      <TimelineLegend />
+    </div>
+  );
+}
+7.2 Timeline Canvas (SVG-based)
+typescript
+// components/timeline/TimelineCanvas.tsx
+
+export function TimelineCanvas({ events, zoom, onZoomChange, overlays, onHover }) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [width, setWidth] = useState(1200);
+  const HEIGHT = 240;
+  const AXIS_H  = 40;
+  const TRACK_H = 180;
+  const Y_TRACKS: Record<string, number> = {
+    CDR:                 40,
+    LOCATION_DATA:       90,
+    FINANCIAL_RECORDS:  140,
+  };
+
+  // Compute visible time range:
+  const allTimes = events.map(e => new Date(e.event_time).getTime());
+  const minMs = zoom.startMs || Math.min(...allTimes);
+  const maxMs = zoom.endMs   || Math.max(...allTimes);
+  const spanMs = maxMs - minMs;
+
+  const pctX = (ms: number) => ((ms - minMs) / spanMs) * width;
+
+  // Resize observer:
+  useEffect(() => {
+    const obs = new ResizeObserver(entries => {
+      setWidth(entries[0].contentRect.width);
+    });
+    if (svgRef.current?.parentElement) obs.observe(svgRef.current.parentElement);
+    return () => obs.disconnect();
+  }, []);
+
+  // Zoom via wheel:
+  const handleWheel = (e: WheelEvent) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY > 0 ? 1.2 : 0.85;
+    const pivotPct   = e.offsetX / width;
+    const pivotMs    = minMs + pivotPct * spanMs;
+    const newSpan    = spanMs * zoomFactor;
+    onZoomChange({
+      startMs: pivotMs - pivotPct * newSpan,
+      endMs:   pivotMs + (1 - pivotPct) * newSpan
+    });
+  };
+
+  return (
+    <div className="timeline-canvas-wrap">
+      <svg
+        ref      = {svgRef}
+        width    = {width}
+        height   = {HEIGHT}
+        className= "timeline-svg"
+        onWheel  = {handleWheel}
+        role     = "img"
+        aria-label="Forensic event timeline"
+      >
+        {/* TOD window overlay */}
+        {overlays?.todWindow && (() => {
+          const x1 = pctX(new Date(overlays.todWindow.lower95).getTime());
+          const x2 = pctX(new Date(overlays.todWindow.upper95).getTime());
+          return (
+            <g className="tod-overlay">
+              <rect x={x1} y={0} width={x2-x1} height={TRACK_H}
+                    fill="var(--color-error)" opacity={0.06}
+                    rx={4} />
+              <line x1={(x1+x2)/2} y1={0} x2={(x1+x2)/2} y2={TRACK_H}
+                    stroke="var(--color-error)" strokeWidth={1.5}
+                    strokeDasharray="4 4" opacity={0.6} />
+              <text x={(x1+x2)/2} y={14} textAnchor="middle"
+                    fontSize={10} fill="var(--color-error)" opacity={0.8}>
+                TOD window
+              </text>
+            </g>
+          );
+        })()}
+
+        {/* Hotspot bands */}
+        {overlays?.hotspots.map((h, i) => {
+          const x1 = pctX(new Date(h.start).getTime());
+          const x2 = pctX(new Date(h.end).getTime());
+          const col = h.priority === "CRITICAL"
+                        ? "var(--color-error)"
+                        : h.priority === "HIGH"
+                        ? "var(--color-warning)"
+                        : "var(--color-gold)";
+          return (
+            <rect key={i} x={x1} y={0} width={Math.max(x2-x1, 3)}
+                  height={TRACK_H} fill={col} opacity={0.08}
+                  rx={2} />
+          );
+        })}
+
+        {/* Track lanes */}
+        {Object.entries(Y_TRACKS).map(([source, y]) => (
+          <g key={source}>
+            <line x1={0} y1={y} x2={width} y2={y}
+                  stroke="var(--color-divider)" strokeWidth={1} />
+            <text x={4} y={y - 6} fontSize={10}
+                  fill="var(--color-text-faint)">
+              {source.replace("_", " ")}
+            </text>
+          </g>
+        ))}
+
+        {/* Events */}
+        {events.map(event => {
+          const cx = pctX(new Date(event.event_time).getTime());
+          const cy = Y_TRACKS[event.source] ?? 100;
+          if (cx < -10 || cx > width + 10) return null; // out of view
+
+          return (
+            <EventDot
+              key       = {event.id}
+              cx        = {cx}
+              cy        = {cy}
+              event     = {event}
+              onHover   = {onHover}
+            />
+          );
+        })}
+
+        {/* Time axis */}
+        <TimeAxis minMs={minMs} maxMs={maxMs} width={width} y={TRACK_H + 20} />
+      </svg>
+
+      {/* Pan control strip */}
+      <div className="timeline-pan-strip">
+        <button onClick={() => onZoomChange({ startMs: 0, endMs: 0 })}>Reset</button>
+        <input type="range" min={0} max={100}
+               onChange={e => {/* pan handler */}} />
+      </div>
+    </div>
+  );
+}
+
+// EventDot: individual event circle
+export function EventDot({ cx, cy, event, onHover }) {
+  const COLOR_MAP = {
+    CALL:                   "var(--color-primary)",
+    SMS:                    "var(--color-blue)",
+    LOCATION_FIX:           "var(--color-success)",
+    FINANCIAL_TRANSACTION:  "var(--color-gold)"
+  };
+  const r = event.is_anomalous ? 7 : 4;
+  const fill = COLOR_MAP[event.event_type] ?? "var(--color-text-muted)";
+
+  return (
+    <g
+      onMouseEnter = {() => onHover(event)}
+      onMouseLeave = {() => onHover(null)}
+      style        = {{ cursor: "pointer" }}
+    >
+      {event.is_anomalous && (
+        <circle cx={cx} cy={cy} r={r + 4}
+                fill="none"
+                stroke={fill}
+                strokeWidth={1.5}
+                opacity={0.4} />
+      )}
+      <circle cx={cx} cy={cy} r={r}
+              fill={fill}
+              opacity={event.is_anomalous ? 1.0 : 0.75} />
+    </g>
+  );
+}
+PART VIII — AUDIT TRAIL VIEWER
+typescript
+// components/audit/AuditTrail.tsx
+
+export function AuditTrail({ caseId }) {
+  const [page, setPage]   = useState(1);
+  const [filter, setFilter] = useState<string | null>(null);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["audit", caseId, page, filter],
+    queryFn:  () => api.audit.getLog(caseId, { page, perPage: 50, eventType: filter })
+  });
+
+  const EVENT_ICON: Record<string, string> = {
+    CASE_CREATED:          "◎",
+    EVIDENCE_UPLOADED:     "↑",
+    EVIDENCE_ACCESSED:     "→",
+    PIPELINE_TRIGGERED:    "⚡",
+    PIPELINE_COMPLETE:     "✓",
+    AGENT_RUN_FAILURE:     "✗",
+    REPORT_GENERATED:      "📄",
+    REPORT_EXPORTED:       "↓",
+    USER_LOGIN:            "⎋",
+    PERMISSION_CHANGED:    "⚙",
+    CHAIN_VERIFIED:        "⎈",
+    SECURITY_EVENT:        "⚠"
+  };
+
+  return (
+    <div className="audit-trail">
+      <div className="audit-header">
+        <h2>Audit Trail</h2>
+        <AuditFilterBar
+          options = {Object.keys(EVENT_ICON)}
+          value   = {filter}
+          onChange= {setFilter}
+        />
+      </div>
+
+      {isLoading ? (
+        <AuditSkeleton />
+      ) : (
+        <div className="audit-log">
+          {data?.entries.map(entry => (
+            <AuditLogEntry key={entry.id} entry={entry} icon={EVENT_ICON[entry.event_type] ?? "·"} />
+          ))}
+        </div>
+      )}
+
+      <Pagination
+        currentPage = {page}
+        totalPages  = {data?.totalPages ?? 1}
+        onChange    = {setPage}
+      />
+    </div>
+  );
+}
+
+export function AuditLogEntry({ entry, icon }) {
+  return (
+    <div className={`audit-entry audit-entry--${entry.severity?.toLowerCase() ?? "info"}`}>
+      <span className="audit-entry-icon">{icon}</span>
+      <div className="audit-entry-body">
+        <span className="audit-entry-event">{formatAuditEventType(entry.event_type)}</span>
+        <span className="audit-entry-actor">{entry.actor_masked}</span>
+        {entry.metadata && (
+          <span className="audit-entry-meta">{formatAuditMeta(entry.metadata)}</span>
+        )}
+      </div>
+      <time className="audit-entry-time" dateTime={entry.timestamp}>
+        {new Date(entry.timestamp).toLocaleString("en-IN", {
+          day:    "2-digit",
+          month:  "short",
+          hour:   "2-digit",
+          minute: "2-digit",
+          second: "2-digit"
+        })}
+      </time>
+    </div>
+  );
+}
+PART IX — EXPORT ENGINE
+9.1 PDF Export Flow
+typescript
+// lib/export/pdfExport.ts
+
+export async function triggerReportExport(reportId: string, caseId: string): Promise<void> {
+  // 1. Request export from Layer 1 — triggers server-side PDF generation:
+  const { exportJobId } = await api.reports.requestExport(reportId, {
+    format:   "PDF",
+    sections: "ALL",
+    includeEvidence: false   // never include raw evidence bytes in export
+  });
+
+  // 2. Poll for completion (server uses WeasyPrint/Playwright to render PDF):
+  toast.info("Generating PDF report…");
+  let attempts = 0;
+  while (attempts < 30) {
+    await sleep(2000);
+    const status = await api.reports.getExportStatus(exportJobId);
+    if (status.status === "DONE") {
+      // 3. Trigger browser download:
+      const url = status.downloadUrl;    // pre-signed temporary URL (60s TTL)
+      const link = document.createElement("a");
+      link.href     = url;
+      link.download = `AIVENTRA_Report_${caseId}_${reportId.slice(0, 8)}.pdf`;
+      link.click();
+      toast.success("Report downloaded");
+      return;
+    }
+    if (status.status === "FAILED") {
+      toast.error("PDF generation failed");
+      return;
+    }
+    attempts++;
+  }
+  toast.error("PDF generation timed out");
+}
+9.2 PDF Server-Side Renderer (Layer 1 Export Handler)
+python
+# Layer 1 — POST /api/v1/reports/{report_id}/export
+
+@router.post("/reports/{report_id}/export")
+async def request_export(report_id: UUID, body: ExportRequest,
+                          user: User = Depends(require_auth),
+                          db: asyncpg.Connection = Depends(get_db)):
+    require_role(user, ["ADMIN", "LEAD_INVESTIGATOR", "INVESTIGATOR"])
+
+    # Load report:
+    report = await db.fetchrow("SELECT * FROM reports WHERE id=$1", report_id)
+    if not report:
+        raise HTTPException(404)
+
+    # Require case access:
+    await require_case_access(user, report["case_id"], db)
+
+    export_job_id = uuid4()
+
+    # Enqueue async export job:
+    await redis.xadd("aiventra:export:jobs", {
+        "export_job_id": str(export_job_id),
+        "report_id":     str(report_id),
+        "user_id":       str(user.id),
+        "format":        body.format
+    })
+
+    await audit_log(db, user.id, report["case_id"], "REPORT_EXPORT_REQUESTED",
+                    {"report_id": str(report_id), "format": body.format})
+
+    return {"export_job_id": str(export_job_id), "status": "QUEUED"}
+
+# Export Worker:
+async def _run_export_job(fields: dict):
+    report_id = UUID(fields["report_id"])
+    report    = await db.fetchrow("SELECT * FROM reports WHERE id=$1", report_id)
+    report_data = json.loads(report["report_json"])
+
+    # Render HTML template with report data:
+    html_content = render_report_template(report_data)
+
+    # Convert to PDF using Playwright (headless Chromium):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page    = await browser.new_page()
+        await page.set_content(html_content)
+        await page.emulate_media(media="print")
+        pdf_bytes = await page.pdf(
+            format            = "A4",
+            print_background  = True,
+            margin            = {"top": "20mm", "bottom": "20mm",
+                                  "left": "15mm", "right": "15mm"}
+        )
+        await browser.close()
+
+    # Upload PDF to MinIO (temporary bucket, 1h expiry):
+    pdf_key = f"exports/{report_id}/{uuid4()}.pdf"
+    await minio.put_object("aiventra-exports", pdf_key, pdf_bytes,
+                             content_type="application/pdf")
+
+    # Generate pre-signed download URL (60s TTL):
+    download_url = await minio.presigned_get_object(
+        "aiventra-exports", pdf_key, expires=timedelta(seconds=60)
+    )
+
+    # Update export job status:
+    await redis.hset(f"export_job:{export_job_id}",
+                     mapping={"status": "DONE", "download_url": download_url})
+PART X — LAYER 4 FULL API SURFACE (All REST Calls)
+text
+GET  /api/v1/cases                              ← Case list
+POST /api/v1/cases                              ← Create case
+GET  /api/v1/cases/{caseId}                     ← Case metadata
+PUT  /api/v1/cases/{caseId}/status              ← Update case status
+
+GET  /api/v1/cases/{caseId}/reports/current     ← Latest report
+GET  /api/v1/cases/{caseId}/reports/{reportId}  ← Specific report
+POST /api/v1/reports/{reportId}/export          ← Trigger PDF export
+GET  /api/v1/reports/{reportId}/export/{jobId}  ← Export job status
+
+GET  /api/v1/cases/{caseId}/replay              ← Replay chain (current pipeline)
+GET  /api/v1/cases/{caseId}/replay/verify       ← Chain integrity check
+GET  /api/v1/cases/{caseId}/hypothesis/snapshots← Bayesian trajectory
+
+GET  /api/v1/cases/{caseId}/timeline            ← Timeline events (paginated + filtered)
+GET  /api/v1/cases/{caseId}/timeline/overlays   ← TOD window + hotspot bands
+
+GET  /api/v1/cases/{caseId}/evidence            ← Evidence file list
+GET  /api/v1/cases/{caseId}/evidence/{fileId}   ← Evidence detail + metadata
+GET  /api/v1/cases/{caseId}/evidence/{fileId}/custody ← Custody chain
+
+GET  /api/v1/cases/{caseId}/audit               ← Audit log (paginated + filtered)
+
+GET  /api/v1/cases/{caseId}/agents/status       ← All agent run statuses
+POST /api/v1/cases/{caseId}/agents/run          ← Trigger pipeline
+
+GET  /api/v1/admin/users                        ← User list (ADMIN only)
+POST /api/v1/admin/users                        ← Create user (ADMIN only)
+PUT  /api/v1/admin/users/{userId}/roles         ← Update roles (ADMIN only)
+GET  /api/v1/admin/system/health                ← Agent + infra health
+This completes all four layers of AIVENTRA in full implementation-grade depth. The system now covers:
+
+Layer 1: Auth, RBAC, WebSocket, API Gateway, Audit
+
+Layer 2: Evidence ingestion, AES-256-GCM encryption, SHA-256 integrity, custody chain, MinIO, PII vault
+
+Layer 3: Orchestrator, all 11 agents with full algorithms, mTLS, task tokens, Bayesian fusion, Monte Carlo TOD, autoencoder anomaly detection, cryptographic replay chain
+
+Layer 4: Pipeline status bar, forensic report viewer, reasoning replay viewer with playback + hash verification, SVG timeline explorer, hypothesis trajectory chart, audit trail, and PDF export engine

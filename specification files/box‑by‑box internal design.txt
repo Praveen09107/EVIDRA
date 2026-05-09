@@ -1,0 +1,415 @@
+Layer 1 – User Interface
+Case Overview & Triage Dashboard
+Sub‑modules:
+
+Case list & filter panel
+
+Case header (status, risk, hypothesis pills)
+
+Pipeline strip (per‑agent status from /cases/{id}/pipeline/status)
+
+Quick‑links to Autopsy, TOD, Timeline, Collision, Argument views
+
+Autopsy / TOD / Timeline & Anomaly / Collision / Argument / What‑If
+Each “mini‑app” follows the same pattern:
+
+Data loader hooks
+
+Call the REST endpoints we defined (/autopsy, /tod, /timeline/summary, /digital/anomalies, /graph, /hotspots, etc.)
+
+Real‑time subscription
+
+WebSocket client subscribing to case:{id} channel for pipeline_update, hotspot_created, hypothesis_updated events.
+
+Local state store (Zustand/Redux/RTK Query/etc.)
+
+View components (timeline bands, tables, graphs, inspectors)
+
+No new “agents” here — just consumers of the APIs from lower layers.
+
+Layer 2 – Orchestration (Planner / Case Copilot Agent)
+Sub‑modules:
+
+Request Router
+
+Accepts high‑level intents:
+
+“Run full pipeline for case X”
+
+“Re‑run TOD in HYBRID mode”
+
+“Generate what‑if scenario with modified environment”
+
+Maps them to internal pipeline definitions.
+
+Pipeline Scheduler (Supervisor)
+
+Maintains a DAG of tasks:
+
+Autopsy → TOD → Timeline & Anomaly → Collision/Hotspot → Hypothesis updates → Bias/Replay.
+
+Writes pipeline_runs and agent_runs rows, tracks status and retries.
+
+Task Dispatcher
+
+Pushes tasks onto per‑agent queues.
+
+Handles concurrency limits and priorities (e.g. active cases first).
+
+Progress Broadcaster
+
+Listens to agent run completions and publishes:
+
+WebSocket events to UI (pipeline_update, tod_updated, hotspot_created).
+
+Internal messages to downstream agents (“TOD ready”, “Anomalies ready”).
+
+The Orchestrator is a single logical agent; these four sub‑modules are its internals.
+
+Layer 3 – Evidence Intelligence
+Autopsy & Report Agent (LLM extraction)
+Sub‑modules (as designed earlier):
+
+Document Ingestion
+
+Accept OCR’d text, normalize layout, remove noise.
+
+Section Segmenter
+
+Split into EXTERNAL, INTERNAL, TOXICOLOGY, OPINION, etc.
+
+Clinical/Forensic NLP Pipeline
+
+NER (injuries, diseases, drugs, signs, temporal expressions).
+
+Negation & uncertainty detection.
+
+Relation extraction (injury↔region, substance↔level, time↔event).
+
+Autopsy Reasoner (II‑Medical‑32B)
+
+LLM that:
+
+Produces AutopsyExtraction JSON (cause, manner, signs, tox, uncertainties).
+
+Generates rationales and quality flags, using structured context + JSON schema.
+
+Validator & Coder
+
+JSON schema validation.
+
+Optional ICD‑10 / SNOMED coding for causes.
+
+XAI & Provenance Recorder
+
+Store supporting text snippets and NER spans for each conclusion, so downstream XAI agents can display “why”.
+
+TOD Agent (Henssge + ML)
+Sub‑modules:
+
+Feature Assembler
+
+Build TodRequest from:
+
+AutopsyExtractionMinimal (postmortem signs, environment, body params).
+
+Scene data (ambient temp series).
+
+Temperature measurements & priors.
+
+Physics Core (Henssge/Glaister)
+
+Numeric Henssge solver for early PMI, with correction factors and uncertainty bounds.
+
+Signs Likelihood Engine
+
+Map rigor/livor/decomposition stages to soft PMI distributions.
+
+ML Surrogate
+
+RF/GBM/NN model on PMI features, trained offline on PMI datasets or physics‑synthetic data.
+
+Bayesian Fusion + Monte Carlo
+
+Combine prior, physics, signs, and ML into posterior over TOD via Monte Carlo sampling.
+
+Consistency & XAI Module
+
+Compute consistency flags (rigor vs physics, etc.).
+
+Extract feature importances and component weights for TodResult.
+
+Timeline & Anomaly Agent (Isolation Forest)
+Sub‑modules:
+
+Event Normalizer
+
+Convert raw phone / app / IoT / CCTV events to DigitalEvent with unified schema.
+
+Time‑Grid Builder
+
+Build regular buckets (e.g. 5‑min) and aggregate into TimelineBucketFeatures.
+
+Deep Autoencoder (AE)
+
+Train and run a multivariate time‑series AE over windows; produce reconstruction errors per bucket.
+
+Isolation Forest (IF)
+
+Classical unsupervised IF model trained on normal data; per‑bucket IF anomaly scores.
+
+Score Fusion & Smoothing
+
+Normalize AE + IF, combine into fused anomaly score; apply temporal smoothing and thresholding.
+
+Anomaly Window Builder
+
+Merge consecutive high‑score buckets into AnomalyWindows with top factors and per‑source contributions.
+
+Collision Agent (Spatio‑temporal overlap)
+Sub‑modules:
+
+Spatio‑Temporal Index
+
+Index events by time and approximate location (grid/hilbert/geohash).
+
+Overlap Engine
+
+Given a time window or anomaly:
+
+Find overlapping CCTV tracks, phone locations, IoT triggers.
+
+Compute pairwise overlaps (victim vs suspect vs objects).
+
+Collision Patterns
+
+Rule/LLM-based detection of meaningful overlaps:
+
+Co‑presence of victim and suspect.
+
+Phone near CCTV, door opening near entry, etc.
+
+Outputs enriched KeyEvents and structural overlays to the Hotspot agent and Argument Engine.
+
+Image Agent (YOLOv5)
+Sub‑modules:
+
+Frame Sampler
+
+Select key frames from CCTV (motion-based or fixed rate).
+
+Object/Person Detector
+
+YOLOv5/DETR inference; detect people, vehicles, weapons.
+
+Tracking & Identity Linking
+
+Simple multi‑object tracking; try to consistently identify the same person across frames/cameras.
+
+Event Extractor
+
+Convert detections & tracks into KeyEvents (enter, exit, linger, unusual behavior).
+
+Outputs feed Collision & Timeline/Anomaly features.
+
+Layer 4 – Forensic Argument Engine
+Hypothesis Manager
+Sub‑modules:
+
+Hypothesis Model
+
+Maintains 
+P
+(
+natural
+,
+accident
+,
+suicide
+,
+homicide
+)
+P(natural,accident,suicide,homicide) over time.
+
+Evidence Updater
+
+Bayesian/heuristic updates based on:
+
+Autopsy (cause/manner).
+
+TOD consistency with alibis.
+
+Hotspot types and content.
+
+LLM Explainer
+
+Generates natural‑language explanations for probability shifts.
+
+Claim Extractor
+Sub‑modules:
+
+Source Selector
+
+Chooses relevant texts (witness statements, reports, chat logs).
+
+LLM Claim Miner
+
+Extracts atomic claims with polarity (e.g. “Victim was alone at home at 23:00”).
+
+Normalization & ID Assignment
+
+Normalize phrasing; assign stable IDs for later mapping.
+
+Evidence–Claim Mapper (Support/Contradict)
+Sub‑modules:
+
+Candidate Link Generator
+
+For each claim, search for potentially related evidence (CCTV, phone, anomalies, autopsy findings).
+
+LLM Link Classifier
+
+For each claim–evidence pair:
+
+Classify as SUPPORT, CONTRADICT, or IRRELEVANT with strength.
+
+Link Store
+
+Persist edges used by Argument Graph Builder.
+
+This is analogous to semantic, multi‑modal evidence fusion in other domains.
+
+Argument Graph Builder
+Sub‑modules:
+
+Graph Assembler
+
+Nodes: hypotheses, claims, evidence items, hotspots.
+
+Edges: support/contradict, derived from mapper & Hypothesis Manager.
+
+Strength Propagation
+
+Compute argument strengths along paths; identify central evidence nodes.
+
+Graph View Serializer
+
+Map to CausalGraph JSON for frontend (nodes, edges, strengths).
+
+Gap & Logic Auditor
+Sub‑modules:
+
+Consistency Checker
+
+Detect:
+
+Conflicting evidence about same claim.
+
+Circular reasoning patterns.
+
+Coverage Analyzer
+
+Identify hypotheses with weak support (few or low‑strength paths).
+
+LLM Auditor
+
+Summarize gaps:
+
+“We have no digital evidence for the 3 hours before TOD.”
+
+“Homicide hypothesis relies mainly on one CCTV clip.”
+
+Outputs feed NBE and Bias Monitor.
+
+Layer 5 – Guidance & Safety
+Next‑Best‑Evidence (NBE) Agent
+Sub‑modules:
+
+Opportunity Detector
+
+Scan gaps (from Gap Auditor) and data availability (storage/meta).
+
+Action Generator
+
+Propose evidence requests:
+
+“Fetch more CCTV from camera X around time Y.”
+
+“Request extended toxicology panel.”
+
+Ranking / Prioritization
+
+Rank actions by expected information gain vs cost, inspired by active learning / evidence recommendation ideas.
+
+Bias & Uncertainty Monitor
+Sub‑modules:
+
+Uncertainty Aggregator
+
+Read uncertainty fields:
+
+TOD posterior width.
+
+Anomaly confidence.
+
+Autopsy quality flags.
+
+Hypothesis spread.
+
+Bias Pattern Detector
+
+Heuristics + LLM:
+
+Over‑reliance on one modality.
+
+Ignoring contradictory evidence.
+
+Overconfident narrative vs wide intervals.
+
+Alert & Explanation Generator
+
+Generate warnings and rationales for UI + audit log.
+
+Reasoning Replay & Training Mode
+Sub‑modules:
+
+Event Log Collector
+
+Collect agent_runs, pipeline steps, hypothesis updates, hotspot creation.
+
+Replay Step Composer
+
+Group them into ReplaySteps:
+
+Step index, label, time, involved agents, view focus.
+
+Narrative Generator
+
+LLM to turn steps into an understandable “story” of the reasoning sequence.
+
+Training Scenario Exporter
+
+(Optional) Export anonymized sequences for training future models or for teaching.
+
+Layer 6 – Data & Model
+Already implicitly defined:
+
+Storage
+
+Tables: cases, evidence, autopsy_extractions, tod_results, timeline_events, anomalies, hotspots, graph_nodes, graph_edges, agent_runs, pipeline_runs, audit_logs, etc.
+
+ML Models
+
+AE & IF for anomalies.
+
+RF/GBM for TOD surrogate and possibly hotspot scoring.
+
+YOLO/DETR for images.
+
+LLM Services
+
+II‑Medical‑32B, DeepSeek, etc. via JSON-output APIs.
+
+External APIs
+
+Weather, telecom, map/geocoding, etc., used by TOD, Timeline, and Collision agents.

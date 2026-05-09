@@ -1,0 +1,1088 @@
+M-02 — OCR Agent
+Purpose
+Converts scanned/image-based documents into machine-readable text. Two-pass: Tesseract OCR → LLM correction (if confidence < 0.75).
+
+Input Schema
+json
+{
+  "task_token": "<JWT>",
+  "pipeline_run_id": "uuid",
+  "case_id": "uuid",
+  "agent_id": "ocr",
+  "payload": {
+    "ocr_jobs": [
+      {
+        "file_id": "uuid",
+        "file_type": "AUTOPSY_REPORT",
+        "images": ["<base64_png_page_1>", "<base64_png_page_2>"],
+        "page_count": 2,
+        "source_type": "PDF_SCANNED"
+      }
+    ]
+  }
+}
+Tesseract Config Map
+python
+TESSERACT_CONFIGS = {
+    "AUTOPSY_REPORT": {
+        "lang": "eng", "oem": 3, "psm": 6,
+        "config": "--dpi 300 -c preserve_interword_spaces=1"
+    },
+    "CDR": {
+        "lang": "eng", "oem": 3, "psm": 6,
+        "config": "--dpi 300"
+    },
+    "FINANCIAL_RECORDS": {
+        "lang": "eng", "oem": 3, "psm": 6,
+        "config": "--dpi 300 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,/-: "
+    },
+    "DEFAULT": {
+        "lang": "eng+hin", "oem": 3, "psm": 3,
+        "config": "--dpi 300"
+    }
+}
+PSM Reference:
+
+PSM	Meaning
+PSM	Meaning
+3	Full auto-segmentation
+6	Uniform text block
+11	Sparse — grab as much as possible
+12	Sparse with OSD (rotation)
+Image Pre-processing Pipeline
+python
+def preprocess_image(image_bytes: bytes) -> bytes:
+    import cv2, numpy as np
+    from PIL import Image
+
+    img      = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    # Deskew:
+    coords = np.column_stack(np.where(denoised < 128))
+    if len(coords) > 0:
+        angle = cv2.minAreaRect(coords)[-1]
+        angle = -(90 + angle) if angle < -45 else -angle
+        if abs(angle) > 0.5:
+            h, w = denoised.shape[:2]
+            M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+            denoised = cv2.warpAffine(denoised, M, (w, h),
+                           flags=cv2.INTER_CUBIC,
+                           borderMode=cv2.BORDER_REPLICATE)
+
+    binary = cv2.adaptiveThreshold(
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+    _, buffer = cv2.imencode(".png", binary)
+    return buffer.tobytes()
+Confidence Thresholds
+python
+CONFIDENCE_THRESHOLDS = {
+    "ACCEPTABLE": 0.85,   # No LLM pass
+    "MARGINAL":   0.75,   # LLM recommended
+    "POOR":       0.60,   # LLM mandatory
+    "UNUSABLE":   0.40    # Warn + attempt LLM
+}
+LLM Correction Prompts
+python
+CORRECTION_PROMPTS = {
+    "AUTOPSY_REPORT": """You are a forensic medical document OCR corrector.
+Fix OCR errors in this autopsy report text. Rules:
+1. Fix obvious misreads (e.g. "rigor rnortis" → "rigor mortis")
+2. Fix medical terminology errors
+3. Fix number/letter confusion (e.g. "l00" → "100")
+4. Preserve all original meaning — do NOT add or remove facts
+5. Return ONLY corrected text, no commentary
+
+===DOCUMENT_START===
+{ocr_text}
+===DOCUMENT_END===""",
+
+    "CDR": """You are a telecom data OCR corrector.
+Fix OCR errors in this Call Detail Record. Rules:
+1. Phone numbers: 10 digits — fix letter/number confusion
+2. Dates: fix format errors preserving the original date
+3. Preserve table structure
+4. Return ONLY corrected text
+
+===DOCUMENT_START===
+{ocr_text}
+===DOCUMENT_END===""",
+
+    "FINANCIAL_RECORDS": """You are a financial document OCR corrector.
+Fix OCR errors in this bank statement. Rules:
+1. Amounts: decimal numbers, fix misreads (e.g. "l,500.00" → "1,500.00")
+2. Preserve column/row structure
+3. Return ONLY corrected text
+
+===DOCUMENT_START===
+{ocr_text}
+===DOCUMENT_END==="""
+}
+Output Schema
+python
+class OcrPage(BaseModel):
+    page_number:  int
+    raw_text:     str
+    confidence:   float          # 0.0–1.0
+    word_count:   int
+    tables:       List[OcrTable]
+
+class OcrTable(BaseModel):
+    row_count:    int
+    col_estimate: int
+    raw_rows:     List[List[str]]
+
+class OcrJobResult(BaseModel):
+    file_id:                  UUID
+    file_type:                str
+    page_count:               int
+    pages:                    List[OcrPage]
+    full_text_raw:            str
+    full_text_corrected:      str
+    avg_confidence:           float
+    llm_correction_applied:   bool
+    tables_detected:          int
+    all_tables:               List[OcrTable]
+    warnings:                 List[str]
+Warnings Table
+Code	Condition	Severity
+LOW_OCR_CONFIDENCE	avg_confidence < 0.60	HIGH
+LLM_OCR_CORRECTION_APPLIED	LLM pass used	INFO
+BLANK_PAGE_DETECTED	0 words on page	MEDIUM
+MULTILINGUAL_CONTENT	Hindi/regional script	INFO
+M-03 — Format Normalizer Agent
+Purpose
+Maps all operator/bank/institution raw schemas → AIVENTRA canonical schemas. Normalizes timestamps to UTC, phone numbers to E.164, and applies PII masking.
+
+Input Schema
+json
+{
+  "task_token": "<JWT>",
+  "pipeline_run_id": "uuid",
+  "case_id": "uuid",
+  "agent_id": "format_normalizer",
+  "payload": {
+    "items": [
+      {
+        "file_id": "uuid",
+        "file_type": "CDR",
+        "source": "DIRECT_EXTRACT",
+        "content": {
+          "content_type":    "TABULAR",
+          "dataframe_json":  "[{...}]",
+          "column_names":    ["PhoneNumber","Date","Time","CallType"],
+          "row_count":       4521
+        }
+      }
+    ]
+  }
+}
+CDR Operator Schema Detection
+python
+CDR_OPERATOR_SIGNATURES = {
+    "AIRTEL": {
+        "required_cols": {"PhoneNumber","Date","Time","CallType","Duration"},
+        "optional_cols": {"CalledNumber","TowerID","TowerLatitude","TowerLongitude","IMEI"},
+        "date_formats":  ["%d/%m/%Y","%d-%m-%Y","%Y-%m-%d"],
+        "event_type_map":{"MOC":"MOC","MTC":"MTC","SMS-MO":"SMS_MO","SMS-MT":"SMS_MT","GPRS":"DATA"}
+    },
+    "JIO": {
+        "required_cols": {"MSISDN","CALL_DATE","CALL_TIME","CALL_TYPE","DURATION_SEC"},
+        "optional_cols": {"B_PARTY","CELL_ID","CIRCLE","LAC","ROAMING"},
+        "date_formats":  ["%Y-%m-%d"],
+        "separator":     "|",
+        "event_type_map":{"VOICE_OUT":"MOC","VOICE_IN":"MTC","SMS_OUT":"SMS_MO","SMS_IN":"SMS_MT"}
+    },
+    "BSNL": {
+        "required_cols": {"Subscriber No","Call Date","Call Time","Outgoing/Incoming"},
+        "date_formats":  ["%d-%b-%Y","%d/%m/%Y"],
+        "event_type_map":{"O":"MOC","I":"MTC","S-O":"SMS_MO","S-I":"SMS_MT"}
+    },
+    "VI": {
+        "required_cols": {"Mobile Number","Transaction Date","Transaction Time","Call Type"},
+        "event_type_map":{"OG_VOICE":"MOC","IC_VOICE":"MTC","OG_SMS":"SMS_MO","IC_SMS":"SMS_MT"}
+    }
+}
+
+def detect_cdr_operator(df):
+    col_set = set(df.columns.str.strip())
+    scores  = {}
+    for operator, sig in CDR_OPERATOR_SIGNATURES.items():
+        req = len(sig["required_cols"] & col_set) / len(sig["required_cols"])
+        opt = len(sig.get("optional_cols",set()) & col_set) / max(len(sig.get("optional_cols",set())),1)
+        scores[operator] = req * 0.7 + opt * 0.3
+    best = max(scores, key=scores.get)
+    return (best, scores[best]) if scores[best] >= 0.5 else ("UNKNOWN", scores[best])
+Phone Number Normalization
+python
+def normalize_msisdn(raw: str) -> str:
+    digits = re.sub(r"\D", "", str(raw))
+    if len(digits) == 10:             return f"91{digits}"
+    if len(digits) == 11 and digits.startswith("0"):  return f"91{digits[1:]}"
+    if len(digits) == 12 and digits.startswith("91"): return digits
+    if len(digits) == 13 and digits.startswith("091"):return digits[1:]
+    return digits
+Datetime Normalization
+python
+DATE_FORMATS = [
+    "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y",
+    "%d-%b-%Y", "%d %b %Y", "%d %B %Y",
+    "%Y%m%d",   "%d%m%Y"
+]
+TIME_FORMATS = ["%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p"]
+
+def normalize_datetime(date_str, time_str, timezone="Asia/Kolkata") -> datetime:
+    import pytz
+    combined = f"{date_str.strip()} {time_str.strip()}"
+    for dfmt in DATE_FORMATS:
+        for tfmt in TIME_FORMATS:
+            try:
+                local_dt = datetime.strptime(combined, f"{dfmt} {tfmt}")
+                tz       = pytz.timezone(timezone)
+                return tz.localize(local_dt).astimezone(pytz.utc)
+            except ValueError:
+                continue
+    # Fallback:
+    from dateutil import parser as p
+    local_dt = p.parse(combined, dayfirst=True)
+    tz = pytz.timezone(timezone)
+    if not local_dt.tzinfo:
+        local_dt = tz.localize(local_dt)
+    return local_dt.astimezone(pytz.utc)
+PII Masking
+python
+PII_PATTERNS = {
+    "phone":        (r"\b(?:\+91|0)?[6-9]\d{9}\b",      "PARTIAL"),
+    "email":        (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "FULL"),
+    "bank_account": (r"\b\d{9,18}\b",                    "PARTIAL_END"),
+    "aadhaar":      (r"\b\d{4}\s\d{4}\s\d{4}\b",         "FULL"),
+    "pan":          (r"\b[A-Z]{5}[0-9]{4}[A-Z]\b",       "PARTIAL"),
+    "imei":         (r"\b\d{15}\b",                       "PARTIAL_END")
+}
+# + spaCy PERSON NER → replace with [CONTACT_N] per case
+Output Schema
+python
+class FormatNormalizerOutput(BaseModel):
+    pipeline_run_id:    UUID
+    case_id:            UUID
+    normalized_items:   List[NormalizedItem]
+
+class NormalizedItem(BaseModel):
+    file_id:                UUID
+    file_type:              str
+    schema_detected:        str     # e.g. "AIRTEL_CDR", "HDFC_STATEMENT"
+    schema_confidence:      float
+    event_count:            int
+    date_range_start:       Optional[datetime]
+    date_range_end:         Optional[datetime]
+    bad_row_count:          int
+    pii_masks_applied:      int
+    canonical_events_json:  str
+    warnings:               List[str]
+M-04 — Autopsy Agent
+Purpose
+Extracts all 40+ structured fields from autopsy report text via LLM, then runs pathology rule-based cross-checks to validate internal consistency.
+
+LLM Extraction Prompt
+python
+AUTOPSY_EXTRACTION_SYSTEM = """You are a forensic pathology expert AI.
+Extract structured information from an autopsy report.
+Extract ALL fields. If a field is not mentioned, return null.
+Do NOT infer facts not explicitly stated.
+Return valid JSON only — no prose, no markdown."""
+
+AUTOPSY_EXTRACTION_USER = """Extract the following JSON from this postmortem report:
+
+{
+  "pathologist_name": string|null,
+  "autopsy_date": "YYYY-MM-DD"|null,
+  "report_reference_no": string|null,
+  "examining_agency": string|null,
+
+  "cause_of_death_1a": string|null,
+  "cause_of_death_1b": string|null,
+  "cause_of_death_1c": string|null,
+  "cause_of_death_2":  string|null,
+  "manner_of_death": "HOMICIDE"|"SUICIDE"|"ACCIDENT"|"NATURAL"|"UNDETERMINED"|null,
+
+  "rigor_mortis_stage":    "NONE"|"EARLY"|"FULL"|"RESOLVING"|null,
+  "livor_mortis_stage":    "NONE"|"EARLY"|"FIXED"|null,
+  "livor_distribution":    string|null,
+  "algor_mortis_notes":    string|null,
+  "decomposition_stage":   "NONE"|"EARLY"|"MODERATE"|"ADVANCED"|null,
+
+  "rectal_temp_celsius":   number|null,
+  "rectal_temp_time":      "HH:MM"|null,
+  "body_weight_kg":        number|null,
+  "body_height_cm":        number|null,
+  "estimated_age_years":   number|null,
+  "sex": "MALE"|"FEMALE"|"UNKNOWN"|null,
+
+  "injuries_present":        boolean,
+  "injury_list":             [string],
+  "defensive_wounds":        boolean|null,
+  "defensive_wounds_detail": string|null,
+  "sharp_force_injuries":    boolean|null,
+  "blunt_force_injuries":    boolean|null,
+  "firearm_injuries":        boolean|null,
+  "strangulation_signs":     boolean|null,
+
+  "toxicology_performed":    boolean|null,
+  "alcohol_present":         boolean|null,
+  "alcohol_bac":             number|null,
+  "drugs_detected":          [string],
+  "drug_details": [
+    {"substance":string,"level":string,
+     "significance":"LETHAL"|"TOXIC"|"THERAPEUTIC"|"TRACE"|"UNKNOWN"}
+  ],
+  "poisons_detected": [string],
+
+  "ambient_temp_celsius":   number|null,
+  "scene_type": "INDOOR"|"OUTDOOR"|"VEHICLE"|"PUBLIC"|null,
+  "body_surface": "BED"|"GROUND"|"FLOOR"|"WATER"|"OTHER"|null,
+  "clothing_insulation": "LIGHT"|"MEDIUM"|"HEAVY"|null,
+  "body_covered": "NONE"|"LIGHT"|"HEAVY"|null,
+  "immersion": "NONE"|"PARTIAL"|"FULL"|null,
+
+  "last_seen_alive": "ISO_DATETIME"|null,
+  "found_dead_time":  "ISO_DATETIME"|null,
+  "pathologist_opinion": string|null,
+  "manner_confidence_stated": "HIGH"|"MEDIUM"|"LOW"|null
+}
+
+===AUTOPSY_REPORT_START===
+{sanitized_report_text}
+===AUTOPSY_REPORT_END==="""
+LLM Config: model=gemini-2.0-flash, temperature=0.1, max_tokens=2048, response_format=json_object
+
+Confidence Scoring
+python
+FIELD_WEIGHTS = {
+    "manner_of_death":       0.20,
+    "cause_of_death_1a":     0.15,
+    "rigor_mortis_stage":    0.10,
+    "rectal_temp_celsius":   0.10,
+    "livor_mortis_stage":    0.08,
+    "injuries_present":      0.07,
+    "defensive_wounds":      0.07,
+    "body_weight_kg":        0.05,
+    "toxicology_performed":  0.05,
+    "ambient_temp_celsius":  0.05,
+    "decomposition_stage":   0.05,
+    "found_dead_time":       0.03
+}
+# confidence = sum of weights for non-null fields
+Pathology Cross-Check Rules (7 rules)
+Rule ID	Check	Severity	Warning Code
+RULE_COD_INJURY	COD mentions trauma but injuries_present=False	HIGH	COD_INJURY_MISMATCH
+RULE_MANNER_DEFENSE	manner=SUICIDE but defensive_wounds=True	HIGH	MANNER_DEFENSIVE_WOUND_CONFLICT
+RULE_RIGOR_LIVOR	rigor=FULL + livor=NONE	MEDIUM	RIGOR_LIVOR_INCONSISTENT
+RULE_DECOMP_RIGOR	decomp=ADVANCED + rigor=FULL	HIGH	DECOMP_RIGOR_INCONSISTENT
+RULE_TEMP_WEIGHT	rectal_temp present but weight=null	MEDIUM	MISSING_BODY_WEIGHT_FOR_TOD
+RULE_IMPOSSIBLE_TEMP	rectal_temp > 37.5°C	MEDIUM	UNUSUALLY_HIGH_RECTAL_TEMP
+RULE_TOX_MANNER	lethal drug + manner=HOMICIDE	INFO	LETHAL_TOXICOLOGY_WITH_HOMICIDE
+python
+# Manner confidence override:
+base_conf = {"HIGH":0.92,"MEDIUM":0.75,"LOW":0.55,None:0.80}[manner_confidence_stated]
+final_conf = max(0.3, base_conf - (high_warning_count * 0.08))
+Narrative Prompt
+python
+NARRATIVE_PROMPT = """You are a forensic intelligence analyst.
+Write a 3-sentence neutral, factual summary covering:
+1. Cause and manner of death
+2. Key physical findings relevant to investigation
+3. Toxicology summary (if available)
+Rules: passive voice, factual only, no speculation, no names/locations.
+
+AUTOPSY FINDINGS (JSON):
+{autopsy_json_summary}"""
+Output Schema
+python
+class AutopsyResult(BaseModel):
+    file_id:               UUID
+    autopsy_date:          Optional[date]
+    report_reference_no:   Optional[str]
+
+    manner_of_death:       Optional[str]
+    manner_confidence:     float
+    cause_chain:           Dict[str, Optional[str]]  # 1a,1b,1c,2
+
+    postmortem_signs:      PostmortemSigns
+    body_params:           BodyParams
+    environment:           EnvironmentFactors
+    timeline_mentions:     TimelineMentions
+
+    injuries_present:      bool
+    injury_list:           List[str]
+    defensive_wounds:      Optional[bool]
+    specific_injury_types: Dict[str, Optional[bool]]
+
+    toxicology:            ToxicologyFindings
+
+    extraction_confidence: float
+    pathology_warnings:    List[PathologyWarning]
+    narrative:             str
+    llm_tokens_used:       int
+M-05 — CDR Analyzer Agent
+Purpose
+Transforms canonical CDR events into a forensic communication profile: contact patterns, silence windows, behavioral delta around TOD, tower sequences, IMEI anomalies, and a contact network graph.
+
+Input
+json
+{
+  "agent_id": "cdr_analyzer",
+  "payload": {
+    "cdr_items": [
+      {
+        "file_id": "uuid",
+        "source_msisdn": "919876543210",
+        "canonical_events": [ ...CanonicalCdrEvent array... ]
+      }
+    ],
+    "tod_estimate": {
+      "point_estimate":   "2026-05-09T03:30:00Z",
+      "window_95_start":  "2026-05-08T23:30:00Z",
+      "window_95_end":    "2026-05-09T07:00:00Z"
+    }
+  }
+}
+Contact Classification Thresholds
+Class	Criterion
+FREQUENT	≥ 10 total interactions
+INFREQUENT	3–9 interactions
+RARE	1–2 interactions
+DORMANT	Last event > 30 days before TOD
+UNKNOWN	First-ever contact within 7 days of TOD
+Silence Window Detection
+python
+def find_silence_windows(events, min_silence_hours=4.0):
+    sorted_ev = sorted(events, key=lambda e: e.event_timestamp)
+    windows   = []
+    for i in range(1, len(sorted_ev)):
+        gap_h = (sorted_ev[i].event_timestamp -
+                 sorted_ev[i-1].event_timestamp).total_seconds() / 3600
+        if gap_h >= min_silence_hours:
+            windows.append(SilenceWindow(
+                start      = sorted_ev[i-1].event_timestamp,
+                end        = sorted_ev[i].event_timestamp,
+                duration_h = round(gap_h, 2)
+            ))
+    return windows
+TOD Behavioral Delta
+python
+def compute_tod_behavioral_delta(events, tod_start, tod_end, baseline_days=7):
+    tod_events = [e for e in events if tod_start <= e.event_timestamp <= tod_end]
+    tod_hours  = {e.event_timestamp.hour for e in tod_events}
+    cutoff     = tod_start - timedelta(days=baseline_days)
+    baseline   = [e for e in events
+                  if cutoff <= e.event_timestamp < tod_start
+                  and e.event_timestamp.hour in tod_hours]
+    daily_avg  = len(baseline) / baseline_days
+
+    interpretation = (
+        "SILENCE_DURING_TOD"         if len(tod_events)==0 and daily_avg>1 else
+        "ELEVATED_ACTIVITY_DURING_TOD" if len(tod_events)>daily_avg*2 else
+        "NORMAL"
+    )
+    return TodBehaviorDelta(
+        tod_event_count    = len(tod_events),
+        baseline_daily_avg = round(daily_avg, 2),
+        ratio              = round(len(tod_events)/daily_avg,2) if daily_avg>0 else None,
+        interpretation     = interpretation
+    )
+Tower Sequence Analysis
+python
+def build_tower_sequence(events):
+    tower_events = sorted([e for e in events if e.cell_tower_id],
+                          key=lambda e: e.event_timestamp)
+    transitions  = []
+    for i in range(1, len(tower_events)):
+        prev, curr = tower_events[i-1], tower_events[i]
+        if prev.cell_tower_id != curr.cell_tower_id:
+            time_min = (curr.event_timestamp - prev.event_timestamp).total_seconds()/60
+            speed    = None
+            if prev.tower_latitude and curr.tower_latitude:
+                dist_km = haversine(prev.tower_latitude, prev.tower_longitude,
+                                    curr.tower_latitude, curr.tower_longitude)
+                speed   = (dist_km/time_min*60) if time_min > 0 else None
+            transitions.append(TowerTransition(
+                from_tower    = prev.cell_tower_id,
+                to_tower      = curr.cell_tower_id,
+                time_diff_min = time_min,
+                speed_kmh     = speed,
+                anomalous     = speed is not None and speed > 200
+            ))
+    return TowerSequence(transitions=transitions,
+                         anomalous_jumps=[t for t in transitions if t.anomalous])
+IMEI Anomaly Detection
+python
+def detect_imei_anomalies(events):
+    imei_per_msisdn = defaultdict(set)
+    for e in events:
+        if e.imei: imei_per_msisdn[e.source_msisdn].add(e.imei)
+    return [
+        ImeiAnomaly(type="MULTIPLE_IMEI", msisdn=m, imei_set=list(s), severity="MEDIUM")
+        for m, s in imei_per_msisdn.items() if len(s) > 1
+    ]
+Forensic Flags Output
+python
+flags = []
+if delta.interpretation == "SILENCE_DURING_TOD":    flags.append("SILENCE_WINDOW_DURING_TOD")
+if unknown_contacts_near_tod:                        flags.append(f"UNKNOWN_CONTACTS_NEAR_TOD:{n}")
+if imei_anomalies:                                   flags.append("IMEI_ANOMALY_DETECTED")
+if tower_sequence.anomalous_jumps:                   flags.append("SUSPICIOUS_TOWER_JUMP")
+M-06 — Financial Analyzer Agent
+Purpose
+Transforms canonical financial events into a forensic money profile: spending pattern analysis, cash flow anomalies, suspicious transaction detection, and pre/post-TOD behavioral delta.
+
+Input
+json
+{
+  "agent_id": "financial_analyzer",
+  "payload": {
+    "financial_items": [
+      {
+        "file_id": "uuid",
+        "account_type": "BANK_STATEMENT",
+        "institution": "HDFC",
+        "canonical_events": [ ...CanonicalFinancialEvent array... ]
+      }
+    ],
+    "tod_estimate": { ...same as CDR... }
+  }
+}
+Transaction Classification
+python
+TRANSACTION_CATEGORIES = {
+    "ATM_WITHDRAWAL": [r"ATM", r"CASH WDL", r"WITHDRAWAL"],
+    "TRANSFER_OUT":   [r"NEFT", r"RTGS", r"IMPS", r"UPI"],
+    "TRANSFER_IN":    [r"CR", r"CREDIT", r"RECEIVED"],
+    "BILL_PAYMENT":   [r"BILL", r"ELECTRICITY", r"INSURANCE"],
+    "SALARY":         [r"SALARY", r"SAL CR", r"PAYROLL"],
+    "EMI":            [r"EMI", r"LOAN"],
+    "POS":            [r"POS", r"SWIPE", r"MERCHANT"],
+    "UNKNOWN":        []
+}
+
+def classify_transaction(narration: str) -> str:
+    narration_upper = narration.upper()
+    for category, patterns in TRANSACTION_CATEGORIES.items():
+        if any(re.search(p, narration_upper) for p in patterns):
+            return category
+    return "UNKNOWN"
+Anomaly Detection Rules
+python
+FINANCIAL_ANOMALY_RULES = [
+    {
+        "id":    "LARGE_CASH_WITHDRAWAL",
+        "check": lambda t: t.category=="ATM_WITHDRAWAL" and t.amount>50000,
+        "severity": "HIGH",
+        "code": "LARGE_ATM_WITHDRAWAL"
+    },
+    {
+        "id":    "ROUND_AMOUNT_TRANSFER",
+        "check": lambda t: (t.category in ("TRANSFER_OUT","TRANSFER_IN")
+                            and t.amount % 10000 == 0 and t.amount >= 100000),
+        "severity": "MEDIUM",
+        "code": "ROUND_AMOUNT_LARGE_TRANSFER"
+    },
+    {
+        "id":    "FREQUENT_SMALL_WITHDRAWALS",
+        # Structuring: multiple withdrawals just below threshold (e.g. < ₹10k each)
+        "check": "AGGREGATE",   # checked at batch level, not per transaction
+        "window_hours": 24,
+        "threshold_count": 5,
+        "per_txn_max": 9999,
+        "severity": "HIGH",
+        "code": "POSSIBLE_STRUCTURING"
+    },
+    {
+        "id":    "DORMANT_ACCOUNT_ACTIVITY",
+        # Account shows no activity for 30+ days then sudden large transaction
+        "check": "CONTEXT",
+        "severity": "MEDIUM",
+        "code": "DORMANT_ACCOUNT_SUDDEN_ACTIVITY"
+    },
+    {
+        "id":    "NEW_COUNTERPARTY_LARGE_TRANSFER",
+        # Transfer to a new UPI/account ID > ₹50k and no prior transaction with that party
+        "check": "CONTEXT",
+        "severity": "HIGH",
+        "code": "NEW_COUNTERPARTY_LARGE_TRANSFER"
+    }
+]
+TOD Financial Delta
+python
+def compute_tod_financial_delta(events, tod_start, tod_end, baseline_days=30):
+    tod_txns   = [e for e in events if tod_start <= e.timestamp <= tod_end]
+    tod_debit  = sum(e.amount for e in tod_txns if e.txn_type=="DEBIT")
+    tod_credit = sum(e.amount for e in tod_txns if e.txn_type=="CREDIT")
+
+    cutoff     = tod_start - timedelta(days=baseline_days)
+    baseline   = [e for e in events if cutoff <= e.timestamp < tod_start]
+    daily_avg_debit = (sum(e.amount for e in baseline if e.txn_type=="DEBIT") / baseline_days
+                       if baseline_days > 0 else 0)
+
+    return TodFinancialDelta(
+        tod_debit_total       = tod_debit,
+        tod_credit_total      = tod_credit,
+        baseline_daily_debit  = round(daily_avg_debit, 2),
+        debit_ratio           = round(tod_debit / daily_avg_debit, 2) if daily_avg_debit else None,
+        unusual_large_txn_in_window = any(t.amount > 100000 for t in tod_txns)
+    )
+Output Schema
+python
+class FinancialAnalysisResult(BaseModel):
+    file_id:                UUID
+    institution:            str
+    account_type:           str
+    total_transactions:     int
+    date_range_start:       datetime
+    date_range_end:         datetime
+    total_debit:            float
+    total_credit:           float
+    avg_daily_debit:        float
+
+    transaction_categories: Dict[str, int]   # category → count
+    anomalies:              List[FinancialAnomaly]
+    tod_financial_delta:    TodFinancialDelta
+    dormant_periods:        List[DormantPeriod]
+    counterparty_profiles:  List[CounterpartyProfile]
+
+    forensic_flags:         List[str]
+    replay_steps:           List[ReplayStep]
+Forensic Flags
+python
+if anomalies with severity HIGH:           flags.append("HIGH_SEVERITY_FINANCIAL_ANOMALY")
+if tod_delta.unusual_large_txn_in_window:  flags.append("LARGE_TRANSACTION_NEAR_TOD")
+if dormant_periods:                        flags.append("DORMANT_ACCOUNT_REACTIVATION")
+if structuring detected:                   flags.append("POSSIBLE_FINANCIAL_STRUCTURING")
+M-07 — TOD Agent
+(Already provided in full earlier — this is the complete one)
+
+Quick Reference
+Physics Core: Henssge nomogram (numeric solver)
+
+Signs: Rigor/Livor/Decomp → soft PMI distributions
+
+ML Surrogate: RF/GBM on PMI features
+
+Fusion: Bayesian + Monte Carlo (5k–20k samples)
+
+Output: todPointEstimate, todWindow95, distributionSamples, consistency, featureImportance
+
+M-08 — Timeline & Anomaly Agent
+Purpose
+Merges all canonical event streams (CDR, financial, device) into a unified timeline. Runs autoencoder + Isolation Forest to detect anomalous intervals. Outputs anomaly windows to the Hotspot Agent.
+
+Input
+json
+{
+  "agent_id": "timeline_anomaly",
+  "payload": {
+    "event_streams": [
+      { "stream_type": "CDR",       "events": [...] },
+      { "stream_type": "FINANCIAL", "events": [...] },
+      { "stream_type": "DEVICE",    "events": [...] }
+    ],
+    "tod_estimate": { ...same... },
+    "case_window_start": "ISO",
+    "case_window_end":   "ISO"
+  }
+}
+Timeline Fusion
+python
+def fuse_event_streams(streams: List[EventStream]) -> List[UnifiedTimelineEvent]:
+    all_events = []
+    for stream in streams:
+        for ev in stream.events:
+            all_events.append(UnifiedTimelineEvent(
+                timestamp   = ev.timestamp,
+                stream_type = stream.stream_type,
+                event_type  = ev.event_type,
+                payload     = ev,
+                significance= 0.5   # default; updated by anomaly scores
+            ))
+    return sorted(all_events, key=lambda e: e.timestamp)
+Feature Extraction for Anomaly Detection
+python
+# Sliding window: 1-hour buckets across case window
+def extract_temporal_features(events, window_hours=1) -> pd.DataFrame:
+    buckets = {}
+    for ev in events:
+        bucket_key = ev.timestamp.replace(minute=0, second=0, microsecond=0)
+        if bucket_key not in buckets:
+            buckets[bucket_key] = {
+                "cdr_events":          0,
+                "cdr_calls":           0,
+                "cdr_sms":             0,
+                "financial_txns":      0,
+                "financial_debit_sum": 0,
+                "device_events":       0,
+                "unique_towers":       set(),
+                "unique_contacts":     set()
+            }
+        b = buckets[bucket_key]
+        if ev.stream_type == "CDR":
+            b["cdr_events"] += 1
+            if ev.event_type in ("MOC","MTC"):   b["cdr_calls"] += 1
+            if ev.event_type in ("SMS_MO","SMS_MT"): b["cdr_sms"] += 1
+            if ev.payload.cell_tower_id:         b["unique_towers"].add(ev.payload.cell_tower_id)
+            if ev.payload.counterparty_msisdn:   b["unique_contacts"].add(ev.payload.counterparty_msisdn)
+        elif ev.stream_type == "FINANCIAL":
+            b["financial_txns"] += 1
+            if ev.payload.txn_type == "DEBIT":   b["financial_debit_sum"] += ev.payload.amount
+        elif ev.stream_type == "DEVICE":
+            b["device_events"] += 1
+
+    rows = []
+    for ts, b in sorted(buckets.items()):
+        rows.append({
+            "bucket_ts":        ts,
+            "cdr_events":       b["cdr_events"],
+            "cdr_calls":        b["cdr_calls"],
+            "cdr_sms":          b["cdr_sms"],
+            "financial_txns":   b["financial_txns"],
+            "financial_debit":  b["financial_debit_sum"],
+            "device_events":    b["device_events"],
+            "unique_towers":    len(b["unique_towers"]),
+            "unique_contacts":  len(b["unique_contacts"])
+        })
+    return pd.DataFrame(rows)
+Anomaly Detection (Two Models)
+python
+# Model 1: Isolation Forest (fast, interpretable)
+from sklearn.ensemble import IsolationForest
+
+def run_isolation_forest(df: pd.DataFrame) -> pd.Series:
+    features = df.drop(columns=["bucket_ts"])
+    model    = IsolationForest(contamination=0.05, random_state=42)
+    scores   = model.fit_predict(features)
+    # -1 = anomaly, 1 = normal
+    return pd.Series(scores == -1, index=df.index, name="if_anomaly")
+
+# Model 2: Autoencoder (captures temporal structure)
+def build_autoencoder(input_dim: int):
+    from tensorflow import keras
+    encoder = keras.Sequential([
+        keras.layers.Dense(16, activation="relu", input_shape=(input_dim,)),
+        keras.layers.Dense(8,  activation="relu"),
+        keras.layers.Dense(4,  activation="relu")
+    ])
+    decoder = keras.Sequential([
+        keras.layers.Dense(8,  activation="relu", input_shape=(4,)),
+        keras.layers.Dense(16, activation="relu"),
+        keras.layers.Dense(input_dim, activation="linear")
+    ])
+    autoencoder = keras.Sequential([encoder, decoder])
+    autoencoder.compile(optimizer="adam", loss="mse")
+    return autoencoder
+
+def run_autoencoder_anomaly(df: pd.DataFrame, threshold_percentile=95) -> pd.Series:
+    features = df.drop(columns=["bucket_ts"]).values.astype(float)
+    scaler   = StandardScaler()
+    X        = scaler.fit_transform(features)
+
+    ae = build_autoencoder(X.shape[1])
+    ae.fit(X, X, epochs=50, batch_size=16, verbose=0)
+
+    X_reconstructed = ae.predict(X)
+    reconstruction_error = np.mean(np.square(X - X_reconstructed), axis=1)
+
+    threshold = np.percentile(reconstruction_error, threshold_percentile)
+    return pd.Series(reconstruction_error > threshold, name="ae_anomaly")
+
+# Fusion: anomaly if BOTH models agree (reduces false positives)
+def fuse_anomaly_scores(if_anomaly, ae_anomaly) -> pd.Series:
+    return (if_anomaly & ae_anomaly).rename("fused_anomaly")
+Anomaly Window Construction
+python
+def build_anomaly_windows(df: pd.DataFrame,
+                           fused_anomaly: pd.Series) -> List[AnomalyWindow]:
+    """
+    Merge consecutive anomalous buckets into windows.
+    Tag each window with which streams contributed.
+    """
+    windows = []
+    in_window = False
+    for idx, row in df.iterrows():
+        is_anomaly = fused_anomaly[idx]
+        if is_anomaly and not in_window:
+            window_start = row["bucket_ts"]
+            in_window = True
+        elif not is_anomaly and in_window:
+            windows.append(AnomalyWindow(
+                start           = window_start,
+                end             = row["bucket_ts"],
+                contributing_streams = detect_contributing_streams(df, window_start, row["bucket_ts"]),
+                severity        = compute_window_severity(df, window_start, row["bucket_ts"])
+            ))
+            in_window = False
+
+    return windows
+Output Schema
+python
+class TimelineAnomalyResult(BaseModel):
+    unified_timeline:        List[UnifiedTimelineEvent]
+    temporal_feature_df:     str                    # JSON of bucket features
+    anomaly_windows:         List[AnomalyWindow]
+    total_buckets:           int
+    anomalous_bucket_count:  int
+    anomaly_rate:            float
+    tod_overlap_windows:     List[AnomalyWindow]    # windows intersecting TOD band
+    replay_steps:            List[ReplayStep]
+
+class AnomalyWindow(BaseModel):
+    start:                   datetime
+    end:                     datetime
+    duration_hours:          float
+    contributing_streams:    List[str]
+    severity:                str        # LOW/MEDIUM/HIGH/CRITICAL
+    tod_overlap:             bool
+    description:             str
+M-09 — Hotspot / Correlation Engine
+Purpose
+The Hotspot Engine finds the intersection of: anomaly windows (from Timeline Agent) × suspicious contacts (from CDR Agent) × suspicious transactions (from Financial Agent) × geographic clusters (from tower data). Each intersection becomes a scored Hotspot that feeds the Hypothesis Manager.
+
+Hotspot Types
+Type	What it represents
+TEMPORAL_HOTSPOT	High anomaly density in a time window
+CONTACT_HOTSPOT	Unknown/suspicious contact cluster near TOD
+FINANCIAL_HOTSPOT	Large/unusual transaction near TOD
+GEOGRAPHIC_HOTSPOT	Tower location cluster near crime scene
+COMPOUND_HOTSPOT	2+ hotspot types overlapping in same window
+Intersection Algorithm
+python
+def compute_hotspots(
+    anomaly_windows:     List[AnomalyWindow],
+    cdr_result:          CdrAnalysisResult,
+    financial_result:    FinancialAnalysisResult,
+    tod_estimate:        TodResult
+) -> List[Hotspot]:
+
+    hotspots = []
+
+    for window in anomaly_windows:
+        contributing_factors = []
+        score = 0.0
+
+        # 1. TOD overlap:
+        if window.tod_overlap:
+            score += 0.3
+            contributing_factors.append("TOD_WINDOW_OVERLAP")
+
+        # 2. Unknown contacts in window:
+        unknown_in_window = [c for c in cdr_result.unknown_contacts_near_tod
+                             if window.start <= c.last_event <= window.end]
+        if unknown_in_window:
+            score += 0.2 * len(unknown_in_window)
+            contributing_factors.append(f"UNKNOWN_CONTACTS:{len(unknown_in_window)}")
+
+        # 3. Financial anomalies in window:
+        fin_in_window = [a for a in financial_result.anomalies
+                         if window.start <= a.timestamp <= window.end]
+        if fin_in_window:
+            score += 0.15 * len(fin_in_window)
+            contributing_factors.append(f"FINANCIAL_ANOMALIES:{len(fin_in_window)}")
+
+        # 4. Silence during window:
+        silence_in_window = [s for s in cdr_result.silence_windows
+                             if s.start >= window.start and s.end <= window.end]
+        if silence_in_window:
+            score += 0.15
+            contributing_factors.append("CDR_SILENCE_IN_WINDOW")
+
+        # 5. Anomalous tower jump in window:
+        tower_jumps = [t for t in cdr_result.tower_sequence.anomalous_jumps
+                       if window.start <= t.to_time <= window.end]
+        if tower_jumps:
+            score += 0.10
+            contributing_factors.append("ANOMALOUS_TOWER_JUMP")
+
+        if score > 0.2:    # threshold: only materialize significant hotspots
+            hotspots.append(Hotspot(
+                window_start         = window.start,
+                window_end           = window.end,
+                hotspot_type         = classify_hotspot_type(contributing_factors),
+                composite_score      = min(round(score, 4), 1.0),
+                contributing_factors = contributing_factors,
+                severity             = score_to_severity(score)
+            ))
+
+    # Sort by score descending:
+    hotspots.sort(key=lambda h: h.composite_score, reverse=True)
+    return hotspots
+Output Schema
+python
+class HotspotResult(BaseModel):
+    hotspots:              List[Hotspot]
+    total_hotspot_count:   int
+    critical_count:        int
+    top_hotspot:           Optional[Hotspot]
+    replay_steps:          List[ReplayStep]
+
+class Hotspot(BaseModel):
+    window_start:          datetime
+    window_end:            datetime
+    hotspot_type:          str
+    composite_score:       float         # 0.0–1.0
+    severity:              str           # LOW/MEDIUM/HIGH/CRITICAL
+    contributing_factors:  List[str]
+    tod_overlap:           bool
+    description:           str           # LLM-generated one sentence
+M-10 — Hypothesis Manager Agent
+Purpose
+The final synthesizer. Takes TOD result, hotspots, autopsy findings, CDR flags, and financial flags — and scores each competing hypothesis (HOMICIDE, SUICIDE, ACCIDENT, NATURAL DEATH, UNDETERMINED) with evidence weights, contradictions, and a recommended conclusion.
+
+Hypothesis Scoring Model
+python
+HYPOTHESES = ["HOMICIDE", "SUICIDE", "ACCIDENT", "NATURAL", "UNDETERMINED"]
+
+EVIDENCE_WEIGHTS = {
+    # Evidence type → {hypothesis → weight adjustment}
+    "defensive_wounds_present": {
+        "HOMICIDE":+0.30, "SUICIDE":-0.20, "ACCIDENT":+0.05, "NATURAL":-0.10
+    },
+    "manner_of_death_homicide": {
+        "HOMICIDE":+0.40, "SUICIDE":-0.30, "ACCIDENT":-0.10, "NATURAL":-0.20
+    },
+    "manner_of_death_suicide": {
+        "HOMICIDE":-0.20, "SUICIDE":+0.40, "ACCIDENT":-0.10, "NATURAL":-0.10
+    },
+    "lethal_toxicology": {
+        "HOMICIDE":+0.10, "SUICIDE":+0.20, "ACCIDENT":+0.05, "NATURAL":+0.05
+    },
+    "silence_during_tod": {
+        "HOMICIDE":+0.15, "SUICIDE":+0.05, "ACCIDENT":+0.05, "NATURAL":0.0
+    },
+    "unknown_contact_near_tod": {
+        "HOMICIDE":+0.20, "SUICIDE":0.0, "ACCIDENT":+0.05, "NATURAL":0.0
+    },
+    "large_financial_txn_near_tod": {
+        "HOMICIDE":+0.15, "SUICIDE":+0.05, "ACCIDENT":0.0, "NATURAL":0.0
+    },
+    "critical_hotspot": {
+        "HOMICIDE":+0.20, "SUICIDE":+0.05, "ACCIDENT":+0.05, "NATURAL":0.0
+    },
+    "no_injuries": {
+        "HOMICIDE":-0.20, "SUICIDE":-0.05, "ACCIDENT":-0.10, "NATURAL":+0.15
+    },
+    "natural_cause_of_death": {
+        "HOMICIDE":-0.25, "SUICIDE":-0.15, "ACCIDENT":-0.15, "NATURAL":+0.35
+    }
+}
+
+def score_hypotheses(
+    autopsy:     AutopsyResult,
+    cdr:         CdrAnalysisResult,
+    financial:   FinancialAnalysisResult,
+    hotspots:    HotspotResult,
+    tod:         TodResult
+) -> Dict[str, float]:
+
+    scores = {h: 0.25 for h in HYPOTHESES}   # uniform prior
+
+    # Map evidence → adjustment:
+    evidence_signals = {
+        "defensive_wounds_present":   autopsy.defensive_wounds == True,
+        "manner_of_death_homicide":   autopsy.manner_of_death == "HOMICIDE",
+        "manner_of_death_suicide":    autopsy.manner_of_death == "SUICIDE",
+        "lethal_toxicology":          any(d.significance=="LETHAL" for d in autopsy.toxicology.drug_details),
+        "silence_during_tod":         "SILENCE_WINDOW_DURING_TOD" in cdr.analysis_flags,
+        "unknown_contact_near_tod":   bool(cdr.unknown_contacts_near_tod),
+        "large_financial_txn_near_tod": "LARGE_TRANSACTION_NEAR_TOD" in financial.forensic_flags,
+        "critical_hotspot":           any(h.severity=="CRITICAL" for h in hotspots.hotspots),
+        "no_injuries":                not autopsy.injuries_present,
+        "natural_cause_of_death":     autopsy.manner_of_death == "NATURAL"
+    }
+
+    for signal, is_present in evidence_signals.items():
+        if is_present and signal in EVIDENCE_WEIGHTS:
+            for hyp, delta in EVIDENCE_WEIGHTS[signal].items():
+                scores[hyp] = max(0.0, scores[hyp] + delta)
+
+    # Normalize to sum=1:
+    total = sum(scores.values())
+    return {h: round(s/total, 4) for h, s in scores.items()}
+Contradiction Detection
+python
+def detect_contradictions(autopsy, cdr, financial, tod) -> List[str]:
+    contradictions = []
+
+    # Pathologist says SUICIDE but defensive wounds present:
+    if autopsy.manner_of_death=="SUICIDE" and autopsy.defensive_wounds:
+        contradictions.append("PATHOLOGIST_MANNER_VS_DEFENSIVE_WOUNDS")
+
+    # Pathologist says NATURAL but high-severity hotspot near TOD:
+    if autopsy.manner_of_death=="NATURAL" and any(h.severity in ("HIGH","CRITICAL")
+                                                   for h in financial.anomalies):
+        contradictions.append("NATURAL_MANNER_VS_FINANCIAL_ANOMALY")
+
+    # TOD window entirely in silence period — no phone activity at all:
+    if cdr.tod_behavior_delta.interpretation=="SILENCE_DURING_TOD":
+        contradictions.append("COMPLETE_COMMUNICATION_BLACKOUT_DURING_TOD")
+
+    # Unknown contact appeared immediately after TOD window:
+    if cdr.unknown_contacts_near_tod:
+        for c in cdr.unknown_contacts_near_tod:
+            if c.first_event >= tod.todWindow95["start"]:
+                contradictions.append("NEW_CONTACT_POST_TOD")
+
+    return contradictions
+LLM Reasoning Narrative
+python
+HYPOTHESIS_NARRATIVE_PROMPT = """You are a senior forensic investigator.
+Based on the following evidence summary, write a structured analytical narrative covering:
+1. Recommended primary hypothesis (most probable cause/manner of death)
+2. Supporting evidence for the primary hypothesis
+3. Evidence that contradicts or weakens the primary hypothesis
+4. Alternative hypotheses that cannot be ruled out
+5. Recommended next investigative steps
+
+Rules:
+- Be analytical, not speculative
+- Cite specific evidence (e.g. "defensive wounds present", "unknown contact 2h before TOD")
+- Express uncertainty clearly
+- Do not use victim/suspect names — refer to "the deceased" / "the subject"
+- Limit to 300 words
+
+EVIDENCE SUMMARY:
+{evidence_json}"""
+Output Schema
+python
+class HypothesisResult(BaseModel):
+    scores:                 Dict[str, float]   # {HOMICIDE:0.62, SUICIDE:0.15, ...}
+    primary_hypothesis:     str
+    primary_confidence:     float
+    contradictions:         List[str]
+    supporting_evidence:    List[str]
+    weakening_evidence:     List[str]
+    narrative:              str                # LLM 300-word analysis
+    recommended_actions:    List[str]
+    replay_steps:           List[ReplayStep]
+Recommended Actions Logic
+python
+RECOMMENDED_ACTIONS = {
+    "HOMICIDE":  [
+        "Verify alibi of unknown contacts near TOD",
+        "Request full CDR of unknown contact MSISDNs",
+        "Analyze financial transfers to unknown counterparties",
+        "Re-examine scene for additional physical evidence",
+        "Request CCTV footage near last known tower location"
+    ],
+    "SUICIDE": [
+        "Obtain mental health records if any",
+        "Interview close contacts for behavioral changes",
+        "Review all communications in 48h before TOD",
+        "Check for suicide note or digital drafts"
+    ],
+    "UNDETERMINED": [
+        "Expedite toxicology report",
+        "Request additional autopsy opinion",
+        "Expand CDR analysis to 30-day window",
+        "Map all towers near death location"
+    ]
+}

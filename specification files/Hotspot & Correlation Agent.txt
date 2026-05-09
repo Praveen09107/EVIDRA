@@ -1,0 +1,681 @@
+1. Hotspot & Correlation Agent – Role in the System
+1.1 Purpose
+The Hotspot & Correlation Agent takes multi‑modal signals for a case:
+
+TOD Agent’s posterior distribution over time of death.
+
+Anomaly windows from the Timeline & Anomaly Agent.
+
+CCTV tracks, phone events, IoT events around those windows.
+
+Key autopsy/TOD findings (e.g., estimated TOD, injury types, manner-of-death probabilities).
+
+and fuses them into a small set of “hotspots”: intervals where “something important” likely happened, with a score and a transparent explanation.
+
+Conceptually, this is a multi-modal fusion & hotspot identification layer analogous to:
+
+Integrated multi‑model data fusion approaches in forensic / security systems.
+
+Event correlation engines in incident detection platforms that group alerts into incidents.
+
+Statistical/Bayesian hotspot detection frameworks that identify regions/time windows with multiple signals pointing to the same event.
+
+The output drives:
+
+The Hotspots view in the UI.
+
+Inputs to the Causal Graph/Hypothesis Manager (nodes & edges).
+
+Reasoning Theater / Replay sequences.
+
+2. Data Contracts
+2.1 Inputs
+Per case, the agent consumes:
+
+ts
+HotspotFusionInput {
+  caseId: string;
+
+  todResult: TodResult;               // from TOD Agent
+  anomalyWindows: AnomalyWindow[];    // from Timeline & Anomaly Agent
+  timelineBuckets: TimelineBucket[];  // for context (main timeline)
+  keyEvents: KeyEvent[];              // curated events (CCTV, phone, IoT, scene)
+  hypotheses: HypothesisSummary[];    // NATURAL / ACCIDENT / SUICIDE / HOMICIDE distribution
+}
+We already defined TodResult, AnomalyWindow, TimelineBucket, and HypothesisSummary earlier.
+
+2.1.1 KeyEvent
+Key events are “coarse, important” events extracted by upstream agents (CCTV, phone, etc.):
+
+ts
+KeyEvent {
+  id: string;
+  caseId: string;
+  timestamp: string;
+  type: "CCTV_PERSON_SEEN" | "PHONE_CALL" | "APP_SESSION" | "IOT_DOOR" | "SCENE_EVENT" | "MANUAL_MARKER";
+  severity: "INFO" | "INTERESTING" | "CRITICAL";
+  description: string;
+  attributes: Record<string, any>;   // e.g., cameraId, contactId, location, duration, etc.
+}
+Some of these might be elevated outputs from other agents (e.g. CCTV agent flags “person X enters building alone”).
+
+2.2 Outputs
+ts
+Hotspot {
+  id: string;
+  caseId: string;
+
+  rank: number;                // 1 = highest-priority
+  score: number;               // 0–1 fused importance score
+
+  timeWindow: {
+    start: string;
+    end: string;
+  };
+
+  withinTodBand: boolean;      // whether overlaps TOD 95% band
+  overlapWithTodFraction: number; // fraction of hotspot window overlapping TOD band
+
+  sources: HotspotSourceContribution[];
+  anomalies: string[];         // anomalyWindow IDs contributing
+  keyEvents: string[];         // KeyEvent IDs contributing
+
+  associatedHypotheses: HypothesisImpact[];   // how this hotspot moves hypotheses
+
+  explanation: string;         // narrative explanation (LLM)
+}
+ts
+HotspotSourceContribution {
+  source: "TOD" | "ANOMALIES" | "CCTV" | "PHONE" | "IOT" | "AUTOPSY" | "OTHER";
+  weight: number;              // contribution to score
+}
+
+HypothesisImpact {
+  hypothesis: "NATURAL" | "ACCIDENT" | "SUICIDE" | "HOMICIDE";
+  direction: "SUPPORTS" | "WEAKENS" | "AMBIGUOUS";
+  strength: number;           // 0–1
+  rationale: string;
+}
+3. Architecture Overview
+High-level stages:
+
+text
+Inputs (TOD, anomalies, key events, timeline)
+    ↓
+Candidate Interval Generation (from anomalies & TOD band)
+    ↓
+Feature Extraction per candidate interval
+    ↓
+Scoring & Ranking (multi-modal fusion, global-local scoring)
+    ↓
+Hypothesis linkage & explanation
+    ↓
+Top-K Hotspots
+This is conceptually similar to:
+
+Multi-modal time series fusion pipelines where multiple modalities are encoded separately and then fused at intermediate/output level.
+
+Hotspot detection / anomaly localization frameworks that find “regions” where multiple signals co‑occur, often using Bayesian or global-local models to separate noise from true hotspots.
+
+4. Candidate Interval Generation
+The agent must create candidate hotspot windows before scoring them.
+
+4.1 Sources for Candidates
+AnomalyWindows from Timeline & Anomaly Agent.
+
+TOD band:
+
+95% interval from TOD posterior.
+
+Manual/External markers:
+
+E.g. user‑flagged “interesting” times in UI; not necessary for hackathon, but design should allow it.
+
+4.2 Merging Strategy
+We create initial candidate intervals:
+
+Start with all AnomalyWindows.
+
+Intersect them with TOD band:
+
+If withinTodBand is required for a candidate, we keep only overlapping portions (configurable).
+
+Alternatively, we keep full anomaly windows but compute overlap fraction for scoring.
+
+Merge overlapping / closely adjacent intervals:
+
+If two windows are within a small gap (say, < 10 minutes), combine into a larger candidate:
+
+start = min(starts), end = max(ends).
+
+Optionally add a pure TOD candidate:
+
+If there are no anomalies in the TOD band, we still produce at least one low‑confidence candidate centered on TOD to remind investigators of the uncertainty.
+
+This is analogous to event correlation engines creating incident “groups” from multiple alerts and temporal proximity.
+
+Result: a list of CandidateIntervals to score.
+
+ts
+CandidateInterval {
+  id: string;
+  caseId: string;
+  start: string;
+  end: string;
+  anomalyWindowIds: string[];  // references
+}
+5. Feature Extraction per Candidate Interval
+For each CandidateInterval, we build a feature vector describing how “interesting” this interval is across modalities.
+
+5.1 Temporal Features
+Duration (seconds, minutes).
+
+Overlap with TOD band:
+
+overlapFraction = |interval ∩ TOD_95| / |interval|.
+
+Position relative to TOD:
+
+e.g. centers before/after TOD median (for context).
+
+5.2 Anomaly Features
+From contributing AnomalyWindows:
+
+Max/mean fused anomaly score in window.
+
+Number of anomalies of different severities (ROUTINE, INTERESTING, CRITICAL).
+
+Diversity of sources (phone, IoT, CCTV) in anomalies.
+
+5.3 Event Features
+From KeyEvents intersecting the interval:
+
+Count of key events by type and severity.
+
+Presence of specific patterns:
+
+CCTV: person entering or leaving, victim with/without others.
+
+Phone: calls/SMS to new contacts or blocked numbers.
+
+IoT: unusual door patterns, alarms.
+
+5.4 Forensic Context Features
+From autopsy & TOD/hypotheses:
+
+Whether there are injuries suggesting specific time‑critical mechanisms (e.g. asphyxia suggests events close to TOD).
+
+Hypothesis baseline probabilities from Hypothesis Manager.
+
+Whether interval contains events likely related to specific hypotheses:
+
+Example: “high‑risk location” correlated with homicide.
+
+These features align with general multi‑modal fusion frameworks that integrate time series with discrete events and clinical context to improve downstream tasks.
+
+6. Scoring & Ranking – Multi‑Modal Fusion
+We now convert CandidateInterval feature vectors into scores.
+
+6.1 Global-Local Scoring Concept
+We can think of this as a global-local hotspot detection problem:
+
+Local: how strong are the anomaly and event signals in this specific interval?
+
+Global: how unusual is this interval compared to the rest of the case, and how strongly does it connect to case hypotheses/TOD?
+
+This is similar to Bayesian global-local hotspot models in high‑dimensional data (e.g. horseshoe priors shrinking noise globally while keeping strong local signals), and Bayesian hotspot identification / multiple testing frameworks that control for false discoveries.
+
+6.2 Simple but Powerful Fusion Formula
+We define a final score 
+S
+∈
+[
+0
+,
+1
+]
+S∈[0,1] as:
+
+S
+=
+σ
+(
+w
+anom
+⋅
+f
+anom
++
+w
+tod
+⋅
+f
+tod
++
+w
+events
+⋅
+f
+events
++
+w
+hyp
+⋅
+f
+hyp
++
+b
+)
+S=σ(w 
+anom
+​
+ ⋅f 
+anom
+​
+ +w 
+tod
+​
+ ⋅f 
+tod
+​
+ +w 
+events
+​
+ ⋅f 
+events
+​
+ +w 
+hyp
+​
+ ⋅f 
+hyp
+​
+ +b)
+Where:
+
+f
+anom
+f 
+anom
+​
+ : normalized anomaly strength (AE/IF fusion).
+
+f
+tod
+f 
+tod
+​
+ : TOD overlap term.
+
+f
+events
+f 
+events
+​
+ : key event density / severity.
+
+f
+hyp
+f 
+hyp
+​
+ : expected impact on hypotheses.
+
+w
+i
+w 
+i
+​
+ : weights; σ = logistic to map to.
+
+We can parameterize or learn these from data:
+
+For hackathon: hand‑tuned heuristics (weights chosen based on domain heuristics).
+
+For production: learn from labeled “ground truth hotspots” using logistic regression/GBM, analogous to learning correlation patterns in event correlation platforms.
+
+6.2.1 Anomaly Term 
+f
+anom
+f 
+anom
+​
+ 
+Take:
+
+f
+anom
+=
+normalized mean of fused anomaly scores in window
+f 
+anom
+​
+ =normalized mean of fused anomaly scores in window.
+
+If you have many windows, you standardize across them (mean 0, variance 1) then squish into.
+
+Hybrid AE+IF anomaly detectors show strong AUC/precision for unusual sequences; we rely on those properties to drive this term.
+
+6.2.2 TOD Term 
+f
+tod
+f 
+tod
+​
+ 
+Use:
+
+Overlap fraction with TOD_95 band.
+
+Penalize intervals far from TOD median; for example:
+
+f
+tod
+=
+λ
+1
+⋅
+overlapFraction
++
+λ
+2
+⋅
+exp
+⁡
+(
+−
+(
+t
+center
+−
+t
+TOD,median
+)
+2
+2
+σ
+TOD
+2
+)
+f 
+tod
+​
+ =λ 
+1
+​
+ ⋅overlapFraction+λ 
+2
+​
+ ⋅exp(− 
+2σ 
+TOD
+2
+​
+ 
+(t 
+center
+​
+ −t 
+TOD,median
+​
+ ) 
+2
+ 
+​
+ )
+This encodes that intervals overlapping the TOD band are more likely to be relevant.
+
+6.2.3 Event Term 
+f
+events
+f 
+events
+​
+ 
+Compute:
+
+Weighted sum of event types:
+
+Critical > Interesting > Info.
+
+CCTV + phone + IoT all have contributions.
+
+Optionally add pattern detectors (e.g. sudden meeting of victim and suspect, or last seen alive).
+
+This parallels event correlation engines that use pattern rules and ML to score clusters of events.
+
+6.2.4 Hypothesis Term 
+f
+hyp
+f 
+hyp
+​
+ 
+For each hypothesis 
+h
+h:
+
+Estimate how strongly the interval could support or contradict it, based on event compositions (LLM reasoning or rules).
+
+Aggregate into a scalar; intervals that can discriminate between hypotheses (e.g. match HOMICIDE but not ACCIDENT patterns) receive higher 
+f
+hyp
+f 
+hyp
+​
+ .
+
+This ties hotspot scoring to the investigation’s actual questions, not just “raw weirdness”.
+
+6.3 Alternative: Bayesian Hotspot Identification
+For a more principled but heavier approach, you can:
+
+Treat each interval as a hypothesis 
+H
+i
+=
+H 
+i
+​
+ = “interval i is a true hotspot”.
+
+Use Bayesian multiple testing / hotspot identification frameworks to compute posterior probabilities of being a true hotspot while controlling FDR.
+
+This is advanced and may be overkill initially, but the architecture is compatible with it.
+
+7. Hypothesis Linkage & Causal Graph Integration
+Once you have a score for each candidate interval, you:
+
+Rank them by score.
+
+For top K (e.g., 3–7) hotspots:
+
+Create Causal Graph nodes:
+
+Node type: EVIDENCE.
+
+Label: “Digital Hotspot #1 (01:40–04:00)”.
+
+Connect them to hypothesis nodes:
+
+Edges with relation “SUPPORTS” / “CONTRADICTS” and strength from HypothesisImpact.
+
+To compute HypothesisImpact:
+
+Use an LLM (like DeepSeek‑V4) with a prompt summarizing:
+
+The hotspot events (phone + CCTV + anomalies).
+
+TOD band and autopsy conclusions.
+
+Current hypothesis priors.
+
+Ask it to reason:
+
+How does this window affect probability of NATURAL vs ACCIDENT vs SUICIDE vs HOMICIDE?
+
+Provide a reasoning chain and directional impact.
+
+This is conceptually similar to multi‑modal fusion models that integrate time series with images/notes to improve classification tasks, but here the downstream task is “hypothesis support”.
+
+8. XAI Layer: Explanation Narratives
+After scoring, we want crisp textual explanations for investigators and the UI:
+
+Components:
+
+Time & TOD context:
+
+“This hotspot occurs near the estimated time of death and overlaps 80% of the 95% TOD window.”
+
+Anomaly summary:
+
+“It includes a cluster of digital anomalies: unusual movement to a remote location, repeated calls to a new contact, and an unprecedented 90‑minute period of complete phone silence.”
+
+Event correlation:
+
+“CCTV shows the victim entering the building with another individual at 01:47, with no recorded exit prior to discovery.”
+
+Hypothesis relationship:
+
+“These patterns are more consistent with staged or coerced behavior than with the victim’s normal routine, supporting the homicide hypothesis.”
+
+Many anomaly/correlation frameworks explicitly recommend providing summary narratives and root‑cause chains, not just scores.
+
+We generate these via LLM:
+
+Input: structured summary (scores, factors, events, hypothesis impacts).
+
+Output: one or two paragraphs of explanation that the UI displays.
+
+9. Example – End-to-End Hotspot Creation
+Scenario Snapshot
+TOD Agent: TOD median at 03:30, 95% band [23:30–07:00].
+
+Timeline & Anomaly Agent: Critical anomaly window 01:40–04:00 with high fused anomaly score (see previous example).
+
+Key events:
+
+01:40–02:10: unusual phone calls + movement to remote location.
+
+01:47: CCTV victim + unknown person entering building.
+
+02:10–04:00: digital silence and no exit seen on CCTV.
+
+Hypotheses baseline:
+
+NATURAL: 0.20, ACCIDENT: 0.30, SUICIDE: 0.15, HOMICIDE: 0.35.
+
+9.1 Candidate Interval
+Interval from 01:40 to 04:00 (from anomaly window, intersected with TOD band).
+
+Overlap with TOD band:
+
+Entire interval inside [23:30–07:00] → overlapFraction ≈ 1.
+
+9.2 Feature Vector
+Duration: 2h20m.
+
+Anomaly features:
+
+fusedScore mean ≈ 0.90.
+
+sources: phone, IoT, CCTV.
+
+Event features:
+
+1 critical CCTV event (victim + unknown person).
+
+multiple critical/interesting phone events.
+
+Hypothesis features:
+
+LLM reasoning: “Cluster is highly inconsistent with natural death; more aligned with homicide or accident with third‑party presence.”
+
+9.3 Scoring
+Compute:
+
+f
+anom
+f 
+anom
+​
+  high (~0.9).
+
+f
+tod
+f 
+tod
+​
+  high (~1.0).
+
+f
+events
+f 
+events
+​
+  high due to multiple critical events.
+
+f
+hyp
+f 
+hyp
+​
+  skewed towards homicide support.
+
+Plug into scoring formula → final score 
+S
+≈
+0.93
+S≈0.93. Rank = 1.
+
+9.4 Hotspot Object
+ts
+{
+  id: "hotspot-1",
+  caseId: "C123",
+  rank: 1,
+  score: 0.93,
+  timeWindow: { start: "2026-05-09T01:40:00Z", end: "2026-05-09T04:00:00Z" },
+  withinTodBand: true,
+  overlapWithTodFraction: 1.0,
+  sources: [
+    { source: "ANOMALIES", weight: 0.4 },
+    { source: "TOD", weight: 0.2 },
+    { source: "CCTV", weight: 0.25 },
+    { source: "PHONE", weight: 0.15 }
+  ],
+  anomalies: ["anom-01"],
+  keyEvents: ["kevt-01", "kevt-02", "kevt-03"],
+  associatedHypotheses: [
+    { hypothesis: "HOMICIDE", direction: "SUPPORTS", strength: 0.8, rationale: "Unusual movement, presence of another individual, and silence period inconsistent with baseline behavior." },
+    { hypothesis: "ACCIDENT", direction: "SUPPORTS", strength: 0.3, rationale: "Could reflect an accidental altercation or fall at remote location." },
+    { hypothesis: "NATURAL", direction: "WEAKENS", strength: 0.7, rationale: "Pattern inconsistent with sudden natural death and typical routine." }
+  ],
+  explanation: "Between 01:40 and 04:00, the victim displayed highly unusual digital and physical behavior near the estimated time of death..."
+}
+UI shows this as Hotspot #1, with a bold band on the timeline, the explanation in the Hotspot panel, and links into Causal Graph.
+
+10. Implementation & Evolution
+Implementation stack:
+
+Python for fusion logic and scoring; models (if you learn weights) in scikit‑learn or light GBM.
+
+LLM (DeepSeek‑V4, etc.) for HypothesisImpact reasoning & explanations.
+
+Offline training:
+
+If you ever collect retrospective labels (“this was the key interval”), you can:
+
+Train logistic/GBM models on CandidateInterval features to learn weights.
+
+Apply ideas from multiple testing / Bayesian hotspot identification to calibrate thresholds and FDR.
+
+Alignment with research:
+
+Follows forensic multi‑model fusion principles.
+
+Follows multi‑modal time series fusion practices (intermediate / output fusion).
+
+Inspired by global-local & Bayesian hotspot methods for robust selection.
+
+Aligned with event correlation best practices for incident detection.

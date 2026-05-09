@@ -1,0 +1,768 @@
+Global Visual Theme (applies to all pages)
+Overall style: Dark forensic cockpit, with glass cards, subtle neon accents and strong focus+context visualizations (graph + timeline) as recommended for complex analytical tools.
+
+Layout pattern:
+
+Left fixed sidebar for main navigation.
+
+Top bar for case context, search, and pipeline controls.
+
+Main canvas center, contextual inspector on the right.
+
+Interactions:
+
+Consistent navigation gestures: click to select, scroll to zoom, drag to pan timelines, standard keyboard shortcuts (arrows to move timelines, +/- to zoom) to keep interactions intuitive and familiar.
+
+Hover tooltips on all charts/graphs to avoid label clutter and keep readability.
+
+Page 1 — Command Center (Global Multi‑Agent Dashboard)
+Layout
+Left sidebar: Global nav (Command Center, Cases, Agents, Labs, Replay, Reports, Analytics, Settings).
+
+Main grid: Three vertical zones:
+
+Top: System Overview Strip (full width)
+
+Row of small, pill‑style cards:
+
+“Total Cases Today”, “Agents Running”, “Avg Pipeline Latency”, “Failures Last 24h”.
+
+Each card shows a large number and a mini sparkline.
+
+Middle left: Agent Status Grid
+
+3×4 grid of Agent cards (one per agent).
+
+Each card:
+
+Icon + agent name.
+
+Status dot (green/orange/red).
+
+Small metrics row: avg latency, calls today, error rate.
+
+“Open Agent Lab” button.
+
+Card background uses subtle elevation and color to signal status (e.g., red halo for failing agents).
+
+Middle right: Live Activity Stream
+
+Scrollable list:
+
+Row example: “TOD Agent ran on Case #23 in 1.8s — result: 19:45–21:05 window”.
+
+Colored tag for agent name, clickable to open Agent Lab or filter stream by agent.
+
+Date/time stamp aligned to the right.
+
+Bottom: Pipeline Heatmap
+
+Matrix: rows = agents, columns = active cases.
+
+Cell color intensity indicates number of runs or current load for that agent on that case.
+
+Clicking a cell opens Case Workspace focused on that agent’s contribution to that case.
+
+Key Interactions
+Hover on agent card → show tooltip with last 3 runs (cases + outcomes).
+
+Clicking an agent name → go to that agent’s dedicated Agent Lab (Page 7).
+
+Clicking a case name in Activity Stream or Heatmap → go to Case Workspace (Page 3).
+
+Filter toggle in the stream (chips): “Errors only”, “Slow runs”, “Anomaly-heavy cases”.
+
+Visual Feel
+Very “ops dashboard”: dark background, strong contrast metrics, minimal but expressive color palette, aligning with multi‑agent ops dashboards recommended in practice.
+
+Page 2 — Case Lobby (Case List / Entry)
+Layout
+Top bar:
+
+“New Case” primary button.
+
+Search bar with placeholder “Search case ID, victim, location”.
+
+Filter button (opens right-side filter drawer).
+
+Main area:
+
+Masonry-style grid of Case cards (2–3 columns depending on screen width).
+
+Each Case card:
+
+Title and case ID.
+
+Location and date range (e.g., “Chennai, 04 May 2026”).
+
+Pipeline completion strip:
+
+Row of tiny agent icons with check / exclamation / gray dot:
+
+Autopsy, TOD, Timeline/Anomaly, Correlation, Hypothesis, Bias Monitor.
+
+Mini timeline sparkline:
+
+Thin line chart showing event density over time. (Simple, no axes, just shape).
+
+Risk badge: colored risk pill (Low/Medium/High).
+
+Right filter drawer (slide-in):
+
+Multi-select filters:
+
+Risk (chips).
+
+Agents completed (checkboxes).
+
+Data sources present (CCTV, phone, IoT).
+
+Apply / Clear buttons.
+
+Interactions
+Card hover → slightly lifts and brightens; pipeline strip shows tooltips on each agent icon.
+
+Clicking card → navigate to Case Workspace.
+
+Filters update the grid live.
+
+Visual Feel
+Feels like a “case gallery”; each tile tells a micro-story (risk, activity, agent coverage) before opening.
+
+Page 3 — Case Workspace (Master Investigation Cockpit)
+This is your hero screen.
+
+Overall Layout
+Top band: Case header.
+
+Below header: Multi‑Agent Pipeline Strip.
+
+Main canvas (center): three tabs (Timeline, Hotspots, Causal Graph).
+
+Right inspector panel: contextual details.
+
+3.1 Case Header
+Left: Case title, victim info, location.
+
+Center: Hypothesis chips:
+
+Horizontal list of pills: “Natural”, “Accident”, “Suicide”, “Homicide”.
+
+Each pill: probability bar inside (e.g., 72% fill), colored by risk.
+
+Right:
+
+“Run full pipeline” / “Re‑run changed agents” buttons.
+
+Pipeline run status indicator (e.g. “Last run: 3 minutes ago”).
+
+3.2 Multi-Agent Pipeline Strip
+Horizontal stepper (like a DAG simplified in a single row):
+
+Nodes: Autopsy → TOD → Timeline & Anomaly → Correlation → Claim Extractor → Evidence–Claim Mapper → Hypothesis Manager → Bias Monitor → Replay Engine.
+
+Each node:
+
+Circular icon with agent initials and status ring (animated border when running).
+
+Below: small label “Done” / “Running” / “Warning”.
+
+Edges:
+
+Subtle animated arrows showing flow direction.
+
+Clicking a node:
+
+Highlights that agent’s contributions in the current tab.
+
+Opens a small popover:
+
+Last run summary, link to full Agent Lab.
+
+3.3 Tab 1 — Timeline View
+Layout (top→bottom):
+
+Main timeline (top third of center)
+
+Large chart showing event volume over time with colored stacked bars/lines by source category (CCTV, phone, IoT, autopsy events).
+
+TOD window visualized as a translucent vertical band across the plot.
+
+Anomaly intensity overlay (e.g., heat gradient behind the curve in periods where AE score is high).
+
+Mini timeline (immediately under main)
+
+Slim overview timeline spanning entire case period.
+
+Draggable/resizeable window rectangle controlling the zoomed region in the main timeline (classic focus+context pattern).
+
+Event lanes (middle third)
+
+Horizontal lanes stacked:
+
+Autopsy/TOD.
+
+Phone metadata.
+
+CCTV events.
+
+Other sensors/logs.
+
+Agent outputs (e.g., anomaly markers, collisions).
+
+Each event: small pill or icon anchored at its timestamp, color-coded by type. Labels only appear when zoomed in enough to keep readability.
+
+Event table (bottom third)
+
+Synchronized list view of events in the current time window.
+
+Columns: Time, Source, Event type, Short description, Anomaly score, Link to raw data.
+
+Interactions:
+
+Scroll wheel / pinch on main timeline → zoom in/out; mini timeline updates focus window accordingly.
+
+Drag window in mini timeline to pan time range.
+
+Hover over events:
+
+Shows tooltip with details and highlights the corresponding row in the table.
+
+Clicking an event:
+
+Selects it, opens details in the right inspector panel.
+
+Keyboard shortcuts:
+
+Arrow keys to move time window, +/- to zoom, ensuring accessible navigation.
+
+3.4 Tab 2 — Collision Hotspots
+Layout:
+
+Top: Filter chips:
+
+“Within TOD window”, “Digital-only”, “Multi-source”, “High-score only”.
+
+Main area: Hotspot cards in a vertical list.
+
+Each hotspot card:
+
+Title: “Hotspot #3 — Phone silence + CCTV gap in TOD window”.
+
+Badge row: sources (CCTV, phone, TOD), time window, collision score.
+
+Mini strip showing:
+
+A narrow timeline band with markers for involved events.
+
+Short explanation:
+
+2–3 lines summarizing why this is interesting.
+
+“View on timeline” button.
+
+Interactions:
+
+Clicking card:
+
+Jumps Timeline tab to the hotspot window.
+
+Temporarily highlights involved events with a glow effect.
+
+Hover on mini strip:
+
+Shows exact start/end times, anomaly score distribution.
+
+3.5 Tab 3 — Causal / Hypothesis Graph
+Layout:
+
+Central canvas: node-link diagram:
+
+Hypothesis nodes (larger, top).
+
+Claim nodes (middle).
+
+Evidence nodes (bottom).
+
+Left: small legend explaining node shapes/colors.
+
+Right: explanation panel.
+
+Interactions (based on graph UX best practices):
+
+Click a hypothesis node:
+
+Focus mode: dims everything else, highlights its supporting and contradicting paths.
+
+Inspector shows:
+
+Current probability.
+
+List of strongest supporting / contradicting evidences with links back to timeline.
+
+Zoom & pan:
+
+Standard mouse wheel zoom and drag to pan.
+
+Zoom indicator suggests when to zoom further when labels get dense.
+
+Hover:
+
+Short tooltips on nodes/edges (no overcrowding).
+
+Toggle:
+
+Buttons for “Show only critical evidence”, “Show all evidence”.
+
+3.6 Right Inspector Panel
+Dynamic content:
+
+For selected event: metadata, source, associated agent outputs.
+
+For hotspot: involved agents, time windows, detailed explanation, “open in XAI studio” button.
+
+For graph node: explanation why evidence supports/contradicts claim, with confidence and bias notes.
+
+Page 4 — Autopsy & TOD Lab
+Layout
+Two-column split:
+
+Left: Autopsy Intelligence.
+
+Right: TOD Engine.
+
+Left: Autopsy Intelligence
+Components:
+
+Document viewer:
+
+Scrollable text area showing autopsy report.
+
+Detected fields highlighted in context (e.g. injuries in yellow, toxicology in blue).
+
+Extraction summary card (above or beside the text):
+
+Structured fields:
+
+Cause of death, manner of death.
+
+Injury list (bulleted with location, type).
+
+Toxicology findings.
+
+Negative findings.
+
+Each field annotated with confidence indicator (e.g. shaded bar or icon).
+
+Interactions:
+
+Hover on a field in summary → highlight matching text occurrences in document.
+
+Clicking a highlight in text → scrolls summary to that field.
+
+Right: TOD Engine
+Components:
+
+PMI distribution chart
+
+A smooth density plot over time (x-axis = time, y-axis = probability).
+
+Overlaid markers:
+
+“Physics only” estimate.
+
+“Hybrid” estimate.
+
+TOD 95% confidence band shaded.
+
+Feature importance bar chart
+
+Horizontal bars: ambient temp, clothing, BMI, environment, etc.
+
+Bars sorted by importance; labels on left, % on right.
+
+Mode switcher
+
+Segment control: “Physics”, “Hybrid”, “Signs-constrained”.
+
+Switching fades between charts, updating text explanation.
+
+Consistency widget
+
+Cards: Rigor, Livor, Algor vs estimated TOD.
+
+Each card: label, observed stage, “Consistent” / “In tension” indicator.
+
+Interactions:
+
+Hover on PMI chart → show specific time, probability, and whether it falls in TOD band + textual explanation.
+
+Hover on feature bar → show how a small change in that feature would move PMI (sensitivity hint).
+
+Clicking a “Signs-constrained” mode explains exactly which biological signs tightened the window.
+
+Page 5 — Digital Forensics Lab
+Layout
+Three major areas stacked or split:
+
+Digital Timeline (top)
+
+Anomaly Explorer (middle)
+
+CCTV / Scene Viewer (bottom or right)
+
+5.1 Digital Timeline
+Similar to Case Workspace timeline but filtered only to digital sources.
+
+Lanes: phone, network, app logs, IoT signals.
+
+Interactions:
+
+Same zoom/pan + hover tooltips behavior as main timeline for consistency.
+
+5.2 Anomaly Explorer
+Table with each row representing a time window (e.g. 15 minutes):
+
+Window start–end.
+
+Autoencoder reconstruction error (AE score).
+
+IF score.
+
+Fused anomaly score.
+
+Dominant features contributing to anomaly (e.g., “long silence”, “night-time unusual movement”).
+
+Side mini-chart:
+
+Distribution histogram of all anomaly scores (so high values stand visually apart).
+
+Interactions:
+
+Click a row:
+
+Highlights corresponding window in Digital Timeline (e.g., with a translucent band).
+
+Hover over a row:
+
+Shows a small popover with quick narrative (e.g., “20-min phone silence during TOD band”).
+
+Filter controls:
+
+Slider for minimum anomaly score.
+
+Checkbox “Intersect TOD window”.
+
+5.3 CCTV / Scene Viewer
+Primary video panel:
+
+Video frame with YOLO/DETR boxes.
+
+Color-coded boxes by entity, ID labels (“Person #3”, “Vehicle #2”).
+
+Timeline scrub bar:
+
+Below the video, segments colored for:
+
+High anomaly.
+
+Collision hotspot times.
+
+Small pins marking detections or suspicious intervals.
+
+Entity list (side panel):
+
+Each row: thumbnail + label + presence segments (mini timeline bars showing when they appear on which camera).
+
+Interactions:
+
+Hover on entity in list → highlight only that entity’s boxes in video.
+
+Clicking a hotspot segment in scrub bar → jump to that time, link back to Hotspots tab in Case Workspace.
+
+Page 6 — Agent Directory
+Layout
+Search bar + filter chips (“NLP Agents”, “Vision Agents”, “Tabular”, “XAI / Bias”, “Orchestration”).
+
+Grid of Agent cards (like a mini version of Command Center agent grid but case-agnostic):
+
+Each card:
+
+Icon, name, category tag.
+
+Short role description.
+
+Model name (DeepSeek Flash, II‑Medical‑32B, RF/GBM, Autoencoder, YOLO).
+
+Stats row: calls today, avg latency, error rate.
+
+Two buttons:
+
+“Open Agent Lab”.
+
+“See runs” (filtered view of recent activity stream).
+
+Interactions:
+
+Filters: clicking a category chip filters grid instantly.
+
+Clicking “Open Agent Lab” → navigate to Agent Lab (Page 7).
+
+Page 7 — Agent Lab (Template for Each Agent)
+Layout Template
+Top: Agent header
+
+Icon + Agent name.
+
+Tagline (“Specialized in X…”).
+
+Badges with:
+
+Model version.
+
+Underlying architecture (LLM / RF / Autoencoder / Vision).
+
+Mini pipeline graph with this agent highlighted (so judges see where it sits in the pipeline).
+
+Main content (two columns):
+
+Left column: Test Bench
+Right column: Recent Runs & Config
+
+Left: Test Bench
+Input area tailored to agent type:
+
+Autopsy Agent: large text area for medical text.
+
+TOD Agent: sliders/inputs for temp, BMI, environment.
+
+Timeline Agent: text box for pasted logs or upload widget.
+
+Image Agent: image upload or sample images.
+
+“Run Agent” button.
+
+Output area:
+
+Tabbed:
+
+“Summary” (human-readable).
+
+“JSON” (raw structured response).
+
+“XAI” (for agents with feature importance / explanation).
+
+Interactions:
+
+After run:
+
+Summary view shows highlight cards: key decisions, main numbers.
+
+JSON view: syntax-highlighted, with copy button.
+
+XAI view: small chart or bullet list showing top contributing factors, aligned with forensic XAI standards.
+
+Right: Recent Runs & Config
+Recent runs list:
+
+Table: Case ID, input summary (short snippet), result summary, latency, timestamp.
+
+Click entry → go to Case Workspace at relevant position.
+
+Config panel:
+
+Display (or minimal controls) of relevant hyperparameters (e.g., Autoencoder threshold, tree depth).
+
+Model version + last update time.
+
+Page 8 — Pipeline Explorer (Per-Case, Full Pipeline View)
+Layout
+Left: Filter controls (show/hide agents, show only failed runs, etc.).
+
+Center: Big pipeline graph.
+
+Bottom: Timeline of pipeline events.
+
+Center graph:
+
+DAG representing pipeline structure:
+
+Nodes = agents.
+
+Edges = data/control flow.
+
+Node size/color indicates activity or status (bigger for higher load / importance).
+
+Interactions:
+
+Play button:
+
+Animates the pipeline execution of the last run step by step:
+
+Nodes light up as they ran.
+
+Edges animate with flow.
+
+Clicking a node:
+
+Highlights all connected upstream/downstream agents.
+
+Opens side panel with run details for this agent in this case (inputs, outputs, errors).
+
+Zoom/pan same as causal graph, with predictable patterns.
+
+Bottom timeline:
+
+Horizontal timeline marking when each agent executed (stacked tracks by agent).
+
+Clicking a bar jumps the graph focus to that execution moment.
+
+Page 9 — XAI & Uncertainty Studio
+Layout
+Tabs at top: “TOD”, “Anomaly”, “Hypotheses”.
+
+Each tab has:
+
+Global summary cards (top):
+
+E.g., “TOD uncertainty ± 2.1h”, “Top anomaly driver: silence gaps”, “Most sensitive hypothesis: Homicide vs Accident”.
+
+Central visualization:
+
+TOD tab: density plots, reliability diagram (predicted vs actual, if you have ground truth for demos).
+
+Anomaly tab: feature attribution bar charts, maybe a 2D projection of normal vs anomalous windows.
+
+Hypotheses tab: small multiples showing each hypothesis’ probability distribution and sensitivity to evidence removal.
+
+Right: Explanation panel:
+
+Plain-language breakdown (e.g., “The TOD range is wide due to inconsistent ambient temperature readings and limited postmortem sign data.”).
+
+Interactions:
+
+Hover on feature bars → show why this feature matters (SHAP/LIME text).
+
+Toggle checkboxes to “include/exclude” evidence and watch probability distributions change.
+
+Page 10 — Reasoning Replay Theater
+Layout
+Three columns:
+
+Left: Step list (vertical).
+
+Center: Visualization stage.
+
+Right: Narrative.
+
+Left: Steps
+
+Numbered sequence:
+
+“Autopsy processed”
+
+“TOD estimated”
+
+“Digital anomalies identified”
+
+“Collision hotspot 1”
+
+…
+
+Each step has a short title and timestamp.
+
+Center: Visualization stage
+
+Container that swaps in different mini views:
+
+Small timeline snapshot for timeline-related steps.
+
+Causal graph snippet for hypothesis changes.
+
+Hotspot card for collision steps.
+
+Right: Narrative
+
+Paragraph or two describing what changed at this step:
+
+Which agents ran.
+
+How probabilities or conclusions shifted.
+
+Interactions:
+
+Play/Pause at top of Step list:
+
+Auto-advance through steps with timed transitions.
+
+Clicking a step:
+
+Stage + narrative jump to that step.
+
+“Open in context” button on each step:
+
+Takes you directly to the relevant view (Timeline / Causal graph / Agent Lab).
+
+Page 11 — Report Builder
+Layout
+Left: Section checklist (outline).
+
+Center: WYSIWYG report preview.
+
+Right: Insert panel.
+
+Left outline:
+
+Checkable items: Summary, Timeline, Hotspots, Autopsy & TOD, Digital Evidence, XAI, Conclusion.
+
+Center preview:
+
+Live rendering of report sections:
+
+Text blocks.
+
+Embedded charts/screenshots (placeholders from other pages).
+
+Chronological event listings (using timeline data).
+
+Right insert panel:
+
+Library of elements:
+
+“Insert TOD plot”, “Insert Collision hotspot #2 snapshot”, “Insert anomaly explanation”.
+
+Drag & drop or click to insert into the preview at the cursor.
+
+Interactions:
+
+Reorder sections by drag & drop in the outline.
+
+Click an embedded chart → “Edit in source view” opens original page (TOD Lab, Timeline, XAI Studio).
+
+Page 12 — Audit & Chain‑of‑Custody
+Layout
+Top filters: by agent, event type (run, config change, report export), user.
+
+Main: vertical audit timeline with grouped events:
+
+Dated headings.
+
+Entries like “TOD Agent v1.3 run by Inspector A at 19:02 — success”.
+
+Right: Expanded detail when you click any entry:
+
+Agent, case, input/output hashes, any warnings.
+
+Interactions:
+
+Filter to only show e.g. “Bias Monitor events” to demonstrate fairness controls.
+
+Export log (button) to JSON/CSV.
+
+This covers every major screen with component-level layout and interaction model, and it cleanly exposes:
+
+Each agent individually (via Agent Directory + Agent Labs).
+
+The full pipeline (via Pipeline strip + Pipeline Explorer).
+
+All layers: TOD ML, autoencoder anomalies, CV, multi-agent coordination, XAI, and legal/audit surfaces.

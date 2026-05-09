@@ -1,0 +1,704 @@
+1. Timeline & Anomaly Agent – Purpose and Role
+1.1 Purpose
+This agent is the “digital nervous system” of the case. It ingests heterogeneous digital signals (phone logs, app usage, network logs, IoT sensors, CCTV metadata, etc.), converts them into a unified time series, and then detects unusual patterns and time windows that might be relevant to the death.
+
+Its responsibilities:
+
+Normalize multi‑source digital evidence into a case timeline with per‑time‑bucket features.
+
+Learn normal behavior for that person/context (within‑case or across reference datasets).
+
+Detect anomalies using a hybrid of:
+
+Deep autoencoder for multivariate time series (reconstruction error).
+
+Isolation Forest (IF) for statistical outlier scores.
+
+Fuse these signals into anomaly windows with scores and explanations that can be visualized on the timeline and passed to the Hotspot/Correlation Agent.
+
+This mirrors modern network/IoT anomaly frameworks that combine autoencoders + Isolation Forest for more robust anomaly detection than either alone.
+
+2. Data Model and Inputs
+2.1 Raw Event Inputs
+The agent consumes structured events already ingested/normalized by upstream ETL:
+
+ts
+DigitalEvent {
+  id: string;
+  caseId: string;
+  timestamp: string;     // ISO
+  source: "PHONE" | "APP" | "CCTV" | "IOT" | "NETWORK" | "SYSTEM";
+  subtype: string;       // "CALL_START", "CALL_END", "LOCATION_PING", "UNLOCK", "DOOR_OPEN", ...
+  attributes: Record<string, any>;  // duration, lat/lng, appId, IP, etc.
+}
+This includes:
+
+Phone/telecom: call/SMS start/end, tower pings, data sessions.
+
+App usage: unlocks, messaging sessions, app foreground events.
+
+IoT: door sensors, smart lock, motion, lights, etc.
+
+CCTV metadata: person ID track times, camera IDs, coarse locations.
+
+2.2 Unified Timeline Feature Grid
+Internally, the agent creates a regular time grid (e.g. 1‑minute or 5‑minute buckets) per case:
+
+ts
+TimelineBucketFeatures {
+  bucketStart: string;               // ISO
+  bucketEnd: string;
+  features: {
+    callCount: number;
+    totalCallDurationSec: number;
+    smsCount: number;
+    appEventsCount: number;
+    numUniqueApps: number;
+    motionEvents: number;
+    doorOpenCount: number;
+    cctvDetections: number;
+    distanceMovedMeters: number;
+    // … extend as needed
+  };
+}
+These form a multivariate time series 
+X
+t
+∈
+R
+d
+X 
+t
+​
+ ∈R 
+d
+  on a regular grid, which is ideal for autoencoder‑based anomaly detection methods.
+
+3. Internal Architecture Overview
+Conceptual pipeline:
+
+text
+Raw Digital Events
+    ↓
+Event Normalization & Enrichment
+    ↓
+Time Binning & Feature Engineering  (TimelineBucketFeatures)
+    ↓
+Unsupervised Modeling:
+    - Deep Autoencoder → reconstruction error
+    - Isolation Forest (IF) → outlier score
+    ↓
+Score Fusion & Smoothing
+    ↓
+Anomaly Windows (start, end, scores, dominant factors)
+    ↓
+Outputs for UI + Hotspot Agent + Causal Graph
+This is structurally similar to modern unsupervised anomaly detectors that combine reconstruction models (autoencoders) with statistical outlier detectors (IF), as seen in network/IoT security frameworks.
+
+4. Modules in Detail
+4.1 Event Normalization & Enrichment
+Goal: bring heterogeneous events into a canonical schema and enrich them with useful derived attributes.
+
+Steps:
+
+Normalization: map raw source fields to canonical fields (duration, location, device, etc.).
+
+Context enrichment:
+
+Geocoding for “home/work/other” classification from GPS.
+
+Flagging night vs day, weekend vs weekday.
+
+Mapping app IDs to categories (social, financial, entertainment).
+
+Device/session grouping:
+
+Merge low‑level events into sessions (e.g. app session, screen‑on session) for better semantic features.
+
+Most of this is deterministic backend logic and runs before ML; the autoencoder sees a relatively clean numerical feature tensor.
+
+4.2 Time Binning & Feature Engineering
+Binning:
+
+Choose Δt (e.g. 5 minutes) as the fundamental bucket size.
+
+For each case, generate buckets from 
+min(timestamp)
+min(timestamp) to 
+max(timestamp)
+max(timestamp).
+
+Aggregate events into bucket features (counts, durations, distances).
+
+Feature examples:
+
+Counts per type:
+
+callInCount, callOutCount, smsCount, locationPingCount, unlockCount, appEventCount.
+
+Temporal features:
+
+Time‑of‑day (sine/cosine encoding).
+
+Day‑of‑week; weekend flag.
+
+Mobility:
+
+distanceMovedMeters, numLocationTransitions.
+
+Social:
+
+Number of unique contacts in bucket, or in trailing window.
+
+The output is a matrix 
+X
+∈
+R
+T
+×
+d
+X∈R 
+T×d
+  (T = number of buckets, d = features), the input to the ML models, matching common setups for multivariate time series anomaly detection.
+
+4.3 Autoencoder Module
+4.3.1 Model Choice
+Use a deep autoencoder (AE) to learn a compact representation of normal behavior and detect anomalies via reconstruction error.
+
+Options:
+
+Simple feedforward AE (for per‑bucket vectors).
+
+Temporal AE (1D Conv, LSTM, Transformer‑based windowed AE) to capture sequence context, similar to recent temporal‑frequency masked AEs (TFMAE) and other transformer‑based time series AEs.
+
+A practical compromise:
+
+Window size 
+W
+W (e.g. 12 buckets = 1 hour).
+
+For each sliding window, create 
+X
+t
+:
+t
++
+W
+−
+1
+∈
+R
+W
+×
+d
+X 
+t:t+W−1
+​
+ ∈R 
+W×d
+ .
+
+Use either:
+
+Flattened vector into a feedforward AE, or
+
+1D Conv/Transformer AE for better temporal modeling.
+
+4.3.2 Training Strategy
+Training mode options:
+
+Person‑specific unsupervised:
+
+Use earlier “known normal” periods (e.g. 30 days of digital activity) when available.
+
+Advantage: tailored to the victim’s baseline.
+
+Population‑level:
+
+Train on large corpora of “normal” digital behavior from similar cohorts, as done in industrial/IoT/time‑series anomaly detection.
+
+Hybrid:
+
+Start with population pre‑train, fine‑tune per‑person using normal segments when possible.
+
+Optimization:
+
+Minimize reconstruction loss (mean squared error or robust losses).
+
+Apply regularization and compression strategies (pruning, quantization) as in efficient AE research to keep models fast for real‑time scoring.
+
+4.3.3 Inference & Scoring
+For each window:
+
+Encode & decode: 
+X
+^
+t
+:
+t
++
+W
+−
+1
+X
+^
+  
+t:t+W−1
+​
+ .
+
+Compute reconstruction error per time step and per feature; aggregate:
+
+Per‑bucket AE score 
+AE_score
+t
+=
+MSE
+(
+X
+t
+,
+X
+^
+t
+)
+AE_score 
+t
+​
+ =MSE(X 
+t
+​
+ , 
+X
+^
+  
+t
+​
+ ).
+
+Optionally per‑feature error contributions.
+
+High reconstruction error indicates behavior that deviates from learned normal patterns, consistent with AE‑based anomaly detection literature.
+
+4.4 Isolation Forest Module
+4.4.1 Rationale
+Isolation Forest (IF) is a classical, unsupervised anomaly detector that isolates anomalies by random partitioning and uses path lengths to compute anomaly scores.
+
+It is:
+
+Efficient for high‑dimensional data.
+
+Complementary to AE: AEs model continuous manifolds, IF detects statistical outliers that may be rare but not poorly reconstructed.
+
+Recent security and IoT work shows hybrid AE + IF frameworks outperform either component alone for detecting various anomalies (DoS, ransomware, IoT traffic drift).
+
+4.4.2 Training
+We train an IF model on a “normal” subset of timeline buckets:
+
+Use pre‑case baseline or population normal dataset.
+
+Parameters:
+
+Number of trees (e.g. 100–300).
+
+Subsample size per tree.
+
+Contamination rate (expected fraction of anomalies).
+
+4.4.3 Inference
+For each bucket feature vector 
+X
+t
+X 
+t
+​
+ :
+
+Compute IF anomaly score 
+IF_score
+t
+∈
+[
+0
+,
+1
+]
+IF_score 
+t
+​
+ ∈[0,1].
+
+Higher score → more anomalous, as defined by shorter average isolation paths.
+
+4.5 Score Fusion and Anomaly Windowing
+4.5.1 Score Normalization
+Normalize AE and IF scores into comparable ranges:
+
+Apply robust scaling (using training quantiles).
+
+For each bucket:
+
+s
+t
+(
+A
+E
+)
+=
+normalize
+(
+AE_score
+t
+)
+,
+s
+t
+(
+I
+F
+)
+=
+normalize
+(
+IF_score
+t
+)
+s 
+t
+(AE)
+​
+ =normalize(AE_score 
+t
+​
+ ),s 
+t
+(IF)
+​
+ =normalize(IF_score 
+t
+​
+ )
+4.5.2 Fusion Strategy
+We compute a fused anomaly score:
+
+s
+t
+(
+f
+u
+s
+e
+d
+)
+=
+α
+⋅
+s
+t
+(
+A
+E
+)
++
+β
+⋅
+s
+t
+(
+I
+F
+)
++
+γ
+⋅
+s
+t
+(
+r
+u
+l
+e
+)
+s 
+t
+(fused)
+​
+ =α⋅s 
+t
+(AE)
+​
+ +β⋅s 
+t
+(IF)
+​
+ +γ⋅s 
+t
+(rule)
+​
+ 
+s
+t
+(
+r
+u
+l
+e
+)
+s 
+t
+(rule)
+​
+  is optional rule‑based score (e.g. zero activity spike, impossible travel, known fraud patterns).
+
+α
+,
+β
+,
+γ
+α,β,γ are weights that can be tuned or set per source type.
+
+Hybrid AE+IF frameworks in network/IoT security have shown improved detection performance and clearer separation between normal and anomalous behavior using such weighted combinations.
+
+4.5.3 Temporal Smoothing
+Apply 1D smoothing (e.g. moving average or small Gaussian kernel) over 
+s
+t
+(
+f
+u
+s
+e
+d
+)
+s 
+t
+(fused)
+​
+  to reduce noise.
+
+This favors persistent anomalous segments over isolated spikes, which aligns with real‑world patterns where suspicious behavior spans minutes/hours.
+
+4.5.4 Window Extraction
+From the smoothed score series:
+
+Find contiguous segments where 
+s
+t
+(
+f
+u
+s
+e
+d
+)
+s 
+t
+(fused)
+​
+  exceeds threshold θ.
+
+Merge adjacent segments separated by gaps smaller than a small gap threshold (e.g. <= 1–2 buckets).
+
+For each segment, compute:
+
+Start & end time.
+
+Max, mean, and duration‑weighted anomaly scores.
+
+Top contributing features (from AE per‑feature error & IF feature attributions).
+
+These segments become AnomalyWindow objects used everywhere in the app.
+
+5. Outputs – Anomaly Windows & Explanations
+5.1 AnomalyWindow Schema
+We already sketched something like this; here is a detailed version:
+
+ts
+AnomalyWindow {
+  id: string;
+  caseId: string;
+  start: string;
+  end: string;
+  aeScore: number;          // aggregated AE score (e.g., max or mean over window)
+  ifScore: number;          // aggregated IF score
+  fusedScore: number;
+  factors: AnomalyFactor[]; // top-k feature factors
+  sourceBreakdown: SourceContribution[];
+  label?: "ROUTINE" | "INTERESTING" | "CRITICAL";  // severity
+  explanation: string;      // narrative, for UI
+}
+ts
+AnomalyFactor {
+  feature: string;          // "callCount", "distanceMovedMeters", ...
+  contribution: number;     // relative importance within window
+  direction: "HIGHER_THAN_USUAL" | "LOWER_THAN_USUAL";
+}
+
+SourceContribution {
+  source: "PHONE" | "APP" | "IOT" | "CCTV" | "NETWORK";
+  weight: number;           // fraction of fused score attributable to this source
+}
+Feature‑level importance can be derived by aggregating reconstruction error per feature from the AE, plus any feature importance techniques applied on an interpretable variant of IF, similar to ExIFFI or importance analyses in IF frameworks.
+
+5.2 XAI Narratives
+A small LLM pass can turn the numeric explanation into natural language:
+
+“Between 02:10 and 02:45, the victim’s phone showed an unusually high number of short calls to unknown numbers and a complete absence of typical late‑night app usage, which differs from their baseline pattern. Location data also suggests a longer‑than‑usual stationary period at an unfamiliar address.”
+
+This is conceptually similar to explanation‑oriented anomaly detection pipelines in security, where feature importance is used to justify flagged anomalies.
+
+6. Modes: Training / Scoring / Streaming
+6.1 Offline Training Mode
+Train or fine‑tune AE and IF models on:
+
+Pre‑case normal segments (if available).
+
+Population‑level normal datasets by source (phone, IoT, etc.).
+
+Hyperparameter tuning using:
+
+Reconstruction error distributions and F1/ROC on labeled anomalies (if any).
+
+Benchmarks similar to those in time series anomaly detection surveys (point & collective anomalies).
+
+6.2 Batch Scoring Mode
+Used for initial case ingest:
+
+Build full timeline for case (from earliest to latest events).
+
+Compute AE & IF scores for all buckets.
+
+Extract anomaly windows and persist them.
+
+Send them to Hotspot Agent and UI.
+
+6.3 Streaming/Online Mode
+For live monitoring or incremental updates:
+
+As new digital events arrive:
+
+Update relevant buckets.
+
+Compute incremental features.
+
+Run AE & IF scoring only on affected windows.
+
+Update anomaly windows (extend, split, merge) accordingly.
+
+Modern time‑series anomaly detection focuses heavily on online detection; the same architectural ideas (incremental scoring, windowing, concept drift handling) apply here.
+
+7. Interaction with Other Agents
+7.1 TOD Agent
+The TOD Agent’s posterior window defines a focus band on the timeline.
+
+The Timeline & Anomaly Agent can:
+
+Mark anomalies falling within the TOD 95% interval more prominently (higher effective priority).
+
+Provide to TOD Agent summary stats about anomaly density near candidate TODs for feedback loops if you want.
+
+7.2 Hotspot & Correlation Agent
+This agent takes:
+
+AnomalyWindows (with fusedScore).
+
+TOD posterior window.
+
+Other signals (CCTV, phone, IoT correlation events).
+
+And produces Hotspots, which include the anomaly windows as one of the contributing components. The anomaly windows effectively provide candidate suspicious intervals to be intersected with TOD and other evidence.
+
+7.3 Causal Graph & Hypothesis Manager
+Anomalies can be turned into candidate evidence nodes, e.g. “Unusual phone silence between 22:00–23:00” or “Unexpected movement to unfamiliar location at 03:13”.
+
+Each anomaly window can map to a node with edges to hypotheses (suicide vs homicide vs accident) via LLM reasoning.
+
+8. Example Flow – From Raw Events to AnomalyWindow
+8.1 Scenario
+Victim usually:
+
+Has messaging & social app activity until 23:30.
+
+Minimal activity between 00:00–06:00.
+
+On case night:
+
+From 01:40–02:10, there are 12 short outgoing calls to a new contact and 6 location pings moving to a remote industrial area.
+
+From 02:10–04:00, complete silence from phone and apps, unlike baseline where there is usually at least some late‑night chat usage.
+
+IoT logs show door open/close at 01:42 and not again until morning.
+
+8.2 Processing
+Events → buckets: 5‑minute buckets from 00:00 to 08:00.
+
+Feature vectors show:
+
+Spike in callCount and distanceMoved between 01:40–02:10.
+
+Near‑zero activity but unusual pattern of “hard silence” between 02:10–04:00 compared to baseline.
+
+AE scoring:
+
+Normal windows reconstruct well (low error).
+
+01:40–02:10 windows show high error due to unusual combined call + movement pattern.
+
+02:10–04:00 windows show high error because AE expects occasional messaging or app background activity from baseline but gets zero.
+
+IF scoring:
+
+Points for 01:40–02:10 and 02:10–04:00 lie in sparse regions of the feature space; IF marks them with high anomaly scores.
+
+Fusion & windows:
+
+Fused scores exceed threshold from ~01:40–04:00, with two sub‑peaks:
+
+Activity spike.
+
+Silence region.
+
+The agent merges them into one extended AnomalyWindow or two adjacent ones depending on configuration.
+
+Resulting AnomalyWindow:
+
+ts
+{
+  id: "anom-01",
+  caseId: "C123",
+  start: "2026-05-09T01:40:00Z",
+  end:   "2026-05-09T04:00:00Z",
+  aeScore: 0.89,
+  ifScore: 0.91,
+  fusedScore: 0.90,
+  factors: [
+    { feature: "callCount", contribution: 0.35, direction: "HIGHER_THAN_USUAL" },
+    { feature: "distanceMovedMeters", contribution: 0.30, direction: "HIGHER_THAN_USUAL" },
+    { feature: "appEventsCount", contribution: 0.20, direction: "LOWER_THAN_USUAL" },
+    { feature: "doorOpenCount", contribution: 0.15, direction: "HIGHER_THAN_USUAL" }
+  ],
+  sourceBreakdown: [
+    { source: "PHONE", weight: 0.7 },
+    { source: "IOT", weight: 0.3 }
+  ],
+  label: "CRITICAL",
+  explanation: "Unusually dense phone activity and movement to a new location followed by complete digital silence."
+}
+This is exactly what the UI can highlight as a red band on the main timeline, with tooltips explaining what was anomalous and why.
+
+9. Implementation & Operational Considerations
+Tech stack:
+
+Python: PyTorch/TF for AE, scikit‑learn for IF.
+
+Optionally accelerate with ONNX/TensorRT for real‑time scoring.
+
+Model management:
+
+Version AEs & IFs (timeline_ae_vX, timeline_if_vY).
+
+Store version IDs in each AnomalyWindow for auditability.
+
+Evaluation:
+
+Use benchmark datasets and detection metrics (Precision/Recall/F1, ROC AUC) as in network/IoT anomaly detection studies to validate the hybrid approach.

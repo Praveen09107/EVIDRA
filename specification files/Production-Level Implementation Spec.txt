@@ -1,0 +1,420 @@
+2) Production-Level Implementation Spec
+This is for the backend + infra side: how to build a system that can realistically be moved towards production and can satisfy forensic constraints.
+
+2.1 Architecture Overview
+2.1.1 High-Level System
+API Gateway / Edge: Accepts HTTP/WS, handles auth, routing.
+
+API Service: Implements REST API and WebSocket/SSE server.
+
+Orchestrator Service (Supervisor Agent):
+
+Implements “Supervisor pattern” for multi-agent orchestrations.
+
+Receives pipeline run requests, schedules agent tasks.
+
+Agent Workers:
+
+AutopsyAgentWorker,
+
+TODWorker,
+
+TimelineAnomalyWorker,
+
+CorrelationWorker,
+
+ClaimExtractorWorker,
+
+EvidenceClaimMapperWorker,
+
+HypothesisManagerWorker,
+
+BiasMonitorWorker,
+
+ReplayWorker,
+
+ImageWorker (YOLO/DETR).
+
+Data Services:
+
+Relational DB (Postgres) for cases, metadata, agent runs, audit logs.
+
+Object Storage (S3/GCS) for raw evidence (reports, videos, large logs).
+
+(Optional) Vector DB for semantic search on text.
+
+2.1.2 Coordination Pattern
+Use Supervisor (Orchestrator) pattern for predictable pipelines:
+
+Orchestrator receives PipelineRunRequest with caseId + agents list.
+
+It schedules tasks:
+
+Some sequential (Autopsy → TOD → Timeline → Correlation).
+
+Some in parallel (ClaimExtractor could run concurrently with others).
+
+Each agent worker:
+
+Has clear inputs/outputs.
+
+Communicates via message queue and DB.
+
+Principles:
+
+Decoupling: Agents shouldn’t call each other directly; they read inputs from DB and write outputs, orchestrator manages dependencies.
+
+Failure isolation: Each agent failure doesn’t crash the pipeline; orchestrator can retry or mark partial success.
+
+2.2 Data Model & Storage
+2.2.1 Forensic Evidence Handling
+Follow forensic best practices: never modify originals; use forensically sound copies, store chain of custody logs.
+
+EvidenceIngested table:
+
+id, caseId, type (autopsy, cctv, phone), path to raw object, hash, size.
+
+EvidenceCopy:
+
+Forensic image or read-only copy for analysis.
+
+Rules:
+
+Original evidence (files) are read-only, stored with cryptographic hash.
+
+All agent processing operates on copies or structured derivatives.
+
+All access is logged in AuditLog.
+
+2.2.2 Core Tables (sketch)
+cases (Case metadata).
+
+hypotheses (per-case hypothesis probabilities over time).
+
+agents (registry).
+
+agent_runs (one row per execution).
+
+pipeline_runs.
+
+timeline_events.
+
+timeline_buckets.
+
+hotspots.
+
+causal_nodes, causal_edges.
+
+tod_results.
+
+anomalies.
+
+explanations.
+
+reports.
+
+audit_logs.
+
+2.3 Agent Implementations
+2.3.1 General Agent Worker Contract
+Each Worker:
+
+Reads tasks from a queue or task table (e.g. agent_tasks).
+
+For each task:
+
+Loads necessary inputs (case + evidence + prior agent outputs).
+
+Calls underlying model(s).
+
+Writes back structured output (JSON) to DB.
+
+Updates agent_runs status and attaches summary.
+
+Agent runtime failure handling:
+
+Retry N times with backoff.
+
+If still failing, mark agent_run.status=ERROR, propagate to pipeline_run and send WebSocket event.
+
+2.3.2 Specific Agents
+AutopsyAgentWorker:
+
+Input: autopsy text.
+
+Model: II-Medical-32B-Preview.
+
+Output: structured autopsy JSON stored in autopsy_extractions.
+
+TODWorker:
+
+Input: autopsy extractions (rigor/livor info), environmental data (temperature history, clothing, etc.).
+
+Compute:
+
+Henssge baseline.
+
+RandomForest/GBM surrogate (trained offline on synthetic data).
+
+Monte Carlo sampling for uncertainty.
+
+Post-mortem sign consistency.
+
+Persist: tod_results row.
+
+TimelineAnomalyWorker:
+
+Input: digital events (phone pings, logs).
+
+Train/Load:
+
+Deep autoencoder for recon error.
+
+IsolationForest as baseline.
+
+Compute:
+
+Anomaly scores per window.
+
+Fused score.
+
+Persist: anomalies rows + update timeline_events with anomalyScore.
+
+CorrelationWorker:
+
+Input: TOD window, anomalies, events.
+
+Compute collision hotspots (joint probability).
+
+Persist: hotspots.
+
+ClaimExtractorWorker & EvidenceClaimMapperWorker:
+
+Use LLM to:
+
+Extract explicit claims from narrative sources.
+
+Map evidence items to claims as supports/contradictions.
+
+Persist: nodes/edges in causal_nodes, causal_edges.
+
+HypothesisManagerWorker:
+
+Input: graph + hotspots.
+
+Compute updated probability distribution over hypotheses.
+
+Persist: hypotheses.
+
+BiasMonitorWorker:
+
+Use LLM + heuristics to:
+
+Assess overconfidence.
+
+Flag inconsistent or bias-prone patterns (e.g. one piece of evidence shifting probability too much).
+
+Persist: explanations or bias_flags.
+
+ReplayWorker:
+
+Summarizes pipeline run into discrete steps with narrative.
+
+Persist: replay_steps.
+
+ImageWorker:
+
+Runs YOLOv8/DETR over key frames.
+
+Outputs detection tracks stored in cctv_entities and cctv_events.
+
+2.4 Real-Time & API Implementation
+2.4.1 REST API Best Practices
+Adhere to principles for efficient real-time REST:
+
+Filtering, pagination, and sparse fields to keep payloads light.
+
+updatedAt fields for each resource + ?since=timestamp queries for incremental updates.
+
+Use strict versioning: /api/v1 > /api/v2 for breaking changes.
+
+Idempotency for POSTs that trigger pipelines:
+
+Client can send idempotencyKey header.
+
+Backend stores keys in idempotent_requests.
+
+2.4.2 WebSocket Architecture
+Use WebSocket for:
+
+Pipeline progress updates (pipeline strip).
+
+Agent run notifications.
+
+New hotspots / anomalies.
+
+Possibly for live logs if you add debug mode.
+
+Server design:
+
+Single WS endpoint /ws.
+
+After connection:
+
+Authenticate token.
+
+Subscribe to channels:
+
+global,
+
+per-case (e.g. case:{id}).
+
+When backend updates agent_runs, pipeline_runs, hotspots, it publishes events to relevant channels.
+
+Follow WebSocket best practices for robust and scalable real-time systems: monitoring, backpressure, fallbacks.
+
+Client reconnection:
+
+Exponential backoff on disconnect.
+
+Resume subscription with last-known cursor or lastEventId.
+
+Fallbacks:
+
+If WS fails, fallback to:
+
+GET /cases/{id}/pipeline/status polling every X seconds.
+
+GET /cases/{id}/hotspots?since=lastFetch.
+
+2.5 Security, Privacy, Forensic Integrity
+Align with digital forensics standards and best practices.
+
+Key requirements:
+
+Evidence integrity:
+
+Use write blockers at ingestion (out of scope for app, but documented).
+
+Store hashes for all evidence and derivative data.
+
+Never modify original files; only read and produce new artifacts.
+
+Access control:
+
+RBAC: roles like Investigator, Admin, Viewer.
+
+Access checks at every API entrypoint.
+
+Encryption:
+
+TLS in transit.
+
+At rest for sensitive databases and evidence storage.
+
+Audit & chain of custody:
+
+audit_logs capturing:
+
+Who accessed/ran what, on which evidence, at what time.
+
+Include:
+
+pipeline runs, agent runs, report exports, config changes.
+
+Data minimization:
+
+Frontend only receives necessary fields (via sparse fieldsets).
+
+PII stripped as early as possible where appropriate to privacy laws (depending on environment).
+
+2.6 Reliability & Scaling
+Multi-agent reliability patterns:
+
+Supervisor pattern with:
+
+Retries per agent.
+
+Circuit breaker: if an agent repeatedly fails, mark it degraded and skip in subsequent runs until manual intervention.
+
+Decoupling: Agents communicate via queues and DB, not direct RPC.
+
+Scaling:
+
+Horizontal scale of:
+
+API servers (stateless).
+
+Orchestrator (1 active, 1 standby or use distributed scheduler).
+
+Agent workers (per type) based on queue depth.
+
+Use autoscaling triggers on message queue length and CPU usage.
+
+Monitoring & Alerting:
+
+Track:
+
+WebSocket connection counts, errors, latency.
+
+API latencies, error rates, throughput.
+
+Agent run durations and error rates.
+
+Alerts:
+
+Pipeline failures for critical cases.
+
+WS failure or high disconnect rates.
+
+DB performance issues.
+
+2.7 Testing Strategy
+Unit tests:
+
+For each agent worker: deterministic tests on known inputs.
+
+For orchestrator: pipeline run flows and failure scenarios.
+
+Integration/Scenario tests:
+
+End-to-end: ingest sample case → run full pipeline → assert that:
+
+TOD band is reasonable.
+
+At least one hotspot is produced.
+
+Hypotheses probabilities updated.
+
+Security tests:
+
+Basic penetration tests on API.
+
+Auth bypass attempts.
+
+Performance tests:
+
+Load tests with multiple simultaneous pipeline runs and WebSocket clients.
+
+2.8 Deployment & Environments
+Environments:
+
+Dev → Staging → Production.
+
+Infrastructure:
+
+Containerize services (Docker).
+
+Orchestrate via Kubernetes or similar.
+
+Use separate clusters/namespaces for staging vs production.
+
+Config Management:
+
+Externalize configuration (env vars / config service).
+
+Separate LLM and model endpoints per env.
+
+Secrets:
+
+Use secret manager for API keys, DB credentials.

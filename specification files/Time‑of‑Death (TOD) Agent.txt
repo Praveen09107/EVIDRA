@@ -1,0 +1,767 @@
+1. TOD Agent – Role and Responsibilities
+The TOD Agent’s job is to turn scattered medical and contextual signals into a probability distribution over time of death (TOD) plus a clearly explainable window and rationale. It is the “physics + ML + consistency” brain that bridges autopsy findings, environmental data, and case timeline.
+
+It:
+
+Implements a physics-based core (Henssge/Glaister family of models for cooling plus classic rigor/livor/decomposition heuristics).
+
+Uses ML surrogates (e.g. RF/GBM/NN) trained on synthetic or real PMI datasets to refine TOD within regimes where data supports it.
+
+Wraps both in a Bayesian/Monto Carlo uncertainty layer, yielding a posterior TOD band (e.g. 95% credible interval) rather than a single naive timestamp.
+
+Checks for consistency with other postmortem signs (rigor/livor/decomposition) and flags tensions.
+
+Downstream:
+
+The Timeline & Anomaly Agent uses TOD posterior as a temporal prior to focus anomaly windows.
+
+The Hotspot/Correlation Engine intersects TOD band with digital anomalies to find suspicious intervals.
+
+The Hypothesis Manager uses TOD vs known events (e.g. last seen alive, alibi times) to score homicide vs accident vs suicide hypotheses.
+
+2. Data Contracts
+2.1 Inputs
+The TOD Agent receives a single normalized request per case (or per scenario):
+
+ts
+TodRequest {
+  caseId: string;
+  mode: "PHYSICS_ONLY" | "HYBRID" | "SIGNS_CONSTRAINED";
+  autopsyExtraction: AutopsyExtractionMinimal;
+  sceneData: SceneData;
+  measurementSeries: TemperatureMeasurements[];
+  priorInfo?: TodPriorInfo;
+}
+2.1.1 AutopsyExtractionMinimal
+This is a compressed subset of the Autopsy Agent output:
+
+ts
+AutopsyExtractionMinimal {
+  postmortemSigns: {
+    rigorMortisStage?: "NONE" | "EARLY" | "FULL" | "RESOLVING";
+    livorMortisStage?: "NONE" | "EARLY" | "FIXED";
+    livorDistribution?: string;
+    algorMortisNotes?: string;
+    decompositionStage?: "NONE" | "EARLY" | "MODERATE" | "ADVANCED";
+  };
+  environmentFactors: {
+    indoorOutdoor?: "INDOOR" | "OUTDOOR";
+    surfaceType?: "GROUND" | "BED" | "WATER" | "OTHER";
+    covers?: "NONE" | "LIGHT" | "HEAVY";
+    immersion?: "NONE" | "PARTIAL" | "FULL";
+  };
+  bodyParams: {
+    estimatedWeightKg?: number;
+    clothingInsulationLevel?: "LIGHT" | "MEDIUM" | "HEAVY";
+  };
+  timelineMentions: {
+    lastSeenAlive?: string;       // ISO, if known
+    foundDead?: string;          // discovery time
+    lastKnownNormal?: string;    // optional
+  };
+}
+This mirrors classical PMI practice: body temperature / cooling, rigor, livor, decomposition, and context.
+
+2.1.2 SceneData
+ts
+SceneData {
+  ambientTemperatureSeries?: { time: string; tempC: number }[];
+  ambientTemperatureAtDiscovery?: number;   // °C
+  humidity?: number;                        // %
+  windSpeed?: number;                       // m/s
+  rainOrWetness?: boolean;
+  shade?: boolean;
+}
+Early temperature-based methods (Henssge, Glaister) rely heavily on ambient temp and body weight; modern approaches also bring in humidity, clothing, etc.
+
+2.1.3 TemperatureMeasurements
+ts
+TemperatureMeasurements {
+  time: string;         // measurement time (ISO)
+  bodySite: "RECTAL" | "LIVER" | "EAR" | "TYMPANIC";
+  tempC: number;
+}
+Multiple temperatures can be taken at different times or sites; Henssge is usually rectal in early PMI, but we support others.
+
+2.1.4 Priors
+ts
+TodPriorInfo {
+  priorWindow?: { start: string; end: string };   // e.g. last seen alive to found
+  priorMode?: "UNIFORM" | "GAUSSIAN" | "CUSTOM";
+  customDensity?: { time: string; weight: number }[];
+}
+This allows the agent to integrate external constraints (CCTV last seen, phone events) as priors.
+
+2.2 Outputs
+ts
+TodResult {
+  mode: "PHYSICS_ONLY" | "HYBRID" | "SIGNS_CONSTRAINED";
+  todPointEstimate: string;               // ISO time – posterior mean or median
+  todWindow95: { start: string; end: string };    // 95% credible interval
+  todWindow68?: { start: string; end: string };   // 68% interval (optional)
+  distributionSamples?: { time: string; weight: number }[]; // Monte Carlo histogram
+  componentContributions: TodComponentContribution[];
+  consistency: TodConsistency;
+  featureImportance: TodFeatureContribution[];
+  warnings: TodWarning[];
+  explanationNarrative: string[];
+}
+2.2.1 Components
+ts
+TodComponentContribution {
+  component: "HENSSGE_CORE" | "RIGOR_LIVOR_HEURISTICS" | "ML_SURROGATE" | "MICROBIOME" | "METABOLOMICS" | "PRIOR_TIMELINE";
+  weight: number;      // how much this component influenced posterior (0–1 conceptual)
+  description: string;
+}
+We keep the component set extensible; ML micro/macro markers (metabolome, microbiome) are for future versions.
+
+2.2.2 Consistency & Feature Importance
+ts
+TodConsistency {
+  rigor: "CONSISTENT" | "INCONSISTENT" | "INSUFFICIENT_DATA";
+  livor: "CONSISTENT" | "INCONSISTENT" | "INSUFFICIENT_DATA";
+  algor: "CONSISTENT" | "INCONSISTENT" | "INSUFFICIENT_DATA";
+  decomposition: "CONSISTENT" | "INCONSISTENT" | "INSUFFICIENT_DATA";
+  comments: string[];
+}
+
+TodFeatureContribution {
+  feature: string;               // e.g. "ambientTemp", "rigorStage", "rectalTempAtT1"
+  method: "MODEL_IMPORTANCE" | "SHAP" | "HEURISTIC";
+  contribution: number;          // magnitude
+  direction: "EARLIER" | "LATER" | "NEUTRAL";
+  description: string;
+}
+Consistency essentially checks classical PMI indicators against the estimated TOD band.
+
+3. Internal Architecture & Algorithms
+3.1 High-Level Design
+Internally, the TOD Agent is a hybrid estimator:
+
+Henssge Algor Core
+
+Applies temperature-based cooling models (Glaister/Henssge).
+
+Heuristic PMI Constraints
+
+Uses rigor, livor, decomposition to restrict plausible PMI ranges.
+
+ML Surrogate Model
+
+Random Forest / GBM / NN trained on PMI data to refine estimates.
+
+Bayesian Fusion + Monte Carlo
+
+Treats TOD as a random variable with prior (from timeline) and likelihood contributions from each component, then samples posterior via Monte Carlo.
+
+Explainability Layer
+
+Derives feature contributions and natural-language explanations.
+
+You can think of it as:
+
+“We approximate the posterior distribution 
+p
+(
+T
+O
+D
+∣
+d
+a
+t
+a
+)
+p(TOD∣data) by combining physics, heuristics, and ML as separate likelihood factors, then use Monte Carlo sampling to propagate uncertainty from model parameters, measurement noise, and priors.”
+
+3.2 Component 1: Henssge / Glaister Core
+3.2.1 Background
+Henssge nomogram is the standard in early PMI (< 10–20 hours) using rectal temperature, body weight, ambient temperature, and a correction factor for clothing/environment.
+
+Glaister-type equations use approximate cooling rate (1–1.5 °C per hour) as a simple rule, but they’re less precise.
+
+We implement a numeric version of the nomogram instead of a graphical one.
+
+3.2.2 Model
+We maintain a function:
+
+ts
+function henssgeEstimate(
+  tempRectal: number,
+  tempAmbient: number,
+  weightKg: number,
+  correctionFactor: number
+): { meanHours: number; lower95: number; upper95: number }
+correctionFactor encodes clothing, environment, etc., as in Henssge’s tables.
+
+For multiple measurements, we can:
+
+Use earliest measurement as primary, later ones as checks.
+
+Or fit a simple cooling curve through them.
+
+If ambient temperature changed (e.g. body moved to cooling), we can implement extended back-calculation models described in later work that handle ambient temp shifts.
+
+We also attach uncertainty ranges roughly matching Henssge’s tolerance limits (e.g. ±3.2 h in early intervals).
+
+3.3 Component 2: Heuristic Signs (Rigor, Livor, Decomposition)
+Forensic practice often uses coarse rules:
+
+Warm + flaccid → < 3 h.
+
+Warm + stiff → 3–8 h.
+
+Cold + stiff → 8–36 h.
+
+Cold + flaccid → > 36 h.
+
+Similarly, livor and decomposition stages map to broad PMI bands.
+
+We encode these as soft constraints:
+
+From rigorMortisStage, derive a PMI range:
+
+EARLY → say 2–8 h with a fuzzy distribution.
+
+FULL → 8–36 h with wide tails.
+
+From livorMortisStage, similar banding.
+
+From decompositionStage, later PMIs (> 24 h, > days).
+
+We treat each as a likelihood over PMI:
+
+L
+rigor
+(
+t
+)
+∝
+exp
+⁡
+(
+−
+(
+t
+−
+μ
+r
+)
+2
+2
+σ
+r
+2
+)
+L 
+rigor
+​
+ (t)∝exp(− 
+2σ 
+r
+2
+​
+ 
+(t−μ 
+r
+​
+ ) 
+2
+ 
+​
+ ), truncated to plausible ranges.
+
+Same for livor and decomposition, parameterized from literature and expert rules.
+
+These are coarse but help constrain extremes and check physics consistency.
+
+3.4 Component 3: ML Surrogate Model
+3.4.1 Motivation
+Recent work shows ML models (RF, GBM, neural networks) can achieve significantly lower PMI estimation error (e.g. MAE ~ 3–5 h or better in controlled datasets) by using richer feature sets (environment, microbiome, metabolomics).
+
+We use a surrogate model trained offline on:
+
+Physics-based synthetic data (simulate cooling under many conditions).
+
+Real autopsy/PMI datasets if available (e.g., with temperature, signs, and ground-truth TOD).
+
+Optionally microbiome/metabolomic data later.
+
+3.4.2 Features
+Baseline feature vector:
+
+ts
+TodFeatures {
+  tempRectalAtDiscovery?: number;
+  deltaTempBodyAmbient?: number;
+  numTempMeasurements?: number;
+  rigorStageOrdinal?: number;       // e.g. NONE=0, EARLY=1, FULL=2, RESOLVING=3
+  livorStageOrdinal?: number;
+  decompositionOrdinal?: number;
+  ambientTempAtDiscovery?: number;
+  weightKg?: number;
+  clothingOrdinal?: number;
+  indoorOutdoor?: number;
+  humidity?: number;
+  windSpeed?: number;
+  timeSinceLastSeenToDiscovery?: number;  // hours, if known
+  // optional: microbiome/metabolome summary indices
+}
+3.4.3 Model Choice
+For early prototypes: Random Forest Regressor (robust, interpretable feature importances).
+
+Optionally gradient boosting or neural nets for more complex relationships.
+
+The model predicts:
+
+PMI
+^
+PMI
+^
+  (hours since death at measurement time).
+
+Uncertainty, either:
+
+From ensemble variance (RF).
+
+Or approximated via quantile regression / dropout.
+
+We then convert PMI to TOD:
+
+T
+O
+D
+ML
+=
+t
+discovery
+−
+PMI
+^
+TOD 
+ML
+​
+ =t 
+discovery
+​
+ − 
+PMI
+^
+ .
+
+Where 
+t
+discovery
+t 
+discovery
+​
+  is either known or approximated from foundDead.
+
+3.5 Component 4: Bayesian Fusion & Monte Carlo
+We treat TOD as a random variable 
+T
+T and define:
+
+Prior 
+p
+(
+T
+)
+p(T): often uniform between lastSeenAlive and foundDead, or broader if unknown.
+
+Likelihoods:
+
+L
+physics
+(
+T
+)
+L 
+physics
+​
+ (T) from Henssge cooling model.
+
+L
+rigor
+(
+T
+)
+,
+L
+livor
+(
+T
+)
+,
+L
+decomp
+(
+T
+)
+L 
+rigor
+​
+ (T),L 
+livor
+​
+ (T),L 
+decomp
+​
+ (T) from heuristic bands.
+
+L
+ML
+(
+T
+)
+L 
+ML
+​
+ (T) from ML PMI estimate and its error model.
+
+Then:
+
+p
+(
+T
+∣
+data
+)
+∝
+p
+(
+T
+)
+⋅
+L
+physics
+(
+T
+)
+⋅
+L
+rigor
+(
+T
+)
+⋅
+L
+livor
+(
+T
+)
+⋅
+L
+decomp
+(
+T
+)
+⋅
+L
+ML
+(
+T
+)
+.
+p(T∣data)∝p(T)⋅L 
+physics
+​
+ (T)⋅L 
+rigor
+​
+ (T)⋅L 
+livor
+​
+ (T)⋅L 
+decomp
+​
+ (T)⋅L 
+ML
+​
+ (T).
+We approximate this posterior using Monte Carlo sampling:
+
+Define a continuous time range (e.g. a 72–96 h window around discovery).
+
+For each sample:
+
+Sample candidate TOD from prior.
+
+Apply random perturbations to model parameters (e.g. Henssge correction factor, measurement noise, ML model error) according to their uncertainty distributions.
+
+Compute combined log-likelihood.
+
+Accept/reweight accordingly (importance sampling or MCMC).
+
+From the ensemble of accepted TOD values:
+
+Compute median or mean (point estimate).
+
+Compute 95% and 68% intervals (quantiles).
+
+Estimate feature contribution metrics (using importance weights and/or SHAP on ML part).
+
+Monte Carlo is standard for uncertainty propagation: it provides not just a best estimate, but a principled confidence band and “how uncertain is our uncertainty” if we track MC convergence.
+
+3.6 Component 5: Explainability & Diagnostics
+We expose:
+
+Component contributions: how much the physics core vs ML vs signs vs priors moved the posterior center and narrowed/widened the band.
+
+Feature contributions from ML (using standard RF feature importances or SHAP-like methods).
+
+Consistency flags:
+
+If physics core says 4 h but rigor/decomposition suggests > 24 h → mark INCONSISTENT and widen band, with a narrative comment.
+
+This aligns with recommendations for explainable forensic AI: decisions must be justifiable with transparent reasoning and uncertainty.
+
+4. Modes of Operation
+4.1 PHYSICS_ONLY
+Use only cooling + basic signs.
+
+Use narrow prior between last seen and discovery if known, else broad.
+
+Disable or downweight ML likelihood.
+
+Output is similar to classical Henssge with quantified uncertainty.
+
+4.2 HYBRID
+All components active: physics core + ML surrogate + signs + priors.
+
+Typically default mode.
+
+ML often reduces MAE compared to classical methods, especially outside early PMI or with complex environments.
+
+4.3 SIGNS_CONSTRAINED
+For cases with no temperature data (no thermometer), but good rigor/livor/decomposition descriptions.
+
+Use signs-based likelihoods + priors only.
+
+Physics/ML disabled or extremely downweighted.
+
+5. Internal Workflow (Step-by-Step)
+5.1 End-to-End TOD Agent Run
+Task Start
+
+Orchestrator enqueues TodTask(caseId, mode).
+
+TOD worker picks it up, loads AutopsyExtractionMinimal, SceneData, TemperatureMeasurements, and TodPriorInfo from DB.
+
+Pre-checks
+
+Validate at least one information source is present:
+
+Temperature, or signs, or metabolomics/microbiome (future).
+
+If nothing, return warnings with “INSUFFICIENT_DATA” and skip heavy modeling.
+
+Feature Construction
+
+Extract features for physics core:
+
+tempRectalAtDiscovery, weight, ambientTempAtDiscovery, clothing correction.
+
+Extract heuristic signs:
+
+Rigor/livor/decomp ordinals.
+
+Build ML feature vector.
+
+Physics Core Estimate
+
+Run henssgeEstimate (or Glaister fallback if minimal info) for early PMI.
+
+Obtain mean PMI and 95% bounds.
+
+Heuristic PMI Bands
+
+Convert rigor/livor/decomp to soft PMI distributions.
+
+Save as likelihood functions.
+
+ML Surrogate Estimate (if HYBRID)
+
+Feed ML features into RF/GBM/NN model.
+
+Get PMI mean + error estimates.
+
+Construct Prior
+
+If last seen alive & discovery times known:
+
+Prior uniform over that range (or mild tapering near edges).
+
+Else default broader prior (e.g. 0–72 h before discovery).
+
+Monte Carlo Fusion
+
+For M samples (e.g. 5k–20k):
+
+Sample candidate TOD from prior.
+
+Randomize model parameters (ambient temp error, Henssge correction factor, ML residual).
+
+Compute log-likelihood from each component.
+
+Aggregate to estimate posterior:
+
+Weighted histogram of TOD.
+
+Extract quantiles and summary stats.
+
+Consistency & XAI
+
+Compare TOD band to:
+
+Signs-based PMI.
+
+Physics PMI.
+
+Build TodConsistency and TodFeatureContribution.
+
+Generate explanationNarrative using an LLM, based on numeric summary and features.
+
+Persist & Events
+
+Store TodResult in DB.
+
+Create AgentRun row with status DONE.
+
+Emit WebSocket event tod_updated / timeline_updated so UI can update TOD band.
+
+6. Example Scenario Walkthrough
+Case Setup
+Discovery: 2026-05-09 14:00.
+
+Rectal temperature at discovery: 30.0 °C.
+
+Ambient temp: 18.0 °C (stable indoors).
+
+Body weight: 70 kg.
+
+Clothing: medium.
+
+Rigor: FULL.
+
+Livor: EARLY.
+
+Decomposition: NONE.
+
+Last seen alive: 2026-05-09 01:00 at home.
+
+6.1 Physics Estimate
+Apply Henssge-like model:
+
+Body cooled from 37 to 30 °C → 7 °C drop.
+
+Given ambient 18 °C, weight 70 kg, clothing medium, Henssge suggests PMI around maybe 9–12 h (ballpark; exact result from numeric solver).
+
+So physics core gives:
+
+PMI_physics_mean ≈ 10 h.
+
+95% interval ≈ [6.8, 13.2] h (similar width to ±3.2 h references).
+
+Translate to TOD:
+
+TOD_physics_mean ≈ discovery (14:00) − 10 h = 04:00.
+
+Interval ≈ [00:48, 07:12].
+
+6.2 Heuristic Signs
+Rigor FULL → PMI likely 8–36 h with broad distribution.
+
+Livor EARLY → PMI maybe 2–12 h.
+
+Decomp NONE → less than ~24–48 h.
+
+Combined signs band: roughly 4–24 h before discovery, with peak around 10–14 h.
+
+That is broadly consistent with physics estimate.
+
+6.3 ML Surrogate
+Features:
+
+Rectal temp = 30.
+
+Ambient = 18.
+
+Rigor = FULL (2 or 3).
+
+Livor = EARLY.
+
+Decomp = NONE.
+
+Weight = 70.
+
+ClothingMedium, Indoor.
+
+Delta lastSeen–discovery ≈ 13 h.
+
+Model (trained offline) returns:
+
+PMI_ml_mean ≈ 11 h.
+
+With predicted MAE ~ 4–5 h, consistent with studies showing RF/NN methods can reduce PMI error to ~4.5 h or so in their setting.
+
+So TOD_ml ≈ 03:00.
+
+6.4 Fusion
+Prior: uniform between last seen (01:00) and discovery (14:00), maybe with small tails beyond if configured.
+
+Combining:
+
+Physics suggests around 04:00.
+
+ML suggests around 03:00.
+
+Signs allow a broad 4–24 h band but favor 10–14 h PMI, i.e. TOD 00:00–04:00.
+
+Monte Carlo posterior ends up with:
+
+Median TOD ≈ 03:30.
+
+95% range ≈ [23:30 day−1, 07:00 same day] or similar.
+
+Consistency:
+
+Rigor, livor, decomposition all “CONSISTENT”.
+
+Some residual uncertainty due to limited measurements.
+
+Explanation narrative (LLM-generated from numeric summary):
+
+“The estimated time of death is most likely between about 23:30 and 07:00, with a central estimate around 03:30. The body temperature at discovery, ambient conditions, and body weight are compatible with approximately 9–12 hours of cooling. This aligns with fully developed rigor mortis and early livor mortis without decomposition, which typically occur in the first 8–24 hours postmortem. Machine learning models trained on similar cases support a PMI around 10–12 hours given these features.”
+
+7. Failure Modes and Safeguards
+No temperature data: TOD Agent falls back to SIGNS_CONSTRAINED mode and returns coarse intervals based mainly on rigor/livor/decomp + priors, with big uncertainty and warnings.
+
+Extreme conditions: If ambient temperature series shows cooling or heating episodes (e.g. body kept in cooling chamber), physics module uses extended models that account for ambient changes, as in literature.
+
+Contradiction between components:
+
+If physics says PMI < 6 h but decomposition suggests several days, we:
+
+Mark consistency fields as INCONSISTENT.
+
+Inflation of uncertainty on posterior (widen intervals).
+
+Raise high-severity warning so investigator knows TOD is unreliable without expert review.
+
+8. Implementation Notes
+Language: Python backend with:
+
+Numpy/Scipy for numeric Henssge solver.
+
+Scikit-learn/XGBoost for RF/GBM.
+
+Configuration: All model parameters (correction factors, sign bands, priors) stored in config tables, not hard-coded.
+
+Versioning: tod_model_version, henßge_params_version stored with each run for audit.
+
+Testability:
+
+Unit tests on synthetic scenarios.
+
+Regression tests vs known cases where TOD is documented.

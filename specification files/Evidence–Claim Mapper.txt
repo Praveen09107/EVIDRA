@@ -1,0 +1,412 @@
+The Evidence–Claim Mapper is the bridge between structured claims and structured evidence. It answers: “Does this piece of evidence support, contradict, or say nothing about this claim, and why?”
+
+Below is an implementation‑grade spec: purpose, data contracts, internal modules, algorithms (NLI/fact‑checking style), and an example.
+
+1. Purpose and Role
+1.1 What it does
+Given:
+
+A set of structured Claim objects (from Claim Extractor).
+
+A set of structured Evidence objects (autopsy findings, TOD results, collision events, anomalies, textual snippets, etc.).
+
+The Evidence–Claim Mapper:
+
+For each (claim, evidence) pair that is potentially related, decides whether the evidence:
+
+SUPPORTS the claim,
+
+CONTRADICTS / REFUTES the claim, or
+
+is NOT_ENOUGH_INFO / IRRELEVANT.
+
+Produces:
+
+A stance label,
+
+A confidence score,
+
+A rationale/explanation (e.g., which parts of the evidence justify the label),
+
+An attribution score (how important this evidence is for that claim).
+
+This is essentially a claim verification / stance classification task, which is widely modeled as Natural Language Inference (NLI) or fact‑checking in recent research.
+
+1.2 Why it matters
+The Argument Graph Builder needs SUPPORT/CONTRADICT edges between evidence nodes and claim nodes.
+
+The Hypothesis Manager needs to know which claims are backed by strong evidence vs undermined.
+
+The Gap & Logic Auditor needs to see where strong claims lack supporting evidence or face contradictions.
+
+For forensic/legal admissibility, we need transparent mapping with explanations, similar to ClaimVer/MEVER style human‑centric verification frameworks.
+
+2. Data Contracts
+2.1 Inputs
+At API level:
+
+ts
+EvidenceClaimMappingRequest {
+  caseId: string;
+  claims: Claim[];            // from Claim Extractor
+  evidences: EvidenceItem[];  // multi-modal evidence objects
+}
+We already defined Claim earlier. Here is a generic EvidenceItem wrapper:
+
+ts
+EvidenceItem {
+  id: string;
+  caseId: string;
+  kind: "AUTOPSY" | "TOD" | "COLLISION" | "ANOMALY" | "TIMELINE_EVENT" |
+        "TEXT_SNIPPET" | "GRAPH_NODE" | "OTHER";
+
+  // Human-readable summary for NLI:
+  summaryText: string;
+
+  // Optional structured payload:
+  payload?: Record<string, any>;
+
+  // Links back to original data:
+  sourceRefs?: DataReference[];
+}
+For a CollisionEvent, summaryText might be:
+“Between 01:47 and 01:50, CCTV shows victim and suspect A together in Stairwell 2; phone data places both devices near the building.”
+
+For a TOD result:
+“Time of death is estimated between 23:30 and 07:00, centered at 03:30.”
+
+For an anomaly/hotspot:
+“There is a high anomaly window between 01:40 and 04:00: unusual phone activity and movement to an unfamiliar location followed by a digital silence.”
+
+2.2 Outputs
+Core mapping result:
+
+ts
+EvidenceClaimMappingResult {
+  caseId: string;
+  mappings: EvidenceClaimLink[];
+}
+ts
+EvidenceClaimLink {
+  id: string;
+  caseId: string;
+  claimId: string;
+  evidenceId: string;
+
+  label: "SUPPORTS" | "REFUTES" | "NOT_ENOUGH_INFO" | "IRRELEVANT";
+  confidence: number;           // 0–1
+
+  // optional finer stance labels from extended taxonomy
+  labelFine?: "PARTIAL_SUPPORT" | "PARTIAL_REFUTE" | "INDIRECT_SUPPORT" | "INDIRECT_REFUTE";
+
+  explanation: string;          // human-friendly reason
+  highlightedClaimSpans?: Span[];
+  highlightedEvidenceSpans?: Span[];
+
+  attributionScore?: number;    // relative importance of this evidence for this claim (0–1)
+}
+ts
+Span {
+  startChar: number;
+  endChar: number;
+}
+Stance labels match common fact‑checking/NLI setups (SUPPORTS/REFUTES/NOT_ENOUGH_INFO), which are known to work well in claim verification pipelines.
+
+3. Internal Architecture
+High‑level:
+
+text
+Claims + EvidenceItems
+    ↓
+Candidate Pair Generator (filtering)
+    ↓
+Representation Builder (text + structured context)
+    ↓
+NLI / Verification Engine (stance classification)
+    ↓
+Attribution & Explanation Layer
+    ↓
+Post-processing & Calibration
+    ↓
+EvidenceClaimLinks
+This mirrors claim verification pipelines: evidence retrieval/filter → NLI stance classification → explanation/attribution.
+
+3.1 Candidate Pair Generator
+We must avoid O(|claims|×|evidence|) brute force. Instead, generate likely relevant pairs.
+
+Semantic & structural filtering
+
+For each claim:
+
+Use:
+
+Entity overlaps (same person, location, device).
+
+Time overlap (claim time vs evidence time window).
+
+Type matching:
+
+Claims about location/time → evidence with location/time (Collision, Timeline, TOD).
+
+Claims about cause/manner → autopsy/TOD/hypothesis.
+
+Textual similarity (for text evidence)
+
+For text snippets, use embedding similarity or BM25 retrieval to find top‑k evidence texts for each claim, similar to evidence retrieval in fact‑checking pipelines.
+
+Hard constraints
+
+Do not pair claims about suspect A with evidence only about suspect B unless there is an explicit linking entity.
+
+Output: a set of (claimId, evidenceId) candidate pairs.
+
+3.2 Representation Builder
+For each candidate pair, we must build inputs suitable for NLI/verification models.
+
+Canonical NLI framing:
+
+Premise: evidence summary.
+
+Hypothesis: claim (normalizedText).
+
+NLI then classifies entailment / contradiction / neutral.
+
+We augment this with structured context:
+
+Entities, times, locations, roles.
+
+Source type and reliability (e.g., autopsy vs witness vs digital).
+
+We can encode this as:
+
+text
+Premise: [EVIDENCE_KIND=Collision] Between 01:47 and 01:50, CCTV cameras
+in Stairwell 2 show both the victim and suspect A. Phone location data
+for both devices also places them near the building at this time.
+
+Hypothesis: [CLAIM] Suspect A was at home all night.
+Plus an auxiliary structured input channel (e.g., as JSON via tools) to help the model reason about time intervals, etc., if we use an LLM with tool‑calling.
+
+3.3 NLI / Verification Engine
+3.3.1 Model formulation
+We treat mapping as an NLI / stance classification problem:
+
+Input: (Premise = evidence, Hypothesis = claim).
+
+Output: one of:
+
+ENTAILMENT → SUPPORTS
+
+CONTRADICTION → REFUTES
+
+NEUTRAL → NOT_ENOUGH_INFO/IRRELEVANT
+
+This is the standard mapping used in many NLI/verification systems.
+
+Options:
+
+Base models:
+
+Fine‑tuned transformer NLI models (e.g., RoBERTa‑large, DeBERTa) adapted to forensic/legal text.
+
+LLMs in few‑shot mode for complex/multi‑sentence reasoning.
+
+Training data:
+
+Generic NLI corpora (SNLI/MNLI).
+
+FEVER/AVeriTeC/claim verification benchmarks (SUPPORT/REFUTE/NEI).
+
+Legal NLI datasets (e.g. where support/refute/unrelated labels are applied to legal claims vs statutes).
+
+Domain‑specific synthetic examples for forensic contexts (e.g., location/time contradictions).
+
+Work in legal NLI shows that transferring NLI models to legal domains (support/refute/unrelated) is feasible and effective for validating legal claims against statutory text or evidence.
+
+3.3.2 Extended label set
+Research in explainable fact‑checking often extends the basic 3 labels into partial categories (e.g., partial support/contradiction, indirect evidence).
+
+We can optionally adopt:
+
+PARTIAL_SUPPORT: evidence supports part but not all of the claim.
+
+PARTIAL_REFUTE: evidence contradicts some aspect but not entire claim.
+
+INDIRECT_SUPPORT/REFUTE: evidence suggests plausibility but not directly.
+
+These fine labels are optional but useful for explanation and graph weighting.
+
+3.4 Attribution & Explanation Layer
+Explainable claim‑level verification frameworks (e.g. ClaimVer, MEVER) add evidence attribution and natural‑language explanations on top of raw stance labels.
+
+We mirror that:
+
+Token/Span attribution
+
+Use attention or gradient‑based methods to identify which evidence tokens most contributed to the stance (or use LLM rationale as a proxy).
+
+Map those to highlightedEvidenceSpans & highlightedClaimSpans so the UI can visually show “this phrase supports/contradicts this part of the claim.”
+
+Natural‑language explanation
+
+Prompt an LLM with:
+
+Claim, evidence, raw stance label, and highlighted spans.
+
+Ask for a 1–3 sentence explanation:
+
+“The evidence states that CCTV and phone records place suspect A at the industrial building between 01:40 and 02:00, while the claim asserts they were at home all night. These locations are mutually exclusive, so the evidence contradicts the claim.”
+
+ClaimVer and similar systems show that such human‑centric explanations significantly improve user trust and usability.
+
+Attribution score
+
+For each evidence–claim link, compute an attribution score indicating how strongly this evidence should influence the claim’s status.
+
+Could derive from:
+
+Model’s confidence,
+
+Number of corroborating evidence items,
+
+Evidence source reliability (autopsy > digital > witness for some contexts).
+
+These concepts mirror evidence‑level & claim‑level attribution used in recent explainable fact‑checking work.
+
+3.5 Post‑processing & Calibration
+Given known issues:
+
+NLI models may mis‑classify subtle contradictions as neutral or support, and vice versa.
+
+Legal NLI models often confuse unrelated vs support/refute when domain shifts.
+
+We implement:
+
+Label smoothing & thresholds
+
+Only treat REFUTES as strong contradiction if confidence > threshold and there is no conflicting supporting evidence.
+
+For borderline probabilities, consider mapping to NOT_ENOUGH_INFO.
+
+Consistency checks across multiple evidence pieces
+
+For a given claim:
+
+Aggregate evidence‑level labels into a claim‑level decision, similar to “evidence‑level vs claim‑level verifier” split in claim verification pipelines.
+
+E.g., multiple low‑confidence supports vs one strong refute.
+
+Uncertainty flags
+
+If evidence is conflicting (some support, some refute) or all low confidence, mark label as “uncertain” for use by Bias & Uncertainty Monitor.
+
+4. Multi‑modal and Structured Evidence Handling
+Many evidence items are not pure text: TOD distributions, collision objects, anomaly scores. We handle these by:
+
+Textual summarization layer
+
+For each structured evidence type, define deterministic or LLM‑based summarizers that produce summaryText capturing the key semantics relevant for claims:
+
+TOD: “Death likely between X and Y.”
+
+Collision: “Victim and suspect at same location/time.”
+
+Anomaly/hotspot: “Unusual phone and movement behavior in this window.”
+
+Auxiliary features
+
+Time intervals, region IDs, distance metrics are passed as structured inputs.
+
+An LLM‑based verifier can use these directly via tools; a small structured feature vector can feed a hybrid neural verifier.
+
+This matches recent multi‑modal claim verification approaches like MEVER and MultiCaption, which combine textual and non‑textual evidence via graph‑based fusion or multi‑modal encoders.
+
+5. Example Walkthrough
+Take the earlier claim:
+
+Claim C: “Suspect A was at home all night.”
+
+And two evidence items:
+
+E1 (Collision): “Between 01:47 and 01:50, CCTV cameras in Stairwell 2 show both the victim and suspect A; phone records place their devices near the industrial building at this time.”
+
+E2 (Phone pattern): “Phone records for suspect A show no activity between 00:00 and 06:00.”
+
+5.1 Candidate generation
+Entity: both claim and E1/E2 mention suspect A.
+
+Time: E1 is in 01:47–01:50, which is within “all night” (implied 00:00–06:00).
+→ (C,E1) and (C,E2) are candidate pairs.
+
+5.2 Representation and NLI
+Pair 1: (C,E1)
+
+Premise: E1 summary.
+
+Hypothesis: “Suspect A was at home all night.”
+
+NLI model:
+
+Recognizes E1 places suspect at the building, not home, at 01:47–01:50.
+
+Output: CONTRADICTION with high confidence.
+
+→ label=REFUTES, high confidence.
+
+Pair 2: (C,E2)
+
+Premise: “Phone records show no activity between 00:00–06:00.”
+
+Hypothesis: “Suspect A was at home all night.”
+
+Phone silence does not entail being at home; could be anywhere.
+Model should classify: NEUTRAL (NOT_ENOUGH_INFO) or at best weak support.
+
+→ label=NOT_ENOUGH_INFO or PARTIAL_SUPPORT with low confidence.
+
+5.3 Explanations
+For E1:
+
+Highlight claim phrase “at home all night”.
+
+Highlight evidence phrases “at the industrial building” and the time 01:47–01:50.
+
+Explanation: “The evidence places suspect A at the industrial building during the night, which contradicts the claim that they were at home the entire time.”
+
+For E2:
+
+Explanation: “The evidence shows phone inactivity, which does not necessarily imply that suspect A was at home. It is therefore insufficient to support or refute the claim.”
+
+5.4 Downstream effects
+Argument Graph:
+
+Node Claim C gets a strong REFUTED edge from E1, a weak/neutral edge from E2.
+
+Hypothesis Manager:
+
+If “suspect A not at crime scene” was important for an accident hypothesis, this contradiction reduces its probability.
+
+Gap Auditor:
+
+Might suggest collecting additional independent evidence (e.g., additional CCTV or witnesses) to further confirm/refute the alibi.
+
+6. Implementation Notes
+Model stack
+
+Start with a fine‑tuned NLI transformer; optionally integrate LLM for difficult multi‑sentence/multi‑modal cases.
+
+Use claim verification data (FEVER, AVeriTeC, domain‑specific datasets) for SUPP/REFUTE/NEI training and calibration.
+
+Consider frameworks like ClaimVer/MEVER as design references for combining retrieval, verification, and explanation.
+
+Legal/forensic adaptation
+
+Incorporate legal NLI datasets for domain adaptation of “support/refute/unrelated” semantics.
+
+Evaluation
+
+Precision/recall for REFUTES is especially critical—misclassifying contradictions as support or neutral is dangerous, as noted in scientific and legal NLI evaluations.
+
+XAI alignment
+
+Provide token‑level highlighting and textual rationales, similar to ClaimVer’s human‑centric explanations.

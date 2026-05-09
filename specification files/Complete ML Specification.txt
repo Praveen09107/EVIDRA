@@ -1,0 +1,1460 @@
+AIVENTRA — Complete ML Specification
+ML-01: TOD Agent — Henssge Physics Model
+1.1 Model Architecture
+The TOD Agent uses a three-layer hybrid estimator:
+
+text
+Layer 1: Henssge Physics Core  →  PMI_physics (mean + 95% CI)
+Layer 2: Heuristic Sign Bands  →  PMI_signs   (soft likelihood)
+Layer 3: ML Surrogate (RF)     →  PMI_ml      (point + variance)
+              ↓
+       Bayesian Fusion + Monte Carlo
+              ↓
+       Posterior TOD Distribution
+1.2 Henssge Numeric Solver
+python
+import numpy as np
+from scipy.optimize import brentq
+from dataclasses import dataclass
+
+@dataclass
+class HenssgeResult:
+    mean_hours: float
+    lower_95:   float
+    upper_95:   float
+    method:     str = "HENSSGE"
+
+def henssge_estimate(
+    temp_rectal:       float,   # °C at measurement
+    temp_ambient:      float,   # °C (stable)
+    weight_kg:         float,
+    correction_factor: float = 1.0,
+    measurement_delay: float = 0.0   # hours after discovery
+) -> HenssgeResult:
+    """
+    Numeric implementation of Henssge nomogram.
+    Reference: Henssge C. (1988) Death time estimation in case work.
+    Tolerance limits: ±2.8h for early PMI, widens beyond 10h.
+    """
+    if temp_rectal >= 37.2:
+        raise ValueError("Rectal temp >= normal — cooling not started")
+    if temp_rectal <= temp_ambient:
+        raise ValueError("Body temp at or below ambient — PMI > 24h, model unreliable")
+
+    # Normalized temperature:
+    T_norm = (temp_rectal - temp_ambient) / (37.2 - temp_ambient)
+
+    # Henssge weight-corrected cooling constant B:
+    # B = 1.2815 * (Cf * weight)^(-0.625) + 0.0284
+    Cf_weight = correction_factor * weight_kg
+    B = 1.2815 * (Cf_weight ** -0.625) + 0.0284
+
+    # Cooling equation: T_norm = 1.25 * exp(-B*t) - 0.25 * exp(-5*B*t)
+    def cooling_eq(t):
+        return 1.25 * np.exp(-B * t) - 0.25 * np.exp(-5 * B * t) - T_norm
+
+    # Solve for t (PMI in hours):
+    try:
+        t_mean = brentq(cooling_eq, 0.01, 100.0)
+    except ValueError:
+        t_mean = None
+
+    if t_mean is None:
+        raise ValueError("No convergence in Henssge solver")
+
+    # Tolerance limits from Henssge 1988 Table 3:
+    # ±2.8h for 0–10h, ±4.8h for 10–20h, ±7.4h for >20h
+    if t_mean <= 10:
+        tolerance = 2.8
+    elif t_mean <= 20:
+        tolerance = 4.8
+    else:
+        tolerance = 7.4
+
+    # Adjust for measurement delay:
+    t_adjusted = t_mean + measurement_delay
+
+    return HenssgeResult(
+        mean_hours = round(t_adjusted, 2),
+        lower_95   = round(max(0, t_adjusted - tolerance), 2),
+        upper_95   = round(t_adjusted + tolerance, 2)
+    )
+1.3 Heuristic Sign Likelihoods
+Each postmortem sign maps to a Gaussian-truncated likelihood over PMI:
+
+python
+from scipy.stats import norm, truncnorm
+
+SIGN_DISTRIBUTIONS = {
+    "rigor": {
+        "NONE":      {"mu": 1.5,  "sigma": 1.5,  "lower": 0,   "upper": 4},
+        "EARLY":     {"mu": 5.0,  "sigma": 3.0,  "lower": 2,   "upper": 10},
+        "FULL":      {"mu": 18.0, "sigma": 8.0,  "lower": 8,   "upper": 36},
+        "RESOLVING": {"mu": 48.0, "sigma": 12.0, "lower": 30,  "upper": 96}
+    },
+    "livor": {
+        "NONE":      {"mu": 1.0,  "sigma": 1.0,  "lower": 0,   "upper": 3},
+        "EARLY":     {"mu": 4.0,  "sigma": 2.0,  "lower": 1,   "upper": 8},
+        "FIXED":     {"mu": 20.0, "sigma": 8.0,  "lower": 12,  "upper": 60}
+    },
+    "decomposition": {
+        "NONE":      {"mu": 24.0, "sigma": 12.0, "lower": 0,   "upper": 60},
+        "EARLY":     {"mu": 72.0, "sigma": 24.0, "lower": 36,  "upper": 168},
+        "MODERATE":  {"mu": 168.0,"sigma": 48.0, "lower": 96,  "upper": 360},
+        "ADVANCED":  {"mu": 336.0,"sigma": 96.0, "lower": 168, "upper": 720}
+    }
+}
+
+def sign_likelihood(pmi_h: float, sign_type: str, stage: str) -> float:
+    dist  = SIGN_DISTRIBUTIONS[sign_type][stage]
+    a     = (dist["lower"] - dist["mu"]) / dist["sigma"]
+    b     = (dist["upper"] - dist["mu"]) / dist["sigma"]
+    rv    = truncnorm(a, b, loc=dist["mu"], scale=dist["sigma"])
+    return rv.pdf(pmi_h)
+1.4 ML Surrogate — Random Forest PMI Estimator
+Feature Vector
+python
+@dataclass
+class TodMLFeatures:
+    # Temperature features
+    temp_rectal_at_discovery:    float         # °C
+    delta_temp_body_ambient:     float         # body - ambient
+    ambient_temp:                float         # °C
+    
+    # Signs (ordinal encoded)
+    rigor_stage:                 int           # 0=NONE, 1=EARLY, 2=FULL, 3=RESOLVING
+    livor_stage:                 int           # 0=NONE, 1=EARLY, 2=FIXED
+    decomp_stage:                int           # 0=NONE, 1=EARLY, 2=MODERATE, 3=ADVANCED
+    
+    # Body/environment
+    weight_kg:                   float
+    clothing_level:              int           # 0=NONE, 1=LIGHT, 2=MEDIUM, 3=HEAVY
+    indoor_outdoor:              int           # 0=OUTDOOR, 1=INDOOR
+    humidity_pct:                float         # 0-100
+    wind_speed_ms:               float
+    
+    # Timeline
+    hours_last_seen_to_discovery: float        # if known, else -1
+    
+    # Derived
+    cooling_rate_approx:         float         # delta_temp / hours_since_discovery_est
+Training Strategy
+python
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import StandardScaler
+import joblib
+
+class TodMLModel:
+    """
+    Ensemble of RF + GBM for robust PMI prediction.
+    Trained on:
+      1. Synthetic data from Henssge physics simulation
+         (10,000 cases × 50 environmental parameter combinations)
+      2. Augmented with published PMI case data from literature
+    """
+
+    def __init__(self):
+        self.rf = RandomForestRegressor(
+            n_estimators=500,
+            max_depth=12,
+            min_samples_leaf=5,
+            n_jobs=-1,
+            random_state=42
+        )
+        self.gbm = GradientBoostingRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            random_state=42
+        )
+        self.scaler = StandardScaler()
+        self.ensemble_weights = [0.55, 0.45]  # RF, GBM
+
+    def predict_with_uncertainty(self, features: np.ndarray) -> dict:
+        X_scaled = self.scaler.transform(features.reshape(1, -1))
+        
+        # RF prediction + variance from tree ensemble:
+        rf_preds = np.array([
+            tree.predict(X_scaled)[0]
+            for tree in self.rf.estimators_
+        ])
+        rf_mean = rf_preds.mean()
+        rf_std  = rf_preds.std()
+        
+        # GBM point prediction:
+        gbm_pred = self.gbm.predict(X_scaled)[0]
+        
+        # Ensemble:
+        ensemble_mean = (self.ensemble_weights[0] * rf_mean +
+                         self.ensemble_weights[1] * gbm_pred)
+        
+        return {
+            "pmi_hours_mean": round(ensemble_mean, 2),
+            "pmi_hours_std":  round(rf_std, 2),
+            "pmi_95_lower":   round(ensemble_mean - 1.96 * rf_std, 2),
+            "pmi_95_upper":   round(ensemble_mean + 1.96 * rf_std, 2),
+            "rf_mean":        round(rf_mean, 2),
+            "gbm_mean":       round(gbm_pred, 2)
+        }
+    
+    def feature_importance(self, feature_names: list) -> dict:
+        importances = self.rf.feature_importances_
+        return dict(sorted(
+            zip(feature_names, importances),
+            key=lambda x: x[1], reverse=True
+        ))
+Synthetic Training Data Generation
+python
+def generate_synthetic_pmi_dataset(n_cases: int = 10_000) -> pd.DataFrame:
+    """
+    Simulate PMI ground truth under varied conditions
+    using the Henssge physics model as the data-generating process.
+    """
+    np.random.seed(42)
+    records = []
+
+    for _ in range(n_cases):
+        # Sample environmental parameters:
+        weight       = np.random.uniform(45, 110)
+        ambient      = np.random.uniform(10, 35)
+        clothing     = np.random.choice([0, 1, 2, 3])
+        indoor       = np.random.choice([0, 1])
+        true_pmi     = np.random.uniform(0.5, 72)  # hours
+
+        # Correction factor by clothing:
+        cf_map = {0: 0.75, 1: 1.0, 2: 1.4, 3: 2.0}
+        cf     = cf_map[clothing]
+
+        # Simulate rectal temp via inverse Henssge:
+        B = 1.2815 * (cf * weight) ** -0.625 + 0.0284
+        T_norm = (1.25 * np.exp(-B * true_pmi)
+                  - 0.25 * np.exp(-5 * B * true_pmi))
+        rectal = ambient + T_norm * (37.2 - ambient)
+        rectal += np.random.normal(0, 0.3)   # measurement noise
+
+        # Derive signs from PMI:
+        rigor = (0 if true_pmi < 2 else
+                 1 if true_pmi < 8 else
+                 2 if true_pmi < 36 else 3)
+        livor = (0 if true_pmi < 2 else
+                 1 if true_pmi < 12 else 2)
+        decomp = (0 if true_pmi < 48 else
+                  1 if true_pmi < 96 else
+                  2 if true_pmi < 240 else 3)
+
+        # Add sign noise (misclassification probability):
+        rigor += np.random.choice([-1, 0, 0, 0, 1])
+        rigor  = np.clip(rigor, 0, 3)
+
+        records.append({
+            "temp_rectal":        rectal,
+            "temp_ambient":       ambient,
+            "delta_temp":         rectal - ambient,
+            "weight_kg":          weight,
+            "clothing":           clothing,
+            "indoor":             indoor,
+            "rigor":              rigor,
+            "livor":              livor,
+            "decomp":             decomp,
+            "true_pmi_hours":     true_pmi
+        })
+
+    return pd.DataFrame(records)
+1.5 Bayesian Monte Carlo Fusion
+python
+def tod_monte_carlo_posterior(
+    physics_result:  HenssgeResult,
+    ml_result:       dict,
+    signs_data:      dict,   # {"rigor": "FULL", "livor": "FIXED", "decomp": "NONE"}
+    discovery_time:  datetime,
+    prior_start:     datetime,    # last seen alive
+    prior_end:       datetime,    # discovery time
+    n_samples:       int = 20_000
+) -> dict:
+    """
+    Monte Carlo Bayesian fusion of all PMI evidence.
+    Returns posterior TOD distribution.
+    """
+    # Candidate TOD grid (minutes resolution):
+    prior_range_h = (prior_end - prior_start).total_seconds() / 3600
+    # Extend slightly beyond prior bounds:
+    t_grid = np.linspace(0, prior_range_h + 6, n_samples)
+
+    log_weights = np.zeros(n_samples)
+
+    # 1. Physics likelihood (Gaussian on PMI):
+    physics_sigma = (physics_result.upper_95 - physics_result.lower_95) / (2 * 1.96)
+    log_weights  += norm.logpdf(t_grid, physics_result.mean_hours, physics_sigma)
+
+    # 2. ML likelihood:
+    ml_sigma      = ml_result["pmi_hours_std"]
+    log_weights  += 0.7 * norm.logpdf(t_grid, ml_result["pmi_hours_mean"], ml_sigma)
+
+    # 3. Sign likelihoods:
+    for sign_type, stage in signs_data.items():
+        if stage:
+            liks = np.array([sign_likelihood(t, sign_type, stage) for t in t_grid])
+            liks = np.clip(liks, 1e-12, None)
+            log_weights += np.log(liks)
+
+    # 4. Prior (uniform within last_seen → discovery, near-zero outside):
+    prior_mask = t_grid <= prior_range_h
+    log_weights[~prior_mask] -= 5.0   # soft penalty, not hard cut
+
+    # Normalize to probability:
+    weights     = np.exp(log_weights - log_weights.max())
+    weights    /= weights.sum()
+
+    # Compute posterior TOD timestamps:
+    tod_samples = [discovery_time - timedelta(hours=float(t)) for t in t_grid]
+
+    # Summary stats:
+    mean_idx    = int(np.average(np.arange(n_samples), weights=weights))
+    cum_weights = np.cumsum(weights)
+    lower_idx   = np.searchsorted(cum_weights, 0.025)
+    upper_idx   = np.searchsorted(cum_weights, 0.975)
+    ci68_lower  = np.searchsorted(cum_weights, 0.16)
+    ci68_upper  = np.searchsorted(cum_weights, 0.84)
+
+    return {
+        "tod_median":      tod_samples[mean_idx].isoformat(),
+        "tod_95_lower":    tod_samples[lower_idx].isoformat(),
+        "tod_95_upper":    tod_samples[upper_idx].isoformat(),
+        "tod_68_lower":    tod_samples[ci68_lower].isoformat(),
+        "tod_68_upper":    tod_samples[ci68_upper].isoformat(),
+        "posterior_weights": weights.tolist(),
+        "n_samples":       n_samples
+    }
+ML-02: Autopsy NLP Pipeline
+2.1 Architecture Overview
+text
+Raw Text (OCR output / native PDF)
+        ↓
+   Text Cleaning & Section Segmentation
+        ↓
+   NER Model (Custom BERT-NER)         → entities: injuries, toxins, measurements
+        ↓
+   Relation Extraction (RE)            → "caused by", "consistent with", "excludes"
+        ↓
+   LLM Structured Extraction (GPT-4o)  → fills AutopsyExtraction schema
+        ↓
+   Schema Validation (Pydantic)        → type checks, confidence scoring
+        ↓
+   Manner Classifier (Logistic + LLM)  → HOMICIDE / SUICIDE / ACCIDENT / NATURAL
+2.2 Text Segmentation
+python
+AUTOPSY_SECTIONS = [
+    "EXTERNAL_EXAMINATION",
+    "INTERNAL_EXAMINATION",
+    "CAUSE_OF_DEATH",
+    "MANNER_OF_DEATH",
+    "TOXICOLOGY",
+    "HISTOLOGY",
+    "OPINION",
+    "POSTMORTEM_SIGNS"
+]
+
+SECTION_PATTERNS = {
+    "CAUSE_OF_DEATH":    r"cause\s+of\s+death|cause\s*:",
+    "MANNER_OF_DEATH":   r"manner\s+of\s+death|manner\s*:",
+    "EXTERNAL_EXAMINATION": r"external\s+exam|external\s+findings",
+    "POSTMORTEM_SIGNS":  r"postmortem\s+changes|rigor|lividity|decomp",
+    "TOXICOLOGY":        r"toxicol|drug\s+screen|blood\s+alcohol",
+    "OPINION":           r"opinion|summary|conclusion"
+}
+
+def segment_autopsy_text(raw_text: str) -> dict[str, str]:
+    lines    = raw_text.split("\n")
+    sections = {}
+    current  = "PREAMBLE"
+    buffer   = []
+
+    for line in lines:
+        matched = False
+        for section, pattern in SECTION_PATTERNS.items():
+            if re.search(pattern, line, re.IGNORECASE):
+                sections[current] = "\n".join(buffer)
+                current  = section
+                buffer   = [line]
+                matched  = True
+                break
+        if not matched:
+            buffer.append(line)
+
+    sections[current] = "\n".join(buffer)
+    return sections
+2.3 Custom NER — Entity Types
+python
+FORENSIC_ENTITIES = {
+    # Injury entities
+    "INJURY_TYPE":     ["laceration", "contusion", "fracture", "haematoma",
+                        "abrasion", "incised wound", "stab wound", "burn"],
+    "INJURY_LOCATION": ["occipital", "temporal", "frontal", "thorax",
+                        "abdomen", "neck", "wrist", "posterior"],
+    
+    # Cause/manner language
+    "CAUSE_PHRASE":    ["consistent with", "indicative of", "caused by",
+                        "due to", "secondary to", "as a result of"],
+    "MANNER_TERM":     ["homicide", "suicide", "accidental", "natural",
+                        "undetermined", "blunt force", "sharp force",
+                        "asphyxia", "drowning", "poisoning"],
+    
+    # Measurements
+    "MEASUREMENT":     ["cm", "mm", "grams", "ml", "mg/dl", "BAC"],
+    "TEMPERATURE":     ["degrees", "°C", "rectal temperature"],
+    
+    # Postmortem signs
+    "PMI_SIGN":        ["rigor mortis", "ligor mortis", "lividity",
+                        "livor mortis", "decomposition", "putrefaction",
+                        "adipocere", "mummification"]
+}
+2.4 LLM Structured Extraction Prompt
+python
+AUTOPSY_EXTRACTION_PROMPT = """
+You are a forensic pathology data extraction system.
+Extract structured data from the autopsy report section below.
+Return ONLY valid JSON matching the schema. Do not invent data.
+If a field cannot be determined from the text, use null.
+
+SCHEMA:
+{
+  "cause_chain": {
+    "1a": "<immediate cause>",
+    "1b": "<underlying cause>",
+    "1c": "<further underlying>",
+    "2":  "<other contributing conditions>"
+  },
+  "manner_of_death": "<HOMICIDE|SUICIDE|ACCIDENT|NATURAL|UNDETERMINED>",
+  "manner_confidence": <0.0-1.0>,
+  "mechanism_of_death": "<e.g. subdural haematoma, asphyxiation>",
+  "wound_descriptions": [
+    {
+      "type": "<laceration|contusion|fracture|etc>",
+      "location": "<body region>",
+      "dimensions_cm": "<if stated>",
+      "direction": "<if stated>",
+      "tool_consistent_with": "<if inferable>"
+    }
+  ],
+  "postmortem_signs": {
+    "rigor_mortis_stage": "<NONE|EARLY|FULL|RESOLVING>",
+    "livor_mortis_stage": "<NONE|EARLY|FIXED>",
+    "livor_distribution": "<description>",
+    "decomposition_stage": "<NONE|EARLY|MODERATE|ADVANCED>",
+    "algor_mortis_notes": "<temperature findings>"
+  },
+  "toxicology": {
+    "available": <true|false>,
+    "findings": "<summary if available>",
+    "alcohol_bac": <float|null>,
+    "drugs_detected": ["<substance>"]
+  },
+  "pathology_warnings": ["<any critical flags>"],
+  "body_params": {
+    "estimated_weight_kg": <float|null>,
+    "estimated_height_cm": <float|null>,
+    "clothing_description": "<brief>"
+  },
+  "temperature_findings": {
+    "rectal_temp_c": <float|null>,
+    "ambient_temp_c": <float|null>,
+    "measurement_time": "<ISO if stated>"
+  }
+}
+
+AUTOPSY TEXT:
+{text}
+"""
+
+async def extract_autopsy_structured(sections: dict) -> dict:
+    combined = "\n\n".join([
+        f"### {k}\n{v}"
+        for k, v in sections.items()
+        if v.strip()
+    ])
+
+    response = await openai_client.chat.completions.create(
+        model       = "gpt-4o",
+        temperature = 0.05,   # near-deterministic for extraction
+        messages    = [
+            {"role": "system",
+             "content": "You are a forensic pathology data extraction engine. "
+                        "Return only valid JSON. Never hallucinate findings."},
+            {"role": "user",
+             "content": AUTOPSY_EXTRACTION_PROMPT.format(text=combined)}
+        ],
+        response_format = {"type": "json_object"}
+    )
+
+    raw_json = json.loads(response.choices[0].message.content)
+    
+    # Validate with Pydantic:
+    return AutopsyExtraction(**raw_json).model_dump()
+2.5 Manner Classifier (Rule-Enhanced Logistic)
+python
+class MannerClassifier:
+    """
+    Two-stage: rule-based confidence boost + logistic regression fallback.
+    LLM extraction provides the primary label; this validates/overrides.
+    """
+
+    HIGH_CONFIDENCE_RULES = {
+        "HOMICIDE": [
+            "defensive wound",
+            "multiple blunt force",
+            "ligature mark",
+            "stab wound posterior",
+            "body moved post mortem"
+        ],
+        "SUICIDE": [
+            "hesitation wound",
+            "self-inflicted",
+            "gunshot wound contact range intraoral"
+        ],
+        "NATURAL": [
+            "coronary artery disease",
+            "myocardial infarction",
+            "natural disease process"
+        ]
+    }
+
+    def classify(self, text: str, llm_manner: str,
+                 llm_confidence: float) -> tuple[str, float]:
+        text_lower = text.lower()
+        rule_scores = {m: 0 for m in ["HOMICIDE", "SUICIDE", "ACCIDENT",
+                                       "NATURAL", "UNDETERMINED"]}
+
+        for manner, keywords in self.HIGH_CONFIDENCE_RULES.items():
+            for kw in keywords:
+                if kw in text_lower:
+                    rule_scores[manner] += 0.15
+
+        best_rule_manner = max(rule_scores, key=rule_scores.get)
+        best_rule_score  = rule_scores[best_rule_manner]
+
+        if best_rule_score >= 0.30 and best_rule_manner == llm_manner:
+            # Rule + LLM agree → high confidence:
+            return llm_manner, min(0.97, llm_confidence + best_rule_score)
+        elif best_rule_score >= 0.30 and best_rule_manner != llm_manner:
+            # Disagreement → flag warning, use rule with lower confidence:
+            return best_rule_manner, 0.65
+        else:
+            # Default to LLM:
+            return llm_manner, llm_confidence
+ML-03: CDR Analyzer ML Pipeline
+3.1 Communication Pattern Baseline Model
+python
+class CdrBaselineModel:
+    """
+    Builds a per-MSISDN behavioral baseline from 30-day history.
+    Used for anomaly scoring and silence detection.
+    """
+
+    def compute_baseline(self, events: list[CdrEvent]) -> dict:
+        df = pd.DataFrame([e.__dict__ for e in events])
+        df["hour"]     = pd.to_datetime(df["event_timestamp"]).dt.hour
+        df["weekday"]  = pd.to_datetime(df["event_timestamp"]).dt.weekday
+        df["date"]     = pd.to_datetime(df["event_timestamp"]).dt.date
+
+        baseline = {
+            # Frequency stats:
+            "daily_call_count_mean":    df.groupby("date").size().mean(),
+            "daily_call_count_std":     df.groupby("date").size().std(),
+            "daily_sms_count_mean":     df[df["event_type"]
+                                           .str.contains("SMS")].groupby("date").size().mean(),
+            
+            # Temporal patterns:
+            "hourly_dist":              df.groupby("hour").size().to_dict(),
+            "active_hours":             df["hour"].unique().tolist(),
+            "typical_silent_hours":     self._find_silent_hours(df),
+            
+            # Contact patterns:
+            "top_contacts":             df["counterparty_msisdn"].value_counts().head(10).to_dict(),
+            "unique_contacts_per_day":  df.groupby("date")["counterparty_msisdn"]
+                                          .nunique().mean(),
+            
+            # Location patterns:
+            "primary_towers":           df["cell_tower_id"].value_counts().head(5).index.tolist(),
+            "tower_entropy":            self._tower_entropy(df)
+        }
+        return baseline
+
+    def _find_silent_hours(self, df: pd.DataFrame) -> list[int]:
+        hour_counts = df.groupby("hour").size()
+        all_hours   = set(range(24))
+        active      = set(hour_counts[hour_counts > 0].index)
+        return sorted(all_hours - active)
+
+    def _tower_entropy(self, df: pd.DataFrame) -> float:
+        tower_probs = df["cell_tower_id"].value_counts(normalize=True)
+        return float(-(tower_probs * np.log2(tower_probs + 1e-10)).sum())
+3.2 Silence Window Anomaly Scorer
+python
+def score_silence_window(
+    silence_start:   datetime,
+    silence_end:     datetime,
+    baseline:        dict,
+    tod_window:      dict | None = None
+) -> dict:
+    """
+    Scores a communication silence period for anomalousness.
+    Uses Z-score relative to historical silence distribution.
+    """
+    duration_h = (silence_end - silence_start).total_seconds() / 3600
+
+    # Historical maximum silence from baseline:
+    typical_max_silence = 24 - len(baseline["active_hours"])
+
+    # Z-score:
+    if baseline["daily_call_count_std"] > 0:
+        z_score = (duration_h - typical_max_silence) / max(2.0, typical_max_silence)
+    else:
+        z_score = 2.0   # conservative
+
+    # Penalty if silence overlaps TOD window:
+    tod_overlap = False
+    if tod_window:
+        s = datetime.fromisoformat(tod_window["start"])
+        e = datetime.fromisoformat(tod_window["end"])
+        tod_overlap = not (silence_end < s or silence_start > e)
+
+    # Compute anomaly score [0,1]:
+    base_score  = min(1.0, z_score / 5.0)
+    final_score = min(1.0, base_score + (0.2 if tod_overlap else 0.0))
+
+    severity = (
+        "HIGH"   if final_score >= 0.75 else
+        "MEDIUM" if final_score >= 0.50 else
+        "LOW"
+    )
+
+    return {
+        "silence_duration_h":  round(duration_h, 2),
+        "z_score":             round(z_score, 3),
+        "anomaly_score":       round(final_score, 3),
+        "tod_overlap":         tod_overlap,
+        "severity":            severity
+    }
+3.3 Contact Escalation Detector
+python
+def detect_contact_escalation(
+    events:   list[CdrEvent],
+    baseline: dict,
+    lookback_days: int = 30,
+    alert_window_hours: int = 72
+) -> list[dict]:
+    """
+    Detects statistically significant pre-death call escalation
+    with specific contacts. Key signal for identifying persons of interest.
+    """
+    df            = pd.DataFrame([e.__dict__ for e in events])
+    df["ts"]      = pd.to_datetime(df["event_timestamp"])
+    most_recent   = df["ts"].max()
+    alert_start   = most_recent - timedelta(hours=alert_window_hours)
+    baseline_start= most_recent - timedelta(days=lookback_days)
+
+    escalations = []
+
+    for contact, top_count in baseline["top_contacts"].items():
+        # Baseline rate:
+        baseline_df   = df[(df["counterparty_msisdn"] == contact) &
+                           (df["ts"] >= baseline_start) &
+                           (df["ts"] < alert_start)]
+        alert_df      = df[(df["counterparty_msisdn"] == contact) &
+                           (df["ts"] >= alert_start)]
+
+        if len(baseline_df) == 0:
+            continue
+
+        baseline_rate = len(baseline_df) / (lookback_days - alert_window_hours / 24)
+        alert_rate    = len(alert_df) / (alert_window_hours / 24)
+
+        if baseline_rate > 0:
+            escalation_ratio = alert_rate / baseline_rate
+        else:
+            escalation_ratio = len(alert_df)
+
+        if escalation_ratio >= 2.5 and len(alert_df) >= 3:
+            escalations.append({
+                "contact_msisdn":    contact,
+                "baseline_rate_day": round(baseline_rate, 2),
+                "alert_rate_day":    round(alert_rate, 2),
+                "escalation_ratio":  round(escalation_ratio, 2),
+                "alert_window_calls": len(alert_df),
+                "severity":          "HIGH" if escalation_ratio >= 4 else "MEDIUM"
+            })
+
+    return sorted(escalations, key=lambda x: x["escalation_ratio"], reverse=True)
+3.4 Tower Proximity Analyzer
+python
+from math import radians, sin, cos, sqrt, atan2
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    R  = 6371
+    d  = (radians(lat2 - lat1), radians(lon2 - lon1))
+    a  = (sin(d[0]/2)**2 +
+          cos(radians(lat1)) * cos(radians(lat2)) * sin(d[1]/2)**2)
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+def analyze_contact_proximity(
+    victim_events:  list[CdrEvent],
+    contact_events: list[CdrEvent],
+    tod_window:     dict,
+    victim_address: tuple[float, float]  # lat, lon
+) -> dict:
+    """
+    For each contact, determine if they were geographically proximate
+    to the victim during the TOD window.
+    """
+    tod_start = datetime.fromisoformat(tod_window["start"])
+    tod_end   = datetime.fromisoformat(tod_window["end"])
+
+    # Victim's tower during TOD window:
+    victim_tod_events = [
+        e for e in victim_events
+        if tod_start <= e.event_timestamp <= tod_end
+        and e.tower_latitude is not None
+    ]
+
+    # Contact's last known tower before/during TOD:
+    contact_tod = sorted(
+        [e for e in contact_events
+         if e.event_timestamp <= tod_end + timedelta(hours=2)
+         and e.tower_latitude is not None],
+        key=lambda x: x.event_timestamp
+    )
+
+    if not contact_tod:
+        return {"proximate": False, "reason": "No tower data for contact in window"}
+
+    contact_last = contact_tod[-1]
+    dist_km      = haversine_km(
+        victim_address[0], victim_address[1],
+        contact_last.tower_latitude, contact_last.tower_longitude
+    )
+
+    # Typical GSM tower radius: 0.5–3km urban
+    TOWER_RADIUS_KM = 1.5
+
+    return {
+        "proximate":          dist_km <= (TOWER_RADIUS_KM * 2),
+        "distance_km":        round(dist_km, 2),
+        "contact_tower_time": contact_last.event_timestamp.isoformat(),
+        "contact_tower_id":   contact_last.cell_tower_id,
+        "severity":           "HIGH" if dist_km <= TOWER_RADIUS_KM else
+                              "MEDIUM" if dist_km <= 3 else "LOW"
+    }
+ML-04: Financial Analyzer ML Pipeline
+4.1 Transaction Anomaly Detection — Isolation Forest + BiLSTM Autoencoder
+python
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+
+class FinancialAnomalyDetector:
+    """
+    Two-stage detection:
+      Stage 1: Isolation Forest for point anomalies (single outlier txn)
+      Stage 2: BiLSTM Autoencoder for sequence anomalies (pattern shifts)
+    """
+
+    def __init__(self):
+        self.iso_forest = IsolationForest(
+            n_estimators=200,
+            contamination=0.05,
+            random_state=42
+        )
+        self.scaler = StandardScaler()
+
+    def extract_txn_features(self, txn: dict,
+                              baseline: dict) -> np.ndarray:
+        """
+        Feature vector for a single transaction.
+        """
+        amount           = txn["amount"]
+        baseline_mean    = baseline["monthly_mean_amount"]
+        baseline_std     = max(baseline["monthly_std_amount"], 1.0)
+        hour             = pd.to_datetime(txn["timestamp"]).hour
+        is_weekend       = pd.to_datetime(txn["timestamp"]).weekday() >= 5
+        is_cash          = 1 if "cash" in txn.get("narration","").lower() else 0
+        amount_zscore    = (amount - baseline_mean) / baseline_std
+        is_round_number  = 1 if amount % 1000 == 0 else 0
+
+        return np.array([
+            amount,
+            amount_zscore,
+            np.log1p(amount),
+            hour,
+            int(is_weekend),
+            is_cash,
+            is_round_number,
+            txn.get("balance_after", 0) / max(baseline_mean * 30, 1),
+        ])
+
+    def fit_and_score(self, transactions: list[dict],
+                      baseline: dict) -> list[dict]:
+        if len(transactions) < 5:
+            return []
+
+        features = np.array([
+            self.extract_txn_features(t, baseline)
+            for t in transactions
+        ])
+        features_scaled = self.scaler.fit_transform(features)
+
+        # Isolation Forest scores (lower = more anomalous):
+        self.iso_forest.fit(features_scaled)
+        scores   = self.iso_forest.score_samples(features_scaled)
+        preds    = self.iso_forest.predict(features_scaled)  # -1=anomaly
+
+        results = []
+        for i, txn in enumerate(transactions):
+            # Convert IF score to anomaly probability [0,1]:
+            anomaly_prob = 1 - (scores[i] - scores.min()) / (
+                scores.max() - scores.min() + 1e-10
+            )
+            if preds[i] == -1 or anomaly_prob > 0.65:
+                results.append({
+                    "txn_timestamp":    txn["timestamp"],
+                    "amount":           txn["amount"],
+                    "narration":        txn.get("narration", ""),
+                    "anomaly_score":    round(float(anomaly_prob), 3),
+                    "isolation_score":  round(float(scores[i]), 4),
+                    "severity":         ("HIGH"   if anomaly_prob > 0.85 else
+                                         "MEDIUM" if anomaly_prob > 0.65 else "LOW"),
+                    "features":         features[i].tolist()
+                })
+
+        return sorted(results, key=lambda x: x["anomaly_score"], reverse=True)
+4.2 BiLSTM Autoencoder (Sequence Anomaly)
+python
+class BiLSTMAutoencoder(nn.Module):
+    """
+    Detects anomalous spending pattern sequences.
+    Reconstruction error > threshold → pattern shift anomaly.
+    Trained on normal transaction sequences (30-day windows).
+    """
+
+    def __init__(self, input_size: int = 8, hidden_size: int = 32,
+                 seq_len: int = 14):
+        super().__init__()
+        self.seq_len = seq_len
+
+        # Encoder:
+        self.encoder = nn.LSTM(
+            input_size, hidden_size,
+            num_layers=2, batch_first=True,
+            bidirectional=True, dropout=0.2
+        )
+        self.encoder_fc = nn.Linear(hidden_size * 2, hidden_size)
+
+        # Decoder:
+        self.decoder = nn.LSTM(
+            hidden_size, hidden_size,
+            num_layers=2, batch_first=True, dropout=0.2
+        )
+        self.decoder_fc = nn.Linear(hidden_size, input_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, input_size)
+        enc_out, (h, c) = self.encoder(x)
+        # Take last forward + backward states:
+        latent           = self.encoder_fc(enc_out[:, -1, :])
+        latent_seq       = latent.unsqueeze(1).repeat(1, self.seq_len, 1)
+        dec_out, _       = self.decoder(latent_seq)
+        reconstruction   = self.decoder_fc(dec_out)
+        return reconstruction
+
+    def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
+        recon = self.forward(x)
+        return torch.mean((x - recon) ** 2, dim=(1, 2))
+
+# Anomaly scoring:
+def score_txn_sequence(model: BiLSTMAutoencoder,
+                       sequence: np.ndarray,
+                       threshold: float = 0.045) -> dict:
+    x     = torch.tensor(sequence, dtype=torch.float32).unsqueeze(0)
+    error = model.reconstruction_error(x).item()
+    return {
+        "reconstruction_error": round(error, 5),
+        "threshold":            threshold,
+        "is_anomalous":         error > threshold,
+        "anomaly_score":        round(min(1.0, error / threshold), 3)
+    }
+4.3 Financial Motive Scorer
+python
+MOTIVE_PATTERNS = {
+    "LARGE_CASH_WITHDRAWAL": {
+        "description": "Unusually large cash withdrawal before death",
+        "weight":       0.25,
+        "detector":     lambda txn, bl: (
+            txn["is_cash"] and
+            txn["amount"] > bl["monthly_mean_amount"] * 3
+        )
+    },
+    "REPEATED_CASH_ESCALATION": {
+        "description": "Multiple cash withdrawals escalating over 72h",
+        "weight":       0.30,
+        "detector":     None   # handled by sequence model
+    },
+    "LARGE_TRANSFER_TO_UNKNOWN": {
+        "description": "Transfer to previously unseen counterparty",
+        "weight":       0.20,
+        "detector":     lambda txn, bl: (
+            txn["counterparty_id"] not in bl["known_counterparties"] and
+            txn["amount"] > bl["monthly_mean_amount"] * 2
+        )
+    },
+    "INSURANCE_POLICY_ACTIVITY": {
+        "description": "Insurance payment or policy change near death",
+        "weight":       0.35,
+        "detector":     lambda txn, bl: any(
+            kw in txn.get("narration","").lower()
+            for kw in ["insurance", "lic", "policy", "premium"]
+        )
+    },
+    "DEBT_REPAYMENT_SPIKE": {
+        "description": "Sudden large debt repayment — possible coerced payment",
+        "weight":       0.20,
+        "detector":     lambda txn, bl: (
+            "emi" in txn.get("narration","").lower() or
+            "loan" in txn.get("narration","").lower()
+        ) and txn["amount"] > bl["monthly_mean_amount"] * 1.5
+    }
+}
+
+def score_financial_motive(
+    transactions: list[dict],
+    baseline:     dict,
+    tod_window:   dict
+) -> dict:
+    motive_flags  = []
+    total_weight  = 0.0
+
+    for txn in transactions:
+        txn_time = datetime.fromisoformat(txn["timestamp"])
+        tod_start = datetime.fromisoformat(tod_window["start"])
+
+        # Only score transactions within 72h before death:
+        if not (tod_start - timedelta(hours=72) <= txn_time <= tod_start):
+            continue
+
+        for pattern_id, pattern in MOTIVE_PATTERNS.items():
+            if pattern["detector"] and pattern["detector"](txn, baseline):
+                motive_flags.append({
+                    "pattern":     pattern_id,
+                    "description": pattern["description"],
+                    "amount":      txn["amount"],
+                    "timestamp":   txn["timestamp"],
+                    "weight":      pattern["weight"]
+                })
+                total_weight += pattern["weight"]
+
+    motive_score = min(1.0, total_weight)
+
+    return {
+        "motive_score":   round(motive_score, 3),
+        "motive_flags":   motive_flags,
+        "severity":       ("HIGH"   if motive_score >= 0.50 else
+                           "MEDIUM" if motive_score >= 0.25 else "LOW")
+    }
+ML-05: Timeline Anomaly Detection (LSTM Autoencoder)
+5.1 Multi-Modal Time Series Fusion
+python
+class UnifiedTimelineFusion:
+    """
+    Fuses CDR events, financial events, and TOD posterior into
+    a single unified discrete event series for anomaly detection.
+    """
+
+    RESOLUTION_MINUTES = 15  # 15-min bins
+
+    def build_feature_matrix(
+        self,
+        cdr_events:  list[CdrEvent],
+        fin_events:  list[FinEvent],
+        tod_window:  dict,
+        window_days: int = 7
+    ) -> np.ndarray:
+        """
+        Returns: (T, F) matrix where T = time bins, F = features.
+        Features per bin:
+          0: call_count
+          1: sms_count
+          2: data_sessions
+          3: unique_contacts
+          4: financial_txn_count
+          5: financial_amount_norm
+          6: tod_probability (from posterior)
+          7: silence_indicator (1 if no activity in bin)
+        """
+        end_time   = max(
+            max(e.event_timestamp for e in cdr_events),
+            max(e.timestamp for e in fin_events)
+        )
+        start_time = end_time - timedelta(days=window_days)
+        n_bins     = int((end_time - start_time).total_seconds()
+                         / (self.RESOLUTION_MINUTES * 60))
+
+        matrix = np.zeros((n_bins, 8))
+
+        def bin_idx(ts: datetime) -> int:
+            delta  = (ts - start_time).total_seconds()
+            return int(delta / (self.RESOLUTION_MINUTES * 60))
+
+        # Populate CDR features:
+        for e in cdr_events:
+            idx = bin_idx(e.event_timestamp)
+            if 0 <= idx < n_bins:
+                if "SMS" in e.event_type:
+                    matrix[idx, 1] += 1
+                elif "DATA" in e.event_type:
+                    matrix[idx, 2] += 1
+                else:
+                    matrix[idx, 0] += 1
+                matrix[idx, 3] += 1   # unique contacts (over-counted, normalize later)
+
+        # Populate financial features:
+        max_amount = max((e.amount for e in fin_events), default=1)
+        for e in fin_events:
+            idx = bin_idx(e.timestamp)
+            if 0 <= idx < n_bins:
+                matrix[idx, 4] += 1
+                matrix[idx, 5] += e.amount / max_amount
+
+        # Silence indicator:
+        matrix[:, 7] = (matrix[:, :4].sum(axis=1) == 0).astype(float)
+
+        # Normalize counts:
+        for col in [0, 1, 2, 3, 4]:
+            max_val = matrix[:, col].max()
+            if max_val > 0:
+                matrix[:, col] /= max_val
+
+        return matrix
+5.2 LSTM Autoencoder for Timeline Anomaly
+python
+class TimelineLSTMAutoencoder(nn.Module):
+    """
+    Trained on normal daily activity patterns.
+    Anomaly = high reconstruction error over a window.
+    Architecture follows federated LSTM AE literature
+    for privacy-preserving sequence anomaly detection.
+    Reference: Federated LSTM autoencoders (2025), ScienceDirect.
+    """
+
+    def __init__(self, n_features: int = 8,
+                 hidden_dim: int = 64, latent_dim: int = 16):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.LSTM(n_features, hidden_dim, batch_first=True,
+                    bidirectional=True),
+        )
+        self.enc_fc    = nn.Linear(hidden_dim * 2, latent_dim)
+        self.dec_lstm  = nn.LSTM(latent_dim, hidden_dim,
+                                  batch_first=True)
+        self.dec_fc    = nn.Linear(hidden_dim, n_features)
+
+    def forward(self, x):
+        out, (h, _)  = self.encoder[0](x)
+        latent       = torch.tanh(self.enc_fc(out[:, -1, :]))
+        seq_len      = x.size(1)
+        dec_in       = latent.unsqueeze(1).expand(-1, seq_len, -1)
+        dec_out, _   = self.dec_lstm(dec_in)
+        return self.dec_fc(dec_out)
+
+def detect_timeline_anomaly_windows(
+    model:        TimelineLSTMAutoencoder,
+    matrix:       np.ndarray,
+    window_size:  int = 32,    # 32 × 15min = 8h window
+    stride:       int = 4,
+    threshold:    float = 0.045
+) -> list[dict]:
+    """
+    Sliding window anomaly detection over the timeline matrix.
+    Returns all windows with reconstruction error above threshold.
+    """
+    model.eval()
+    anomaly_windows = []
+
+    with torch.no_grad():
+        for start in range(0, len(matrix) - window_size, stride):
+            window = matrix[start:start + window_size]
+            x      = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
+            recon  = model(x)
+            error  = float(torch.mean((x - recon) ** 2))
+
+            if error > threshold:
+                anomaly_windows.append({
+                    "window_start_bin":  start,
+                    "window_end_bin":    start + window_size,
+                    "reconstruction_error": round(error, 5),
+                    "anomaly_score":        round(min(1.0, error / threshold), 3),
+                    "severity":             ("HIGH"   if error > threshold * 2 else
+                                             "MEDIUM" if error > threshold * 1.4
+                                             else "LOW")
+                })
+
+    return anomaly_windows
+ML-06: Hypothesis Manager — Bayesian Scoring Engine
+6.1 Evidence Weight Framework
+python
+HYPOTHESIS_EVIDENCE_WEIGHTS = {
+    # Evidence → (supports, weakens) hypothesis weight pairs
+    "blunt_force_trauma": {
+        "HOMICIDE":     +0.35,
+        "ACCIDENT":     +0.10,
+        "SUICIDE":      -0.20,
+        "NATURAL":      -0.30
+    },
+    "sharp_force_trauma": {
+        "HOMICIDE":     +0.25,
+        "SUICIDE":      +0.20,
+        "ACCIDENT":     +0.05,
+        "NATURAL":      -0.30
+    },
+    "body_not_moved": {
+        "HOMICIDE":     +0.10,
+        "SUICIDE":      +0.05,
+        "ACCIDENT":     +0.05,
+        "NATURAL":      +0.05
+    },
+    "phone_silence_coincides_tod": {
+        "HOMICIDE":     +0.20,
+        "SUICIDE":      +0.10,
+        "ACCIDENT":     +0.02,
+        "NATURAL":      -0.05
+    },
+    "contact_proximity_tod": {
+        "HOMICIDE":     +0.25,
+        "SUICIDE":      -0.10,
+        "ACCIDENT":     +0.02,
+        "NATURAL":      -0.05
+    },
+    "large_cash_withdrawal": {
+        "HOMICIDE":     +0.15,
+        "SUICIDE":      +0.10,
+        "ACCIDENT":     +0.02,
+        "NATURAL":      -0.05
+    },
+    "defensive_wounds": {
+        "HOMICIDE":     +0.40,
+        "SUICIDE":      -0.30,
+        "ACCIDENT":     -0.20,
+        "NATURAL":      -0.30
+    },
+    "no_suicide_note": {
+        "HOMICIDE":     +0.05,
+        "SUICIDE":      -0.10,
+        "ACCIDENT":     +0.02,
+        "NATURAL":      +0.02
+    },
+    "natural_disease_history": {
+        "NATURAL":      +0.45,
+        "HOMICIDE":     -0.15,
+        "SUICIDE":      -0.05,
+        "ACCIDENT":     -0.10
+    },
+    "hesitation_wounds": {
+        "SUICIDE":      +0.45,
+        "HOMICIDE":     -0.20,
+        "ACCIDENT":     -0.15,
+        "NATURAL":      -0.20
+    }
+}
+
+def compute_hypothesis_scores(
+    evidence_flags: list[str],
+    prior_scores:   dict | None = None
+) -> dict:
+    """
+    Bayesian-style evidence accumulation over hypotheses.
+    Starts from uniform prior (or given prior) and updates
+    multiplicatively for each evidence item.
+    """
+    hypotheses = ["HOMICIDE", "SUICIDE", "ACCIDENT", "NATURAL", "UNDETERMINED"]
+    
+    # Initialize with prior (uniform or given):
+    if prior_scores:
+        log_scores = {h: np.log(max(prior_scores.get(h, 0.2), 1e-10))
+                      for h in hypotheses}
+    else:
+        log_scores = {h: np.log(0.2) for h in hypotheses}
+
+    # Accumulate evidence:
+    for evidence in evidence_flags:
+        weights = HYPOTHESIS_EVIDENCE_WEIGHTS.get(evidence, {})
+        for h in hypotheses:
+            delta = weights.get(h, 0.0)
+            log_scores[h] += delta  # additive in log space
+
+    # Normalize to probabilities:
+    max_log    = max(log_scores.values())
+    raw_scores = {h: np.exp(log_scores[h] - max_log) for h in hypotheses}
+    total      = sum(raw_scores.values())
+    scores     = {h: round(raw_scores[h] / total, 4) for h in hypotheses}
+
+    primary    = max(scores, key=scores.get)
+
+    return {
+        "scores":             scores,
+        "primary_hypothesis": primary,
+        "primary_confidence": scores[primary]
+    }
+ML-07: SHAP Explainability Layer
+7.1 SHAP for TOD ML Model
+python
+import shap
+
+class TodExplainer:
+    """
+    Generates SHAP-based feature contributions for TOD ML estimates.
+    Used to populate TodFeatureContribution[] in the output.
+    """
+
+    def __init__(self, model: TodMLModel, background_data: np.ndarray):
+        # TreeExplainer for RF (fast, exact):
+        self.explainer = shap.TreeExplainer(
+            model.rf,
+            data=background_data,
+            feature_perturbation="interventional"
+        )
+        self.feature_names = [
+            "temp_rectal", "delta_temp", "ambient_temp",
+            "rigor_stage", "livor_stage", "decomp_stage",
+            "weight_kg", "clothing", "indoor", "humidity",
+            "wind_speed", "hours_last_seen", "cooling_rate"
+        ]
+
+    def explain(self, features: np.ndarray) -> list[dict]:
+        shap_values = self.explainer.shap_values(
+            features.reshape(1, -1)
+        )[0]
+
+        contributions = []
+        for fname, shap_val in zip(self.feature_names, shap_values):
+            contributions.append({
+                "feature":      fname,
+                "shap_value":   round(float(shap_val), 4),
+                "direction":    ("EARLIER" if shap_val < 0 else
+                                  "LATER"   if shap_val > 0 else "NEUTRAL"),
+                "magnitude":    round(abs(float(shap_val)), 4),
+                "description":  self._describe(fname, shap_val)
+            })
+
+        return sorted(contributions, key=lambda x: x["magnitude"], reverse=True)
+
+    def _describe(self, feature: str, shap_val: float) -> str:
+        direction = "pushes TOD earlier" if shap_val < 0 else "pushes TOD later"
+        mag       = "strongly" if abs(shap_val) > 2 else "slightly"
+        return f"{feature} {mag} {direction} (SHAP={shap_val:+.2f}h)"
+ML-08: Model Registry & Versioning
+8.1 Model Store Schema
+python
+MODEL_REGISTRY = {
+    "tod_rf_v2": {
+        "path":            "models/tod_rf_v2.pkl",
+        "type":            "RandomForestRegressor",
+        "trained_on":      "synthetic_henssge_10k + literature_augmented",
+        "n_features":      13,
+        "cv_mae_hours":    4.2,
+        "cv_r2":           0.87,
+        "created":         "2026-03-15",
+        "description":     "TOD PMI estimator v2 with clothing correction"
+    },
+    "timeline_ae_v1": {
+        "path":            "models/timeline_ae_v1.pt",
+        "type":            "BiLSTMAutoencoder",
+        "trained_on":      "synthetic_normal_patterns_50k",
+        "threshold":       0.045,
+        "reconstruction_mae": 0.012,
+        "created":         "2026-03-20",
+        "description":     "Timeline anomaly detection — 8h window"
+    },
+    "financial_ae_v1": {
+        "path":            "models/financial_ae_v1.pt",
+        "type":            "BiLSTMAutoencoder",
+        "trained_on":      "synthetic_financial_sequences_30k",
+        "threshold":       0.038,
+        "created":         "2026-03-22",
+        "description":     "Financial sequence anomaly — 14-day window"
+    }
+}
+8.2 Model Performance Targets
+Model	Metric	Target	Notes
+TOD RF v2	MAE (hours)	≤ 4.5h	Within Henssge tolerance range
+TOD RF v2	R²	≥ 0.85	On held-out synthetic test set
+Timeline AE	Reconstruction MAE	≤ 0.015	On normal sequences
+Timeline AE	Anomaly Precision	≥ 0.80	On labeled anomaly set
+Timeline AE	Anomaly Recall	≥ 0.85	Recall prioritized over precision
+Financial AE	Anomaly AUROC	≥ 0.88	On synthetic fraud sequences
+IF Detector	Point Anomaly Precision	≥ 0.75	At contamination=0.05
+Manner NER	Entity F1	≥ 0.90	On forensic NER benchmark
+Hypothesis Scorer	Top-1 Accuracy	≥ 0.82	On labeled synthetic cases
+ML-09: Data Pipelines & Preprocessing
+9.1 CDR Normalization (Multi-Carrier)
+python
+CARRIER_COLUMN_MAPS = {
+    "AIRTEL": {
+        "msisdn":       "A_Party",
+        "timestamp":    "Call_Date_Time",
+        "type":         "Call_Type",
+        "duration":     "Duration_Sec",
+        "counterparty": "B_Party",
+        "tower_id":     "Cell_ID",
+        "lat":          "Latitude",
+        "lon":          "Longitude",
+        "imei":         "IMEI"
+    },
+    "JIO": {
+        "msisdn":       "Calling_Number",
+        "timestamp":    "Start_Time",
+        "type":         "Service_Type",
+        "duration":     "Call_Duration",
+        "counterparty": "Called_Number",
+        "tower_id":     "CGI",
+        "lat":          "Lat",
+        "lon":          "Long",
+        "imei":         "Device_IMEI"
+    },
+    "BSNL": {
+        "msisdn":       "CLI",
+        "timestamp":    "Date_Time",
+        "type":         "Type",
+        "duration":     "Seconds",
+        "counterparty": "Dialled",
+        "tower_id":     "BTS_ID",
+        "lat":          "BTS_Lat",
+        "lon":          "BTS_Lon",
+        "imei":         None
+    }
+}
+
+EVENT_TYPE_MAP = {
+    # Airtel types:
+    "MOC":      "MOC", "MTC": "MTC", "MOSMS": "SMS_MO",
+    "MTSMS":    "SMS_MT", "GPRS": "DATA",
+    # Jio types:
+    "VOICE_OUT":"MOC", "VOICE_IN":"MTC",
+    "SMS_OUT":  "SMS_MO", "SMS_IN":"SMS_MT", "LTE_DATA":"DATA",
+    # BSNL types:
+    "OUT":      "MOC", "IN":"MTC", "SMS":"SMS_MO", "DATA":"DATA"
+}
+
+def normalize_cdr_row(row: dict, carrier: str) -> dict | None:
+    col_map = CARRIER_COLUMN_MAPS.get(carrier)
+    if not col_map:
+        raise ValueError(f"Unknown carrier: {carrier}")
+
+    try:
+        ts = pd.to_datetime(row[col_map["timestamp"]])
+        return {
+            "source_msisdn":       str(row[col_map["msisdn"]]).strip(),
+            "event_timestamp":     ts.isoformat(),
+            "event_type":          EVENT_TYPE_MAP.get(
+                                       str(row[col_map["type"]]).upper(), "UNKNOWN"),
+            "duration_seconds":    int(row.get(col_map["duration"], 0) or 0),
+            "counterparty_msisdn": str(row.get(col_map["counterparty"], "")).strip(),
+            "cell_tower_id":       str(row.get(col_map["tower_id"], "")).strip(),
+            "tower_latitude":      float(row[col_map["lat"]])
+                                   if col_map.get("lat") and row.get(col_map["lat"])
+                                   else None,
+            "tower_longitude":     float(row[col_map["lon"]])
+                                   if col_map.get("lon") and row.get(col_map["lon"])
+                                   else None,
+            "imei":                str(row[col_map["imei"]]).strip()
+                                   if col_map.get("imei") else None,
+        }
+    except Exception:
+        return None   # skip malformed rows
+ML-10: Reasoning Replay — Confidence Aggregation
+10.1 Step-Level Confidence Model
+python
+def compute_step_confidence(
+    agent_id:      str,
+    trigger_type:  str,
+    input_quality: float,   # 0-1: how complete/clean was the input
+    source_count:  int,     # how many evidence items supported this step
+    warnings:      list[str]
+) -> float:
+    """
+    Rule-based confidence scoring for each Replay step.
+    Combines agent reliability, input quality, evidence breadth,
+    and warning penalties.
+    """
+    # Agent base reliabilities (from validation testing):
+    BASE_RELIABILITY = {
+        "autopsy":           0.88,
+        "cdr_analyzer":      0.93,
+        "financial_analyzer":0.85,
+        "tod":               0.82,
+        "timeline_anomaly":  0.87,
+        "hotspot":           0.79,
+        "hypothesis_manager":0.84,
+        "reasoning_replay":  0.95
+    }
+
+    base     = BASE_RELIABILITY.get(agent_id, 0.75)
+    score    = base * input_quality
+
+    # Boost for multiple corroborating sources:
+    source_boost = min(0.10, (source_count - 1) * 0.03)
+    score       += source_boost
+
+    # Warning penalties:
+    penalty_map = {
+        "MISSING_DATA":          0.08,
+        "LOW_OCR_CONFIDENCE":    0.10,
+        "INCONSISTENT_SIGNAL":   0.15,
+        "SINGLE_SOURCE":         0.05,
+        "MODEL_EXTRAPOLATION":   0.07
+    }
+    for warning in warnings:
+        for key, penalty in penalty_map.items():
+            if key in warning.upper():
+                score -= penalty
+                break
+
+    return round(max(0.10, min(0.99, score)), 3)
+
+
+def compute_overall_case_confidence(step_confidences: list[float],
+                                     contradiction_count: int,
+                                     gap_count: int) -> float:
+    """
+    Aggregates all step confidences into a single case-level score.
+    Penalizes contradictions and reasoning gaps.
+    """
+    if not step_confidences:
+        return 0.0
+
+    # Weighted mean (lower-confidence steps penalize more):
+    weights = np.array(step_confidences)
+    # Harmonic mean to penalize weak links:
+    harmonic = len(weights) / np.sum(1.0 / np.maximum(weights, 0.01))
+
+    # Contradiction penalty:
+    contradiction_penalty = contradiction_count * 0.05
+    gap_penalty           = gap_count * 0.03
+
+    final = max(0.0, min(1.0,
+        harmonic - contradiction_penalty - gap_penalty
+    ))
+
+    return round(final, 3)
+That is the complete AIVENTRA ML Specification covering all 10 ML subsystems:
+
+Module	ML Approach
+ML-01 TOD	Henssge solver + RF/GBM ensemble + Monte Carlo Bayesian fusion
+ML-02 Autopsy NLP	BERT NER + Relation Extraction + GPT-4o structured extraction
+ML-03 CDR	Baseline modeling + Z-score silence detection + escalation detection + tower proximity
+ML-04 Financial	Isolation Forest + BiLSTM Autoencoder + motive pattern scorer
+ML-05 Timeline	Multi-modal fusion matrix + LSTM Autoencoder sliding window
+ML-06 Hypothesis	Bayesian log-additive evidence accumulation
+ML-07 Explainability	TreeSHAP for RF, per-feature contribution narratives
+ML-08 Model Registry	Versioned model store with performance targets
+ML-09 Data Pipelines	Multi-carrier CDR normalization, synthetic data generation
+ML-10 Replay Confidence	Step-level + case-level harmonic confidence aggregation

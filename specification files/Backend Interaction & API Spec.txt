@@ -1,0 +1,537 @@
+1) Frontend ↔ Backend Interaction & API Spec
+1.1 High-Level Integration Model
+Frontend: SPA (React/Next, etc.) consuming:
+
+REST/HTTP APIs for CRUD, bulk reads, filters, pagination.
+
+WebSocket or SSE stream for real-time updates (pipeline status, agent events, new hotspots, timeline deltas).
+
+Backend:
+
+HTTP API service (FastAPI/Express/Spring).
+
+Orchestrator service coordinating agents.
+
+Message bus / job queue internally (not visible to frontend).
+
+Principle:
+
+REST handles stateful resources (cases, evidence, reports, timeline data).
+
+WebSocket/SSE handles events (pipeline progress, new agent runs, new hotspots, status changes).
+
+1.2 API Conventions
+Base URL: /api/v1
+
+JSON everywhere.
+
+Standard envelope:
+
+json
+{
+  "data": { ... },
+  "meta": { "requestId": "uuid", "timestamp": "ISO8601" }
+}
+Errors:
+
+json
+{
+  "error": {
+    "code": "CASE_NOT_FOUND",
+    "message": "Case 23 not found",
+    "details": { ... }
+  },
+  "meta": { "requestId": "..." }
+}
+Pagination: cursor-based for large collections:
+
+text
+GET /cases?limit=20&cursor=eyJpZCI6IjIzIn0=
+Response:
+
+json
+{
+  "data": [ ... ],
+  "meta": { "nextCursor": "eyJpZCI6IjI0In0=", "hasMore": true }
+}
+Auth: JWT bearer tokens or session cookies (implementation detail – for hackathon you can mock).
+
+1.3 Core Resource Schemas
+These are the main entities UI needs.
+
+Case
+ts
+Case {
+  id: string;
+  title: string;
+  location: string;
+  dateStart: string;   // ISO
+  dateEnd: string;     // ISO
+  status: "TRIAGE" | "ANALYZING" | "REVIEW" | "CLOSED";
+  riskLevel: "LOW" | "MEDIUM" | "HIGH";
+  hypothesis: HypothesisSummary[];
+  agentsStatus: AgentStatusSummary[];   // for pipeline strip
+  sources: {
+    hasAutopsy: boolean;
+    hasCCTV: boolean;
+    hasPhone: boolean;
+    hasOther: boolean;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+HypothesisSummary
+ts
+HypothesisSummary {
+  key: "NATURAL" | "ACCIDENT" | "SUICIDE" | "HOMICIDE";
+  probability: number;   // 0–1
+  trend: "UP" | "DOWN" | "STABLE";
+}
+AgentStatusSummary
+ts
+AgentStatusSummary {
+  agentId: string;        // "autopsy", "tod", ...
+  displayName: string;    // "TOD Agent"
+  status: "PENDING" | "RUNNING" | "DONE" | "ERROR";
+  lastRunAt?: string;
+  lastDurationMs?: number;
+  lastErrorCode?: string;
+}
+Timeline Data
+At minimum:
+
+ts
+TimelineSummary {
+  buckets: TimelineBucket[];    // for main & mini timeline
+  todWindow?: {
+    start: string;           // predicted TOD band start
+    end: string;
+    mode: string;            // "HYBRID" | "PHYSICS_ONLY" etc.
+  };
+}
+
+TimelineBucket {
+  start: string;
+  end: string;
+  eventCounts: {
+    cctv: number;
+    phone: number;
+    other: number;
+  };
+  anomalyScoreAvg: number;    // 0–1
+}
+Detailed events:
+
+ts
+TimelineEvent {
+  id: string;
+  timestamp: string;
+  source: "AUTOPSY" | "TOD" | "PHONE" | "CCTV" | "IOT" | "AGENT_OUTPUT";
+  type: string;           // "CALL_END", "FRAME_DROP", "TOD_ESTIMATE", ...
+  description: string;
+  anomalyScore?: number;  // 0–1
+  windowId?: string;      // for anomalies
+  agentsInvolved?: string[];
+}
+Hotspot
+ts
+Hotspot {
+  id: string;
+  caseId: string;
+  rank: number;
+  score: number;           // 0–1
+  timeWindow: { start: string; end: string };
+  sources: ("TOD" | "PHONE" | "CCTV" | "IOT" | "AUTOPSY" | "AGENTS")[];
+  explanation: string;
+  contributingAgents: AgentContribution[];
+}
+ts
+AgentContribution {
+  agentId: string;
+  weight: number;   // 0–1, contribution weight
+  summary: string;  // “Flagged long silence”, “Tightened TOD band”
+}
+Causal Graph
+ts
+CausalGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+GraphNode {
+  id: string;
+  kind: "HYPOTHESIS" | "CLAIM" | "EVIDENCE";
+  label: string;
+  probability?: number;  // for hypotheses
+  importance?: number;   // for claims/evidence
+}
+
+GraphEdge {
+  id: string;
+  source: string;   // nodeId
+  target: string;   // nodeId
+  relation: "SUPPORTS" | "CONTRADICTS" | "NEUTRAL";
+  strength: number; // 0–1
+}
+TOD Result
+ts
+TODResult {
+  mode: "PHYSICS_ONLY" | "HYBRID" | "SIGNS_CONSTRAINED";
+  window: { start: string; end: string };
+  distribution: { time: string; probability: number }[];  // samples or summarized
+  featureImportance: {
+    feature: string;
+    importance: number;
+  }[];
+  consistency: {
+    rigor: "CONSISTENT" | "TENSION";
+    livor: "CONSISTENT" | "TENSION";
+    algor: "CONSISTENT" | "TENSION";
+  };
+  explanation: string;
+}
+Anomaly Window
+ts
+AnomalyWindow {
+  id: string;
+  caseId: string;
+  start: string;
+  end: string;
+  aeScore: number;      // autoencoder
+  ifScore: number;      // isolation forest
+  fusedScore: number;
+  dominantFactors: string[];   // e.g. ["silence_gap", "night_movement"]
+  explanation: string;
+}
+Agent & AgentRun
+ts
+Agent {
+  id: string;                   // "tod"
+  displayName: string;
+  description: string;
+  category: "NLP" | "VISION" | "TABULAR" | "XAI" | "ORCH";
+  modelName: string;            // "DeepSeek-V4-Flash"
+  version: string;
+}
+
+AgentRun {
+  id: string;
+  agentId: string;
+  caseId?: string;
+  inputSummary: string;
+  outputSummary: string;
+  status: "PENDING" | "RUNNING" | "DONE" | "ERROR";
+  startedAt: string;
+  finishedAt?: string;
+  errorCode?: string;
+}
+XAI Explanation
+ts
+Explanation {
+  id: string;
+  caseId: string;
+  target: "TOD" | "ANOMALY" | "HYPOTHESIS";
+  contextId: string;      // e.g. hotspotId or anomalyWindowId
+  method: "SHAP" | "LIME" | "RULE";
+  factors: {
+    feature: string;
+    contribution: number;   // + positive, - negative
+    description: string;
+  }[];
+  narrative: string;
+}
+1.4 REST Endpoints – Grouped by View
+1.4.1 Case Lobby
+GET /cases
+
+Query: status, risk, hasAutopsy, hasCCTV, limit, cursor.
+
+Returns: { data: Case[], meta: { nextCursor, hasMore } }.
+
+GET /cases/{caseId}
+
+Returns single Case with hypothesis and agent statuses.
+
+POST /cases
+
+For creating new demo/test case; body: basic metadata.
+
+1.4.2 Evidence Upload / Management
+POST /cases/{caseId}/evidence/autopsy
+
+Body: { fileUrl | base64 | text }.
+
+Response: created evidence ID and extracted summary.
+
+POST /cases/{caseId}/evidence/digital
+
+For logs, CSVs etc.
+
+POST /cases/{caseId}/evidence/cctv-metadata
+
+For pre-parsed CCTV timeline or file references.
+
+(You can stub these for hackathon; main thing is front-end knows where to POST.)
+
+1.4.3 Pipeline Orchestration
+POST /cases/{caseId}/pipeline/run
+
+Body (optional): { agents?: string[] } // specify subset or null for full pipeline.
+
+Response: { data: { pipelineRunId, status: "QUEUED" } }.
+
+GET /cases/{caseId}/pipeline/status
+
+Query: pipelineRunId optional; default=last.
+
+Returns list of agent statuses for this run (to drive pipeline strip).
+
+1.4.4 Timeline View Data
+GET /cases/{caseId}/timeline/summary
+
+Returns TimelineSummary (for main & mini timeline buckets, TOD band).
+
+GET /cases/{caseId}/timeline/events
+
+Query:
+
+start, end (ISO).
+
+Optional sources[]=PHONE&sources[]=CCTV.
+
+Pagination (cursor).
+
+Returns: { data: TimelineEvent[], meta: {...} }.
+
+1.4.5 Hotspots View
+GET /cases/{caseId}/hotspots
+
+Query:
+
+minScore (0–1).
+
+withinTod=true/false.
+
+hasSources[]=TOD&hasSources[]=PHONE.
+
+Returns: Hotspot[].
+
+GET /cases/{caseId}/hotspots/{hotspotId}
+
+Returns full Hotspot + linked events IDs.
+
+1.4.6 Causal Graph View
+GET /cases/{caseId}/graph
+
+Returns: CausalGraph.
+
+GET /cases/{caseId}/graph/hypotheses/{key}
+
+E.g. HOMICIDE.
+
+Returns: trimmed graph focused on that hypothesis (for fast filtering in focus mode).
+
+1.4.7 Autopsy & TOD Lab
+GET /cases/{caseId}/autopsy
+
+Returns:
+
+Raw text (or link).
+
+Structured extraction fields (with confidence).
+
+GET /cases/{caseId}/tod
+
+Query: mode=PHYSICS_ONLY|HYBRID|SIGNS_CONSTRAINED.
+
+Returns: TODResult.
+
+POST /agents/tod/test-run
+
+Body: { temperature, bmi, clothing, environment }.
+
+Returns: standalone TODResult independent of case.
+
+1.4.8 Digital Forensics Lab
+GET /cases/{caseId}/digital/timeline
+
+Query: start, end.
+
+Returns: events filtered to digital sources.
+
+GET /cases/{caseId}/digital/anomalies
+
+Query: minScore.
+
+Returns: AnomalyWindow[].
+
+GET /cases/{caseId}/digital/anomalies/{anomalyId}
+
+Returns: details + associated events.
+
+GET /cases/{caseId}/cctv/entities
+
+Returns:
+
+List of detected entities (id, type).
+
+Time ranges per camera.
+
+(Actual video frames/streams will likely be separate media endpoints or static URLs, not core API.)
+
+1.4.9 Agents & Agent Labs
+GET /agents
+
+Returns list of Agent.
+
+GET /agents/{agentId}
+
+Returns Agent details.
+
+GET /agents/{agentId}/runs
+
+Query: caseId?, limit, cursor.
+
+Returns: AgentRun[].
+
+POST /agents/{agentId}/test-run
+
+Body: agent-specific input structure (frontend will adapt forms accordingly).
+
+Returns: run result:
+
+outputSummary, raw, explanations?.
+
+1.4.10 XAI & Uncertainty
+GET /cases/{caseId}/explanations
+
+Query: target=TOD|ANOMALY|HYPOTHESIS, contextId?.
+
+Returns: Explanation[].
+
+1.4.11 Replay (Reasoning Theater)
+GET /cases/{caseId}/replay
+
+Returns:
+
+ts
+ReplayStep {
+  stepIndex: number;
+  label: string;
+  timestamp: string;
+  agentsInvolved: string[];
+  view: "TIMELINE" | "GRAPH" | "HOTSPOT";
+  viewContextId?: string;   // eventId, hotspotId, hypothesisKey, etc.
+  narrative: string;
+}
+Frontend uses these to drive the stepper and stage.
+
+1.4.12 Reports & Audit
+GET /cases/{caseId}/report
+
+Returns structured report data (sections, text, references to components).
+
+PUT /cases/{caseId}/report
+
+Writes a modified report.
+
+GET /cases/{caseId}/audit
+
+Returns an ordered list of audit events for that case (for the Audit Timeline).
+
+1.5 Real-Time Events (WebSocket / SSE)
+A single WS endpoint:
+
+GET /ws (or /api/v1/ws)
+
+Client connects with auth token and optionally caseId. Server sends messages:
+
+ts
+WsMessage {
+  type: "pipeline_update" |
+        "agent_run_update" |
+        "hotspot_created" |
+        "timeline_updated" |
+        "hypothesis_updated" |
+        "notification";
+  payload: any;
+}
+Examples:
+
+pipeline_update:
+
+{ caseId, pipelineRunId, agentStatuses: AgentStatusSummary[] }
+
+agent_run_update:
+
+{ caseId, agentRun: AgentRun }
+
+hotspot_created:
+
+{ caseId, hotspot: Hotspot }
+
+timeline_updated:
+
+{ caseId, updatedBuckets: TimelineBucket[], window: { start, end } }
+
+hypothesis_updated:
+
+{ caseId, hypotheses: HypothesisSummary[] }
+
+Frontend behavior:
+
+On pipeline_update:
+
+Update local store → pipeline strip UI.
+
+On hotspot_created:
+
+Append to Hotspots list.
+
+On timeline_updated:
+
+Merge or replace relevant buckets.
+
+On hypothesis_updated:
+
+Update hypothesis pills.
+
+Real-time design principles follow recommended practice: REST for data, WS/SSE for event triggers and small payloads.
+
+1.6 Frontend Flow Examples
+Flow 1: Load Case Workspace (Timeline tab)
+GET /cases/{id} → header + pipeline strip + hypothesis pills.
+
+GET /cases/{id}/timeline/summary → main + mini timeline.
+
+GET /cases/{id}/timeline/events?start=...&end=... → event lanes + table.
+
+If WS is supported, open /ws?caseId={id}.
+
+Flow 2: Run Full Pipeline
+User clicks Run Full Pipeline.
+
+Frontend POST /cases/{id}/pipeline/run.
+
+Optimistically set pipeline strip status to “RUNNING”.
+
+Listen on WebSocket:
+
+pipeline_update events gradually set nodes to DONE/ERROR.
+
+On completion, front-end refreshes:
+
+GET /cases/{id} (for new hypothesis).
+
+GET /cases/{id}/timeline/summary.
+
+GET /cases/{id}/hotspots.
+
+GET /cases/{id}/graph.
+
+Flow 3: Agent Lab Test
+User opens /agents/tod UI → GET /agents/tod.
+
+User sets sliders and clicks test → POST /agents/tod/test-run.
+
+Frontend displays returned TODResult in charts.

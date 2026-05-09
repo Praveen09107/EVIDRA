@@ -1,0 +1,182 @@
+G-01 — API Gateway: Full Implementation Specification
+Service: api_gateway
+Port: 8000
+Framework: FastAPI + Uvicorn
+Auth: RS256 JWT (issued by Gateway, verified by all agents)
+
+1. Purpose & Responsibilities
+The API Gateway is the single entry point for all external clients (web UI, mobile, third-party integrations). It handles authentication, rate limiting, request routing, task token issuance, and WebSocket upgrade for real-time events.
+
+Core responsibilities:
+
+Issue and verify RS256 JWTs for all sessions
+
+Route HTTP requests to the correct internal service
+
+Issue short-lived task_tokens for agent-to-agent trust
+
+Maintain WebSocket connections per case per client
+
+Rate limit per user/org tier
+
+Audit log every request
+
+2. Authentication Flow
+python
+# Token issuance on login:
+def issue_access_token(user_id: UUID, org_id: UUID, role: str) -> str:
+    payload = {
+        "sub":     str(user_id),
+        "org":     str(org_id),
+        "role":    role,          # INVESTIGATOR | SUPERVISOR | ADMIN | READONLY
+        "iat":     utcnow(),
+        "exp":     utcnow() + timedelta(hours=8),
+        "jti":     str(uuid4())   # token ID for revocation
+    }
+    return jwt.encode(payload, PRIVATE_KEY, algorithm="RS256")
+
+# Task token — scoped to one agent + one pipeline run:
+def issue_task_token(agent_id: str, pipeline_run_id: UUID,
+                     case_id: UUID) -> str:
+    payload = {
+        "sub":            f"agent:{agent_id}",
+        "pipeline_run_id": str(pipeline_run_id),
+        "case_id":         str(case_id),
+        "iat":             utcnow(),
+        "exp":             utcnow() + timedelta(minutes=30),
+        "scope":           f"agent:{agent_id}"
+    }
+    return jwt.encode(payload, PRIVATE_KEY, algorithm="RS256")
+3. Route Table
+Method	Path	Handler	Auth Required
+POST	/auth/login	login_handler	No
+POST	/auth/refresh	refresh_handler	Refresh token
+POST	/cases	create_case	INVESTIGATOR+
+GET	/cases	list_cases	INVESTIGATOR+
+GET	/cases/{case_id}	get_case	INVESTIGATOR+
+PATCH	/cases/{case_id}	update_case	INVESTIGATOR+
+POST	/cases/{case_id}/files	upload_file	INVESTIGATOR+
+GET	/cases/{case_id}/files	list_files	INVESTIGATOR+
+POST	/cases/{case_id}/pipeline/run	trigger_pipeline	INVESTIGATOR+
+GET	/cases/{case_id}/pipeline/status	pipeline_status	INVESTIGATOR+
+GET	/cases/{case_id}/results	get_results	INVESTIGATOR+
+GET	/cases/{case_id}/replay	get_replay_report	INVESTIGATOR+
+GET	/cases/{case_id}/hypothesis	get_hypothesis	INVESTIGATOR+
+WS	/ws/cases/{case_id}	websocket_handler	Bearer token
+GET	/health	health_check	No
+4. File Upload Handler
+python
+@router.post("/cases/{case_id}/files")
+async def upload_file(
+    case_id:  UUID,
+    file:     UploadFile,
+    doc_type: str = Form(...),   # CDR | AUTOPSY_REPORT | FINANCIAL_RECORDS | DEVICE_DATA
+    token:    str = Depends(verify_jwt)
+):
+    # 1. Validate file type and size:
+    MAX_SIZE_MB = {"CDR": 50, "AUTOPSY_REPORT": 20, "FINANCIAL_RECORDS": 30, "DEVICE_DATA": 100}
+    size_mb = file.size / (1024 * 1024)
+    if size_mb > MAX_SIZE_MB.get(doc_type, 50):
+        raise HTTPException(413, f"File exceeds {MAX_SIZE_MB[doc_type]}MB limit")
+
+    allowed_mime = {
+        "CDR":              ["text/csv","application/vnd.ms-excel","application/pdf"],
+        "AUTOPSY_REPORT":   ["application/pdf","image/jpeg","image/png"],
+        "FINANCIAL_RECORDS":["text/csv","application/pdf","application/json"],
+        "DEVICE_DATA":      ["application/zip","application/json","text/xml"]
+    }
+    if file.content_type not in allowed_mime.get(doc_type, []):
+        raise HTTPException(415, "Unsupported file type")
+
+    # 2. Store raw file in object storage:
+    file_id  = uuid4()
+    s3_key   = f"cases/{case_id}/raw/{file_id}/{file.filename}"
+    await s3.upload_fileobj(file.file, BUCKET, s3_key)
+
+    # 3. Create DB record:
+    await db.execute("""
+        INSERT INTO case_files (file_id, case_id, original_name, s3_key,
+                                doc_type, mime_type, size_bytes, uploaded_by, status)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'PENDING')
+    """, file_id, case_id, file.filename, s3_key,
+         doc_type, file.content_type, file.size, token.sub)
+
+    # 4. Enqueue Evidence Parser task:
+    await task_queue.enqueue("evidence_parser", {
+        "file_id": str(file_id),
+        "case_id": str(case_id),
+        "s3_key":  s3_key,
+        "doc_type": doc_type
+    })
+
+    return {"file_id": str(file_id), "status": "PROCESSING"}
+5. WebSocket Handler
+python
+# Per-case connection registry:
+case_connections: Dict[UUID, Set[WebSocket]] = defaultdict(set)
+
+@router.websocket("/ws/cases/{case_id}")
+async def websocket_handler(ws: WebSocket, case_id: UUID,
+                             token: str = Query(...)):
+    # Verify token:
+    payload = verify_jwt_ws(token)
+    await ws.accept()
+    case_connections[case_id].add(ws)
+
+    try:
+        while True:
+            # Keep alive — client sends ping:
+            data = await asyncio.wait_for(ws.receive_text(), timeout=30)
+            if data == "ping":
+                await ws.send_text("pong")
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        case_connections[case_id].discard(ws)
+
+async def emit_to_case(case_id: UUID, event: str, payload: dict):
+    """
+    Called by agents via internal event bus to push updates to UI.
+    """
+    message = json.dumps({"event": event, "payload": payload,
+                           "timestamp": utcnow().isoformat()})
+    dead    = set()
+    for ws in case_connections.get(case_id, set()):
+        try:
+            await ws.send_text(message)
+        except Exception:
+            dead.add(ws)
+    case_connections[case_id] -= dead
+6. Rate Limiting
+python
+RATE_LIMITS = {
+    "INVESTIGATOR": {"requests_per_min": 60,  "uploads_per_hour": 20},
+    "SUPERVISOR":   {"requests_per_min": 120, "uploads_per_hour": 50},
+    "ADMIN":        {"requests_per_min": 300, "uploads_per_hour": 200}
+}
+
+# Redis sliding window per user:
+async def check_rate_limit(user_id: UUID, role: str, endpoint_type: str):
+    key    = f"ratelimit:{user_id}:{endpoint_type}"
+    limit  = RATE_LIMITS[role][f"{endpoint_type}_per_min"]
+    count  = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, 60)
+    if count > limit:
+        raise HTTPException(429, "Rate limit exceeded")
+7. Request/Response Middleware
+python
+@app.middleware("http")
+async def audit_log_middleware(request: Request, call_next):
+    start    = time.time()
+    response = await call_next(request)
+    duration = (time.time() - start) * 1000
+
+    await audit_log.write({
+        "method":      request.method,
+        "path":        request.url.path,
+        "user_id":     getattr(request.state, "user_id", None),
+        "status_code": response.status_code,
+        "duration_ms": round(duration, 2),
+        "ip":          request.client.host,
+        "timestamp":   utcnow().isoformat()
+    })
+    return response

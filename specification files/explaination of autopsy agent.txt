@@ -1,0 +1,1116 @@
+1. Autopsy Analysis Agent – Role in the Overall System
+1.1 Purpose
+The Autopsy Analysis Agent is the first medical intelligence layer in AIVENTRA. Its job is to transform raw autopsy-related text (PM reports, scene descriptions, toxicology summaries) into structured, machine-usable forensic facts and higher-level clinical inferences that downstream agents can reason over:
+
+Provide the TOD Agent with structured postmortem signs (rigor, livor, algor, injuries, environmental factors).
+
+Feed the Causal Graph and Hypothesis Manager with:
+
+Candidate cause and manner of death.
+
+Key injuries, comorbidities, and toxicology findings.
+
+Explicitly positive, negative, and uncertain findings.
+
+Support explainability: show how medical text drove particular forensic conclusions, aligned with XAI requirements for forensic systems.
+
+It’s essentially a clinical NLP + forensic reasoning pipeline specialized for autopsy narratives, similar in spirit to systems that extract structured information from pathology reports and clinical notes at scale.
+
+2. Inputs and Outputs
+2.1 Inputs
+At minimum, the agent should accept:
+
+caseId: string
+
+autopsyDocuments: AutopsyDocument[]
+
+ts
+AutopsyDocument {
+  id: string;
+  type: "FULL_REPORT" | "PRELIM_REPORT" | "SCENE_DESCRIPTION" | "TOXICOLOGY" | "ANCILLARY";
+  source: "PDF" | "TEXT";
+  language: "en" | "ta" | ... (for future multilingual support);
+  content: string;          // raw text (after OCR if PDF)
+}
+The system feeding this agent is responsible for:
+
+Running reliable OCR on PDFs.
+
+Stripping PII or masking names if the deployment requires it.
+
+2.2 Outputs (Core Structured Schema)
+The agent returns one main JSON structure per case:
+
+ts
+AutopsyExtraction {
+  caseId: string;
+  reportId: string;                // link to EvidenceIngested
+  causeOfDeath: CauseOfDeath[];
+  mannerOfDeath: MannerOfDeathEstimate;
+  injuries: InjuryFinding[];
+  complications: ComplicationFinding[];
+  comorbidities: ConditionFinding[];
+  toxicology: ToxicologyFinding[];
+  postmortemSigns: PostmortemSigns;   // rigor, livor, algor, decomposition
+  environmentFactors: EnvironmentFinding[];
+  timelineMentions: TimelineMention[];
+  negatedFindings: NegatedFinding[];
+  uncertainties: UncertaintyCue[];
+  qualityFlags: QualityFlag[];
+  rawModelOutputs: RawModelArtifacts;
+}
+Each sub-structure:
+
+ts
+CauseOfDeath {
+  label: string;         // free text, e.g. "blunt force trauma to head"
+  categoryCode?: string; // ICD-10 or SNOMED when possible
+  tier: 1 | 2 | 3;       // Part I line 1, 2, 3 etc.
+  confidence: number;    // 0–1
+}
+
+MannerOfDeathEstimate {
+  label: "NATURAL" | "ACCIDENT" | "SUICIDE" | "HOMICIDE" | "UNDETERMINED";
+  confidence: number;
+  rationale: string[];
+}
+
+InjuryFinding {
+  bodyRegion: string;            // "head", "thorax", …
+  type: string;                  // "laceration", "contusion", "stab wound"
+  size?: string;                 // if present
+  laterality?: "left" | "right" | "midline" | "bilateral";
+  internalExternal: "INTERNAL" | "EXTERNAL";
+  severity: "MINOR" | "MODERATE" | "SEVERE" | "FATAL_POTENTIAL";
+  description: string;
+  confidence: number;
+}
+
+ToxicologyFinding {
+  substance: string;             // "ethanol", "fentanyl"
+  concentration?: string;
+  unit?: string;
+  interpretation: "NEGATIVE" | "THERAPEUTIC" | "TOXIC" | "FATAL" | "UNKNOWN";
+  confidence: number;
+}
+
+PostmortemSigns {
+  rigorMortisStage?: "NONE" | "EARLY" | "FULL" | "RESOLVING";
+  livorMortisStage?: "NONE" | "EARLY" | "FIXED";
+  livorDistribution?: string;    // "dependent areas", "face/neck"
+  algorMortisNotes?: string;     // description of body temperature or cooling
+  decompositionStage?: "NONE" | "EARLY" | "MODERATE" | "ADVANCED";
+  otherFindings?: string[];
+  confidence: number;
+}
+
+TimelineMention {
+  text: string;
+  normalizedTime?: string;       // ISO if resolvable
+  relation: "SYMPTOM_ONSET" | "LAST_SEEN_ALIVE" | "DISCOVERY" | "INTERVENTION";
+  confidence: number;
+}
+
+NegatedFinding {
+  entityType: "DISEASE" | "INJURY" | "SUBSTANCE" | "SIGN";
+  value: string;
+  contextSnippet: string;
+}
+
+UncertaintyCue {
+  cueType: "POSSIBLE" | "PROBABLE" | "SUSPECTED" | "CANNOT_BE_EXCLUDED";
+  contextSnippet: string;
+  linkedFindingIds?: string[];
+}
+
+QualityFlag {
+  type: "CONTRADICTORY_TIMES" | "MISSING_POSTMORTEM_SIGNS" | "AMBIGUOUS_CAUSE" | ...;
+  severity: "INFO" | "WARN" | "CRITICAL";
+  description: string;
+}
+
+RawModelArtifacts {
+  llmPrompts: LlmCallRecord[];
+  nerSpans: any;     // token indices, probabilities
+  classificationLogits: any;
+}
+These outputs are designed so that:
+
+The TOD Agent can directly read postmortemSigns + timelineMentions and feed into its physics+ML model.
+
+The Hypothesis Manager and Causal Graph builder can use causeOfDeath, mannerOfDeath, injuries, toxicology, and negatedFindings as nodes and edges.
+
+The Bias/Uncertainty Monitor has explicit uncertainties and qualityFlags to calibrate confidence.
+
+3. Internal Architecture
+At a high level, the Autopsy Agent is a multi-stage NLP + reasoning pipeline combining:
+
+Document ingestion & normalization
+
+Section segmentation & structuring
+
+Clinical/forensic NLP pipeline (NER, assertion, temporal extraction, relation extraction)
+
+LLM-based clinical reasoning & classification (II-Medical-32B-Preview)
+
+Consistency checks & XAI layer
+
+This pattern is similar to how clinical NLP systems extract key indicators from pathology and colonoscopy reports using a combination of rule-based preprocessing and ML/transformer-based NER and classification.
+
+3.1 Component Breakdown
+3.1.1 Ingestion & PII/Noise Handling
+OCR (if PDF):
+
+Use a robust OCR model tuned for scanned medical documents.
+
+Preserve layout enough to infer sections (bold headings, numbered bullets).
+
+Normalization:
+
+Normalize whitespace, merge hyphenated line breaks.
+
+Standardize units (°C, mg/L, etc.) if they appear as plain text.
+
+PII stripping (if required):
+
+A separate pre-processing module removes or masks names, addresses, IDs, but keeps medically relevant text.
+
+This stage is analogous to pre-processing in autopsy NLP research where PDFs are converted to text and cleaned before analysis.
+
+3.1.2 Section Segmentation
+Autopsy reports and forensic pathology documentation follow relatively consistent sections (e.g. External Examination, Internal Examination, Investigations, Opinion/Cause of Death).
+
+The agent:
+
+Uses regex + LLM-backed section classification to split text into sections:
+
+SCENE, EXTERNAL, INTERNAL, HISTOLOGY, TOXICOLOGY, OPINION, DEATH_CERT.
+
+For each section, stores:
+
+Title, start/end offset, normalized section type.
+
+Segmentation allows downstream modules to treat, for example, Opinion more heavily for cause/manner classification and External/Internal sections more for injury extraction.
+
+3.1.3 Clinical/Forensic NLP Pipeline
+Inside each relevant section, the agent runs token-level and span-level NLP:
+
+Named Entity Recognition (NER):
+
+Entities:
+
+Injuries (wound type, body region).
+
+Diseases/conditions.
+
+Postmortem signs (rigor, livor, decomposition).
+
+Medications/drugs.
+
+Temporal expressions.
+
+Implementation:
+
+A transformer-based NER model (e.g. a clinical BERT / pathology-optimized model) is ideal.
+
+It can be integrated as a tool that the Autopsy Agent (LLM) calls, or pre-run in the orchestrator.
+
+Assertion / Negation Detection:
+
+Distinguish “no evidence of hemorrhage” vs “massive intracranial hemorrhage”.
+
+Use rule-based (e.g. NegEx) plus LLM classification at phrase level.
+
+Uncertainty Detection:
+
+Identify hedges: “possible cardiac arrhythmia”, “cannot exclude poisoning”.
+
+Tag entities with uncertain attribute.
+
+Temporal Information Extraction:
+
+Map relative phrases (“found approx 12 hours after death”) to relative times when anchored, or at least categorize as last seen alive / discovery / treatment.
+
+Use LLM to interpret these phrases and, when possible, calculate relative intervals.
+
+Relation Extraction:
+
+Link injuries to body regions.
+
+Link substances to concentrations.
+
+Link events to times.
+
+Link findings to “cause of death” statements.
+
+This follows clinical NLP practice where relation extraction links entities for deeper insight.
+
+These lower-level components can be either:
+
+Classical ML / transformer models that you fine-tune (small-scale) or
+
+Tools invoked by II-Medical-32B via function-calling (a practical hackathon-friendly approach).
+
+3.1.4 LLM Reasoning & Classification (II-Medical-32B-Preview)
+Once you have:
+
+Sections labeled,
+
+Entities & relations extracted,
+
+Negations & uncertainties tagged,
+
+the main Autopsy Reasoner (II-Medical-32B) is invoked with:
+
+A compressed, structured representation of the report.
+
+Excerpts of key sections (Opinion, Conclusion, External, Internal, Toxicology).
+
+A strict output schema declaration.
+
+LLM tasks:
+
+Cause-of-death reasoning:
+
+Summarize text and entity mentions into 1–3-tier cause-of-death statements.
+
+Map to “Part I” style (immediate cause, due to, due to).
+
+Manner-of-death classification:
+
+Using both explicit statements and circumstantial descriptors, produce a probability distribution over NATURAL/ACCIDENT/SUICIDE/HOMICIDE/UNDETERMINED. Studies have shown that text classification on autopsy narratives can predict causes/manners of death using ML; we leverage a stronger LLM for a similar classification task.
+
+Postmortem sign summary:
+
+Convert textual descriptions (“rigor mortis fully developed in all muscle groups”) into standardized categories (FULL/RESOLVING etc).
+
+Consistency/quality checks:
+
+Identify contradictions between different sections (“external exam normal” vs “large scalp laceration described elsewhere”).
+
+Flag missing essential information (no mention of postmortem signs, no toxicology for suspected poisoning).
+
+Narrative rationale:
+
+Produce a human-readable explanation summarizing why it chose a certain cause/manner of death, key injuries, and which text snippets were critical.
+
+This design matches how clinical NLP and autopsy-text classification tasks use ML to automate cause-of-death prediction and entity extraction, but we use a powerful LLM to do multi-task reasoning and output JSON.
+
+3.1.5 XAI & Traceability Layer
+Given forensic context and XAI recommendations:
+
+Persist:
+
+The snippets (text spans) that influenced each major decision:
+
+Each CauseOfDeath entry includes supportingSnippets: string[].
+
+Each MannerOfDeathEstimate includes rationale bullets tied to text spans.
+
+If you use classical NER/ML models, you can apply SHAP/LIME on those models for feature-level importance; you then expose those as part of RawModelArtifacts.
+
+Provide:
+
+“Why was homicide probability 0.74?” → show:
+
+Injury patterns, scene description phrases, TOD vs timeline alignment.
+
+4. Autopsy Agent Workflow (Step-by-step)
+4.1 End-to-End Workflow
+Trigger
+
+Orchestrator sees that a case has autopsy evidence → enqueues AutopsyAnalysisTask(caseId).
+
+Ingestion
+
+Worker fetches autopsy PDFs/text from Evidence store.
+
+Performs OCR if needed; runs normalization & PII stripping.
+
+Section Segmentation
+
+Splits text into sections.
+
+Tags each section type.
+
+Low-level NLP
+
+Runs NER, assertion, temporal extraction, relation extraction on sections.
+
+Creates a structured “document graph” (entities, relations, negations, uncertainties).
+
+LLM Reasoning (main call)
+
+Provide:
+
+Key sections’ text (Opinion, External, Internal, Tox).
+
+Extracted entities + relations + negations.
+
+Output schema (JSON schema).
+
+Ask II-Medical-32B to:
+
+Fill AutopsyExtraction fields.
+
+Provide rationales and quality flags.
+
+Post-processing
+
+Validate JSON matches schema (all required fields present, ranges 0–1 for confidences).
+
+Map free-text causes to codes (e.g., ICD-10) using a separate code-mapping component (optional but nice, using off-the-shelf clinical coding models).
+
+Attach internal diagnostic info (LLM tokens used, NER outputs).
+
+Persist & Events
+
+Save AutopsyExtraction into DB.
+
+Emit:
+
+agent_run updated event.
+
+Possibly hypothesis_updated event if the autopsy content changes cause/manner probabilities.
+
+5. Example Flow (Concrete Walkthrough)
+Let’s walk a realistic flow. Assume:
+
+Case: male, 36, found under bridge, suspected fall vs assault.
+
+Evidence: autopsy report with sections: External, Internal, Toxicology, Opinion.
+
+5.1 Text Snippets
+External:
+“A 6 cm linear laceration is present over the occipital scalp, with underlying skull fracture palpable. Multiple abrasions present on both knees and elbows. No defensive wounds identified on the upper extremities.”
+
+Internal:
+“Massive subdural hemorrhage over right cerebral hemisphere, 150 mL, with midline shift. No significant coronary artery disease. No pulmonary emboli.”
+
+Toxicology:
+“Blood alcohol level: 0.22 g/dL. No other drugs detected.”
+
+Opinion:
+“In my opinion, death is due to blunt force trauma to the head, consistent with a fall from height. The manner of death is best classified as accident.”
+
+5.2 Stage 1 – NLP
+NER & Relations:
+
+Entities:
+
+Injury:
+
+type = "laceration", bodyRegion = "occipital scalp", size = "6 cm".
+
+Injury:
+
+type = "skull fracture", bodyRegion = "skull".
+
+Injury:
+
+type = "subdural hemorrhage", bodyRegion = "right cerebral hemisphere", volume = "150 mL".
+
+Condition:
+
+“coronary artery disease” with assertion = NEGATED (“No significant…”).
+
+Substance:
+
+substance = ethanol, concentration = "0.22 g/dL".
+
+Relations:
+
+Subdural hemorrhage linked to head trauma.
+
+Alcohol level linked to manner-of-death reasoning (increasing accident risk).
+
+Negation & Uncertainty:
+
+“No defensive wounds identified” → NegatedFinding(entityType="INJURY", value="defensive wounds").
+
+“No significant coronary artery disease” → negative comorbidity.
+
+Temporal extraction:
+
+Suppose the report also said “The victim was last seen alive at a bar approximately 3 hours before discovery.” → timeline mention with type LAST_SEEN_ALIVE.
+
+5.3 Stage 2 – LLM Reasoning
+The pipeline constructs a prompt for II-Medical-32B summarizing:
+
+Key sections.
+
+List of injuries, conditions, substances, negations.
+
+Instructions with strict JSON schema.
+
+Prompt instructs:
+
+Determine 1–3 tiers of cause-of-death according to the autopsy opinion and all evidence.
+
+Determine manner-of-death with probabilities.
+
+Standardize injuries, comorbidities, toxicology, and postmortem signs.
+
+Mark negated and uncertain findings clearly.
+
+Provide narrative rationales referencing text snippets.
+
+LLM outputs:
+
+json
+{
+  "causeOfDeath": [
+    {
+      "label": "Blunt force trauma to the head",
+      "categoryCode": "S06.5",      // example code
+      "tier": 1,
+      "confidence": 0.96
+    },
+    {
+      "label": "Fall from height",
+      "categoryCode": "W13",
+      "tier": 2,
+      "confidence": 0.88
+    }
+  ],
+  "mannerOfDeath": {
+    "label": "ACCIDENT",
+    "confidence": 0.9,
+    "rationale": [
+      "Opinion section explicitly states 'consistent with a fall from height' and 'manner ... accident'.",
+      "No defensive wounds and pattern of injuries compatible with fall rather than assault.",
+      "Elevated blood alcohol may contribute to accidental fall risk."
+    ]
+  },
+  "injuries": [
+    {
+      "bodyRegion": "occipital scalp",
+      "type": "laceration",
+      "size": "6 cm",
+      "internalExternal": "EXTERNAL",
+      "severity": "SEVERE",
+      "description": "6 cm linear laceration over occipital scalp",
+      "confidence": 0.92
+    },
+    {
+      "bodyRegion": "right cerebral hemisphere",
+      "type": "subdural hemorrhage",
+      "internalExternal": "INTERNAL",
+      "severity": "FATAL_POTENTIAL",
+      "description": "Massive subdural hemorrhage (150 mL) with midline shift",
+      "confidence": 0.97
+    }
+  ],
+  "toxicology": [
+    {
+      "substance": "ethanol",
+      "concentration": "0.22",
+      "unit": "g/dL",
+      "interpretation": "TOXIC",
+      "confidence": 0.9
+    }
+  ],
+  "postmortemSigns": {
+    "rigorMortisStage": "EARLY",
+    "livorMortisStage": "EARLY",
+    "livorDistribution": "dependent areas",
+    "algorMortisNotes": "body cool to touch",
+    "decompositionStage": "NONE",
+    "otherFindings": [],
+    "confidence": 0.8
+  },
+  "negatedFindings": [
+    {
+      "entityType": "INJURY",
+      "value": "defensive wounds",
+      "contextSnippet": "No defensive wounds identified on the upper extremities."
+    },
+    {
+      "entityType": "DISEASE",
+      "value": "significant coronary artery disease",
+      "contextSnippet": "No significant coronary artery disease."
+    }
+  ],
+  "uncertainties": [],
+  "qualityFlags": [],
+  "rawModelOutputs": { ... }
+}
+5.4 Stage 3 – Downstream Consumption
+TOD Agent:
+
+Uses postmortemSigns plus ambient temperature to refine its PMI estimates.
+
+Hypothesis Manager:
+
+Uses causeOfDeath + mannerOfDeath as strong prior and cross-check with digital evidence (e.g., does timeline support accidental fall?).
+
+Bias Monitor:
+
+Sees that manner-of-death is strongly supported by explicit statements but also checks for alternative plausible scenarios (e.g., assault) given injuries.
+
+6. Architectural Considerations & Trade-offs
+6.1 Why Hybrid (Classical NLP + LLM) Instead of LLM-only?
+Research on autopsy and pathology NLP shows that specialized NER/classification models (e.g. BERT-based NER) can extract entities with high F1 and robustness to spelling / format variations.
+
+LLM-only approaches may hallucinate entities or over-generalize; combining:
+
+deterministic NER & assertion detection,
+
+with LLM reasoning for higher-order tasks (causes, manner, consistency),
+yields more stable behavior.
+
+6.2 Explainability
+Following XAI recommendations for forensic and clinical contexts:
+
+Every major decision (cause, manner, TOD-consistency flag) must:
+
+Be traceable back to specific text excerpts.
+
+Include a human-readable explanation.
+
+Optionally include feature-level attributions from underlying models (e.g. top n-grams or embeddings that drove a logistic regression / RF, SHAP explanations on classical models).
+
+6.3 Robustness & Error Cases
+Missing sections: If Opinion section is missing, rely on NER outputs + pattern classification; set lower confidence and strong qualityFlags.
+
+Contradictory statements: Use LLM to detect contradictions and mark them, then hand them to Bias Monitor for human review.
+
+Non-standard language / local abbreviations: Rely on II-Medical’s generalization ability and incremental fine-tuning or few-shot examples.
+
+7. Summary
+The Autopsy Analysis Agent is not “just an LLM call”. It is a full clinical-forensic NLP pipeline:
+
+It ingests noisy autopsy PDFs or text, segments them, and uses NER, negation, uncertainty and temporal extraction like state-of-the-art clinical NLP pipelines.
+
+It uses a strong medical LLM (II-Medical-32B) to perform cause/manner-of-death reasoning, injury and toxicology summarization, and consistency checks.
+
+It outputs rich structured JSON that feeds TOD estimation, the Causal Graph, Hypothesis Manager, and XAI visualizations.
+
+It follows forensic XAI principles so that every automatic conclusion can be shown, inspected, and challenged by human experts.
+
+1. Role in the Multi-Agent System
+1.1 Responsibilities
+Autopsy Analysis Agent is the authoritative medical text interpreter. It:
+
+Ingests raw autopsy-related documents (PDFs/text).
+
+Normalizes and segments them into forensic sections.
+
+Extracts structured medical & forensic findings:
+
+Injuries (location, type, severity).
+
+Diseases/comorbidities.
+
+Toxicology.
+
+Postmortem signs (rigor, livor, algor, decomposition).
+
+Negated findings.
+
+Temporal references (last seen alive, discovery, interventions).
+
+Infers:
+
+Cause of death (multi-tier).
+
+Manner of death (probability over NATURAL/ACCIDENT/SUICIDE/HOMICIDE/UNDETERMINED).
+
+Produces:
+
+XAI artifacts (snippets + rationales) usable for UI and Bias/Uncertainty Agent.
+
+1.2 Interactions with Other Agents
+Downstream consumers:
+
+TOD Agent:
+
+Needs postmortemSigns, timelineMentions about time of discovery/last seen, and environment/temperature hints if present.
+
+Timeline & Anomaly Agent:
+
+Can use timelineMentions (last seen alive, approximate death times) as soft anchors.
+
+Correlation Engine:
+
+Uses cause-of-death + injury patterns to decide which digital anomalies are relevant.
+
+Hypothesis Manager & Causal Graph:
+
+Use causeOfDeath, mannerOfDeath, injuries, toxicology, and negatedFindings to build evidence nodes and connect them to hypotheses.
+
+Bias & Uncertainty Monitor:
+
+Reads uncertainties and qualityFlags to calibrate confidence and show warnings.
+
+Upstream dependencies:
+
+Ingestion / PII Stripper: Provides cleaned text; the agent does not do OCR itself in the core implementation.
+
+2. Data Contracts (Detail)
+2.1 Input Contract
+At API level:
+
+ts
+AutopsyAnalysisRequest {
+  caseId: string;
+  documents: AutopsyDocument[];
+}
+
+AutopsyDocument {
+  id: string;
+  type: "FULL_REPORT" | "PRELIM_REPORT" | "SCENE_DESCRIPTION" | "TOXICOLOGY" | "ANCILLARY";
+  source: "TEXT" | "PDF";
+  language: "en";          // extendable
+  content: string;         // if TEXT
+  fileUrl?: string;        // if PDF (backend resolves to text)
+}
+Assumptions:
+
+OCR & PII stripping happen before this agent is called.
+
+The orchestrator guarantees that content is plain text UTF‑8 at this stage.
+
+2.2 Core Output Contract (Expanded)
+ts
+AutopsyExtraction {
+  caseId: string;
+  primaryDocumentId: string;        // main report
+  documentsUsed: string[];          // IDs of docs used (including tox etc.)
+  causeOfDeath: CauseOfDeath[];
+  mannerOfDeath: MannerOfDeathEstimate;
+  injuries: InjuryFinding[];
+  comorbidities: ConditionFinding[];
+  complications: ComplicationFinding[];
+  toxicology: ToxicologyFinding[];
+  postmortemSigns: PostmortemSigns;
+  environmentFactors: EnvironmentFinding[];
+  timelineMentions: TimelineMention[];
+  negatedFindings: NegatedFinding[];
+  uncertainties: UncertaintyCue[];
+  qualityFlags: QualityFlag[];
+  provenance: ProvenanceInfo;
+  rawArtifacts: RawModelArtifacts;
+}
+We refine some subtypes.
+
+ts
+ProvenanceInfo {
+  sourceDocIds: string[];
+  generatedAt: string;         // ISO timestamp
+  agentVersion: string;        // e.g. "autopsy-agent:0.3.1"
+}
+2.3 Intermediate Representations
+To keep the agent modular, we define internal IRs:
+
+2.3.1 Document Sections
+ts
+Section {
+  id: string;
+  docId: string;
+  type: "SCENE" | "EXTERNAL" | "INTERNAL" | "HISTOLOGY" | "TOXICOLOGY" | "OPINION" | "DEATH_CERT" | "OTHER";
+  title: string;
+  text: string;
+  charStart: number;
+  charEnd: number;
+}
+2.3.2 NLP Entity Graph
+An intermediate structure representing entity spans & relations:
+
+ts
+NlpEntity {
+  id: string;
+  type: "INJURY" | "DISEASE" | "SUBSTANCE" | "SIGN" | "TEMPORAL" | "MEASUREMENT" | "BODY_REGION" | "FINDING";
+  text: string;
+  sectionId: string;
+  charStart: number;
+  charEnd: number;
+  attributes: Record<string, any>;   // e.g. { severity: "severe", laterality: "left" }
+  assertion: "PRESENT" | "ABSENT" | "UNCERTAIN";
+}
+
+NlpRelation {
+  id: string;
+  type: "LOCATED_IN" | "CAUSES" | "MODIFIES" | "MEASURE_OF" | "TEMPORAL_OF";
+  fromId: string;    // entityId
+  toId: string;      // entityId
+}
+These IRs are not exposed to frontend but are used internally and can be logged for debugging.
+
+3. Internal Architecture: Modules & Layers
+Conceptually:
+
+text
+Ingestion/Normalization
+    ↓
+Section Segmentation
+    ↓
+Low-level NLP (NER, Negation, Temporal, Relations)
+    ↓
+Structured IR (entity graph, section types)
+    ↓
+LLM Reasoner (II-Medical-32B, tool-calling)
+    ↓
+Schema Validation & Enrichment (coding, flags)
+    ↓
+Persist as AutopsyExtraction + XAI artifacts
+3.1 Module 1: Ingestion & Normalization
+Responsibilities:
+
+Accept AutopsyDocument items.
+
+If source="PDF", request text from OCR service (out-of-scope but defined).
+
+Normalize the text:
+
+Remove duplicated headers/footers.
+
+Merge hyphenated line endings.
+
+Normalize whitespace, unify newlines.
+
+Identify document language (for future multi-lingual; currently assume English).
+
+Output:
+
+NormalizedDocument { id, type, text } for each input.
+
+3.2 Module 2: Section Segmentation
+Autopsy/report layouts often follow templates, but there’s variation. Research shows robust rule+ML segmentation works best.
+
+Techniques:
+
+Use a combination of:
+
+Regex / dictionary of common headings:
+
+“EXTERNAL EXAMINATION”, “INTERNAL EXAMINATION”, “OPINION”, “CAUSE OF DEATH”, etc.
+
+Heuristics (all caps lines, lines ending with a colon).
+
+LLM when headings are non-standard: send a short prompt “classify this paragraph into one of these section types”.
+
+Algorithm Sketch:
+
+Scan text line by line:
+
+Identify candidate heading lines via regex (^[A-Z][A-Z \-]+:$ or similar).
+
+Create preliminary sections based on these headings.
+
+For ambiguous/missing headings:
+
+Cluster paragraphs by lexical cues:
+
+Words like “laceration, contusion” → likely EXTERNAL.
+
+“heart, lungs, liver” → INTERNAL.
+
+“In my opinion, death is due to…” → OPINION.
+
+Use LLM classification to assign Section.type.
+
+Outputs:
+
+Array of Section objects with type filled.
+
+3.3 Module 3: Low-Level NLP Pipeline
+You can implement this as either:
+
+Dedicated transformer models for NER/assertion/temporal, OR
+
+Tools called by the LLM.
+
+Given hackathon constraints + desire for strong AI, design it as tools that the LLM can call (backed by models or heuristics).
+
+3.3.1 NER (Named Entity Recognition)
+Objective: Recognize entities relevant to forensic pathology and autopsy.
+
+Entities:
+
+INJURY: laceration, stab wound, contusion, hemorrhage, fracture, etc.
+
+BODY_REGION: head, chest, occipital scalp, right parietal region, etc.
+
+DISEASE/CONDITION: coronary artery disease, cirrhosis, diabetes, etc.
+
+SUBSTANCE: ethanol, fentanyl, cocaine, benzodiazepine, etc.
+
+SIGN: rigor mortis, livor mortis, froth, petechiae, decomposition, etc.
+
+TEMPORAL: “3 hours before discovery”, “18 hours postmortem”.
+
+MEASUREMENT: “6 cm”, “150 mL”, “0.22 g/dL”.
+
+Approach variants:
+
+Full ML: Fine-tune a clinical BERT-like model on autopsy/pathology corpora (long-term).
+
+Hybrid for hackathon (recommended):
+
+Use open clinical NER (like John Snow Labs) where possible.
+
+Wrap it as a tool: extract_entities(text) -> NlpEntity[].
+
+For ambiguous spans, have LLM refine/merge.
+
+3.3.2 Assertion/Negation & Uncertainty
+Goal: For each entity, classify assertion:
+
+PRESENT, ABSENT (negated), UNCERTAIN (hedged).
+
+Sequence:
+
+Use pattern-based negation detection (NegEx-like) on sentence-level.
+
+For hard cases, ask LLM classification:
+
+Given the sentence and the highlighted phrase, is the phrase describing something present, absent, or uncertain?
+
+This aligns with clinical note quality indicators and NLP techniques for negation and uncertainty detection.
+
+3.3.3 Temporal Extraction
+Goal: detect relatively-expressed times and categorize:
+
+LAST_SEEN_ALIVE
+
+DISCOVERY
+
+SYMPTOM_ONSET
+
+INTERVENTION (CPR, intubation, etc.)
+
+Use a combination of:
+
+Regex / SUTime-like libraries to identify relative times.
+
+LLM to interpret context:
+
+“last seen alive approximately 3 hours before discovery” → TimelineMention { relation: "LAST_SEEN_ALIVE", text: "...", normalizedTime: null, confidence }.
+
+Even if you can’t normalize to absolute timestamps (lack of anchor), you still store relation type and text which are useful for TOD & timeline agents.
+
+3.3.4 Relation Extraction
+Goal: connect entities:
+
+INJURY → BODY_REGION (LOCATED_IN)
+
+SUBSTANCE → MEASUREMENT (MEASURE_OF)
+
+SIGN → BODY_REGION or general state
+
+TEMPORAL → event/finding (TEMPORAL_OF)
+
+Use pattern rules (e.g., “6 cm laceration over the occipital scalp” yields relationship) + LLM classification for more complex sentences.
+
+Outputs: NlpEntity[] + NlpRelation[].
+
+3.4 Module 4: LLM Reasoner (II-Medical-32B-Preview)
+3.4.1 Why Use II-Medical-32B
+It’s a medical-domain LLM optimized for:
+
+Clinical terminology.
+
+Pathology reports.
+
+Autopsy-like narratives.
+
+Clinical NLP literature shows domain-specific models outperform generic ones for extracting correct medical facts and inferring conditions.
+
+3.4.2 Input Design
+Context Packing:
+
+We must not dump entire report text when it’s long (context limits, noise). Instead we:
+
+Compile a “summary bundle”:
+
+For each section type:
+
+EXTERNAL: top N sentences with highest injury density.
+
+INTERNAL: top N sentences with severe injuries/organ failures.
+
+TOXICOLOGY: all tox results.
+
+OPINION: full section text (short).
+
+Add:
+
+List of entities and their attributes/upstream relations (injury graph, tox, postmortem signs).
+
+List of negated findings and uncertainty cues.
+
+Use a prompt skeleton:
+
+System: You are a forensic pathology assistant trained to interpret autopsy reports. You output ONLY valid JSON matching the provided schema.
+User: Here is the structured representation of the report (entities, relations, sections) and key text excerpts. Extract causes of death, estimate the manner of death, injuries, toxicology, postmortem signs, and uncertainties, following the JSON schema. Include rationales referencing specific text snippets.
+
+Tools vs. single call:
+
+For hackathon: do a single LLM call with everything plus JSON-schema output constraints.
+
+For production: you can break into smaller tasks (e.g. separate cause/manner inference from injury extraction) to improve controllability.
+
+3.4.3 Output Constraints & Validation
+Use JSON Schema to enforce field presence and types:
+
+E.g., confidence must be between 0 and 1.
+
+tier must be 1, 2, or 3.
+
+After receiving LLM output:
+
+Run JSON Schema validation.
+
+If invalid:
+
+Attempt automatic repair by re-prompting LLM with validation errors.
+
+If still failing, mark Autopsy Agent run as ERROR with detailed logs.
+
+3.5 Module 5: Quality Control & Enrichment
+3.5.1 Coding Causes to Standard Codes
+Optional but high-value:
+
+Use a medical coding model or rule-based mapping to map CauseOfDeath.label to ICD-10 codes.
+
+Implementation:
+
+Query a local code dictionary with fuzzy matching.
+
+Use LLM as fallback (“give me likely ICD-10 codes for this description”).
+
+3.5.2 Quality Flags
+Heuristics to detect quality issues:
+
+No postmortem signs mentioned → MISSING_POSTMORTEM_SIGNS.
+
+Opinion section vague (lots of hedge phrases, no concrete cause) → AMBIGUOUS_CAUSE.
+
+Inconsistency between sections (e.g., external exam “normal” but injuries mention elsewhere) → CONTRADICTORY_FINDINGS.
+
+LLM can also assist: ask it to “List any contradictions or missing key elements in the autopsy report, given forensic best practices”.
+
+3.5.3 Provenance & XAI
+For each major field (cause, manner, postmortemSigns), store:
+
+supportingSnippets: string[] — text spans from report.
+
+Optionally the entity IDs this field depends on.
+
+This ensures front-end can highlight:
+
+“This conclusion is based on text: ‘In my opinion, death is due to…’ plus ‘No defensive wounds’ etc.”
+
+4. Control Flow & Orchestration Details
+4.1 Orchestrator Perspective
+Orchestrator receives request: AUTOPSY_ANALYSIS(caseId).
+
+Orchestrator marks autopsy agent status = RUNNING in DB.
+
+Autopsy worker:
+
+Pulls tasks from queue.
+
+Runs Modules 1–5 as above.
+
+Writes AutopsyExtraction.
+
+Writes AgentRun record and updates status = DONE or ERROR.
+
+Orchestrator:
+
+Updates pipeline status.
+
+Emits WebSocket events to UI.
+
+4.2 Idempotency & Re-runs
+Each run is versioned:
+
+agent_run has runId and references the AutopsyExtraction version.
+
+If autopsy report is updated or new document added:
+
+Orchestrator triggers a new run, linking to new evidence revision.
+
+5. Robustness, Error Handling & Edge Cases
+5.1 Missing Data
+If no autopsy text present:
+
+Agent should:
+
+Return qualityFlags = [ { type: "NO_AUTOPSY_TEXT", severity: "CRITICAL" } ].
+
+Cause/manner fields empty or low confidence.
+
+Status: DONE but with warnings, not ERROR (so pipeline can proceed with digital evidence only).
+
+5.2 Ambiguous or Contradictory Data
+LLM identifies contradictions:
+
+Build QualityFlag entries for them.
+
+Severity determines UI behavior:
+
+“INFO” → just note.
+
+“CRITICAL” → highlight prominently; Hypothesis Manager should keep high uncertainty.
+
+5.3 LLM Failures
+If LLM fails or returns invalid JSON after N retries:
+
+Mark agent status as ERROR.
+
+Save raw text and NlpEntityGraph for debugging.
+
+Pipeline can either:
+
+Stop and require human intervention.
+
+Or proceed with partial data (configurable).
+
+6. Performance Considerations
+Batching: If multiple autopsy runs are queued, share NER model / pipeline in memory for speed.
+
+Incremental updates: If only minor text change, re-use previous NlpEntityGraph and only re-run LLM reasoning.
+
+Context limits: For very long reports, implement:
+
+Section summarization to keep prompt under limits.
+
+Possibly multiple LLM calls per section, then a top-level synthesizer call.
+
+7. Evaluation Plan (Post-Hackathon)
+To turn this into a serious system, you’d evaluate:
+
+Entity extraction:
+
+Precision/recall/F1 vs manually annotated injuries, diseases, signs.
+
+Cause/manner inference:
+
+Compare LLM predictions to ground truth cause/manner labels in a test set (like what’s done in autopsy ML studies).
+
+Postmortem signs classification:
+
+Agreement with expert-labeled rigor/livor stages.
+
+Use datasets from:
+
+Public autopsy/pathology research corpora where possible.
+
+Synthetic / anonymized internal data with expert annotations.
+
+8. Extensibility
+Multilingual support:
+
+Swap in language-specific NER models, keep same LLM if multilingual or add translation layer.
+
+Image integration:
+
+Later, connect to image agent: link text findings (“subdural hemorrhage”) to CT/autopsy imaging.
+
+Feedback loop:
+
+Let pathologists correct structured output; feed corrections into fine-tuning pipeline (active learning).
+

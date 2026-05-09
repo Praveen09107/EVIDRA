@@ -1,0 +1,481 @@
+1. Purpose of the Reasoning Replay Agent
+1.1 What problem it solves
+Right now all the other agents (Autopsy, TOD, Anomaly, Hotspot, Hypothesis Manager, Bias Monitor) are doing heavy reasoning, but:
+
+Their actions are scattered across logs and tables.
+
+Investigators see only the final state, not the process.
+
+Forensic XAI literature says legal contexts care as much about how a conclusion was reached as what the conclusion is.
+
+The Reasoning Replay Agent solves this by:
+
+Collecting the chronological sequence of reasoning steps from all agents for a case.
+
+Compressing that raw trace into a human‑understandable script: “Step 1: Autopsy extraction → Step 2: TOD narrowed → Step 3: Anomaly cluster found → Step 4: Hotspot #1 created → Step 5: Hypothesis updated, homicide ↑.”
+
+Rendering that script into:
+
+A Replay timeline in the UI (“Reasoning Theater”).
+
+A machine‑readable ReplayScript used for:
+
+Training new models (RL / imitation learning / offline evaluation).
+
+Auditing and courtroom explanations.
+
+It’s basically a story generator for the multi‑agent system, aligned with proposals for “explainable, uncertainty‑calibrated forensic agents” where explanations and intermediate steps need to be surfaced and auditable.
+
+1.2 Design goals
+Faithful: Replay reflects actual agent calls and data, not a fictional or purely narrative reconstruction.
+
+Layered detail:
+
+High‑level “10 steps” for UI.
+
+Link each step to raw agent runs and artifacts for expert drill‑down.
+
+Deterministic on a given run: Running Replay on the same pipeline run yields the same script (except maybe small wording differences).
+
+Model‑agnostic: Works even if underlying models change; it uses the event log, not direct network traces.
+
+Training‑friendly: ReplayScript can be used as a dataset for training or evaluating successor agents.
+
+2. Data Contracts
+2.1 Inputs
+For each pipeline run:
+
+ts
+ReplayInput {
+  caseId: string;
+  pipelineRunId: string;
+
+  agentRuns: AgentRun[];          // chronological or time-stamped
+  todResult?: TodResult;
+  anomalies?: AnomalyWindow[];
+  hotspots?: Hotspot[];
+  autopsyExtraction?: AutopsyExtraction;
+  hypothesesTimeline?: HypothesisSnapshot[];
+  uncertaintyReport?: UncertaintyReport;
+}
+We already defined TodResult, AnomalyWindow, Hotspot, AutopsyExtraction, UncertaintyReport earlier.
+
+New piece: HypothesesTimeline:
+
+ts
+HypothesisSnapshot {
+  timestamp: string;
+  sourceAgentId: string;
+  probabilities: {
+    NATURAL: number;
+    ACCIDENT: number;
+    SUICIDE: number;
+    HOMICIDE: number;
+  };
+  explanation?: string;    // short reason from Hypothesis Manager
+}
+And AgentRun:
+
+ts
+AgentRun {
+  id: string;
+  agentId: string;        // "autopsy", "tod", "timeline_anomaly", "hotspot", ...
+  caseId: string;
+  pipelineRunId: string;
+  inputSummary: string;
+  outputSummary: string;
+  status: "PENDING" | "RUNNING" | "DONE" | "ERROR";
+  startedAt: string;
+  finishedAt?: string;
+  errorCode?: string;
+}
+The Replay Agent can also access audit logs for fine‑grained events (e.g., NBE suggestions, user manual interventions).
+
+2.2 Outputs
+Core replay deliverable:
+
+ts
+ReplayScript {
+  caseId: string;
+  pipelineRunId: string;
+  createdAt: string;
+  steps: ReplayStep[];
+  summary: ReplaySummary;
+}
+2.2.1 ReplayStep
+ts
+ReplayStep {
+  index: number;                      // 0,1,2,...
+  timestamp: string;                  // representative time
+  kind: "INGEST" | "AUTOPSY" | "TOD" | "ANOMALY" | "HOTSPOT" |
+        "HYPOTHESIS_UPDATE" | "BIAS_CHECK" | "NBE_ACTION" |
+        "USER_INTERACTION" | "RESTART" | "OTHER";
+
+  label: string;                      // short, UI-visible label
+  agentsInvolved: string[];           // ["autopsy", "tod", "timeline_anomaly"]
+
+  view: "TIMELINE" | "GRAPH" | "HOTSPOT" | "AUTOPSY" | "TOD" | "SUMMARY";
+  viewContextId?: string;             // e.g. hotspotId, anomalyId, nodeId, caseId
+
+  dataRefs: DataReference[];          // links to stored entities (autopsy, tod, anomalies, etc.)
+  hypothesisDelta?: HypothesisDelta;  // how this step changed hypothesis probabilities
+  uncertaintyDelta?: UncertaintyDelta;
+  narrative: string;                  // 1–3 sentences
+}
+ts
+DataReference {
+  type: "AUTOPSY" | "TOD" | "ANOMALY" | "HOTSPOT" | "GRAPH_NODE" | "GRAPH_EDGE" |
+        "EVIDENCE" | "CLAIM" | "UNCERTAINTY" | "NBE_SUGGESTION";
+  id: string;
+}
+
+HypothesisDelta {
+  before: HypothesisSnapshot;
+  after: HypothesisSnapshot;
+  mainDrivers: string[];              // e.g. ["Hotspot #1", "Autopsy cause"]
+}
+
+UncertaintyDelta {
+  component: "TOD" | "ANOMALY" | "HYPOTHESIS" | "OVERALL";
+  beforeLevel: "LOW" | "MEDIUM" | "HIGH";
+  afterLevel: "LOW" | "MEDIUM" | "HIGH";
+  drivers: string[];                  // e.g. "New CCTV evidence", "Conflict with autopsy"
+}
+2.2.2 ReplaySummary
+ts
+ReplaySummary {
+  overallNarrative: string[];         // 3–7 bullet/paragraphs summarizing the story
+  keyTurningPoints: number[];        // indices into steps[]
+  unresolvedQuestions: string[];     // from Bias/Uncertainty + Gap Auditor
+}
+This ReplayScript is what the UI uses for “stepper” playback and what the training infrastructure uses as a time‑stamped reasoning trace.
+
+3. Internal Architecture
+High‑level components:
+
+text
+Raw logs + agent outputs
+    ↓
+Event Collector & Normalizer
+    ↓
+Reasoning Trace Builder (fine-grained)
+    ↓
+Step Compressor & Grouping (coarse steps)
+    ↓
+Narrative Generator & Alignment (views, context)
+    ↓
+ReplayScript (for UI + training)
+3.1 Event Collector & Normalizer
+Objective: pull all relevant events for a pipeline run into one ordered event stream.
+
+Sources:
+
+agent_runs
+
+Domain outputs (tod_results, autopsy_extractions, anomalies, hotspots, graph changes, uncertainty_reports)
+
+audit_logs (user actions, NBE suggestions, manual annotations)
+
+Each raw event is normalized into:
+
+ts
+ReasoningEvent {
+  timestamp: string;
+  source: "AGENT" | "USER" | "SYSTEM";
+  agentId?: string;
+  type: string;              // e.g. "AUTOPSY_DONE", "TOD_UPDATED", "ANOMALY_BATCH_DONE"
+  payload: Record<string, any>;
+}
+Design choices:
+
+Use finishedAt/startedAt for agent runs plus any custom internal events (e.g., “TOD posterior shrunk by X”).
+
+Total order by timestamp; if equal timestamps, apply deterministic tie‑breaking (agent priority or insertion order).
+
+This step gives us a fine‑grained event log of the reasoning process.
+
+3.2 Reasoning Trace Builder (Fine‑grained)
+This module takes the ordered ReasoningEvent[] and builds a richer ReasoningTrace:
+
+ts
+ReasoningTraceStep {
+  index: number;
+  timestamp: string;
+  agentId?: string;
+  logicalAction: string; // semantic label, e.g. "extract_autopsy", "update_tod", "create_hotspot"
+  inputs: DataReference[];
+  outputs: DataReference[];
+  deltas: {
+    hypothesisDelta?: HypothesisDelta;
+    uncertaintyDelta?: UncertaintyDelta;
+  };
+}
+It does a few things:
+
+Semantic labeling
+
+Map low‑level events (like “AGENT_RUN_DONE” + type) to logical actions:
+
+Autopsy run done → extract_autopsy.
+
+TOD run → update_tod.
+
+Anomaly detection run → detect_anomalies.
+
+Hotspot formation → create_hotspot.
+
+Attach inputs/outputs
+
+Link to the specific data objects changed or created.
+
+For example, TOD run outputs a TodResult row; Hypothesis update outputs a new snapshot.
+
+Compute deltas for hypotheses & uncertainty
+
+For each Hypothesis update event: pair “before” and “after” snapshots.
+
+For each UncertaintyReport: compute if TOD band narrowed, anomaly confidence improved, etc.
+
+So ReasoningTraceStep is the full resolution trace; ReplayStep will be a compressed view.
+
+3.3 Step Compressor & Grouping
+If we surfaced every ReasoningTraceStep directly to UI, the replay would be too noisy. We want the UI to show macro steps (e.g. 10–20) rather than dozens/hundreds of micro steps.
+
+The compressor:
+
+Groups related trace steps into macro steps based on heuristics:
+
+Temporal proximity (within N seconds/minutes).
+
+Semantic similarity (same agent group, same high‑level phase).
+
+Example: “Autopsy run + autopsy quality check + autopsy‑derived claim extraction” → one macro step “Autopsy processed & structured”.
+
+Phase segmentation High‑level phases could be:
+
+Phase 1: Ingestion & Autopsy.
+
+Phase 2: TOD estimation.
+
+Phase 3: Digital timeline modeling & anomaly detection.
+
+Phase 4: Hotspot finding and correlation.
+
+Phase 5: Argument graph & hypothesis updates.
+
+Phase 6: Bias/uncertainty and NBE suggestions.
+
+Replay steps can align roughly with these phases, but we still allow more fine steps within phases.
+
+Selecting representative actions For each macro group we pick:
+
+Representative timestamp (center or end).
+
+Representative label (based on dominant logicalAction).
+
+Representative view (TIMELINE, AUTOPSY, HOTSPOT, GRAPH, etc.).
+
+Combined deltas (net change in hypotheses / uncertainty).
+
+Result: a list of 10–30 ReplayStep “skeletons” which we later enrich with narratives.
+
+This coarse‑to‑fine separation is recommended in XAI‑for‑forensics work where full low‑level model traces are too detailed; instead one surfaces important “reasoning milestones” with links to details.
+
+3.4 Narrative Generator & View Alignment
+For each ReplayStep skeleton, the agent now:
+
+Determines view and viewContextId
+
+If step involves anomalies or hotspots → view="TIMELINE" or "HOTSPOT" with context = hotspotId or anomalyId.
+
+If step is autopsy → view="AUTOPSY"; TOD → view="TOD".
+
+If step is argument graph update → view="GRAPH" with key hypothesis node ID.
+
+This is what the UI uses to animate the stage: “When user goes to step N, scroll timeline to this interval, highlight this hotspot, or center this node in causal graph.”
+
+Generates label (short)
+
+Use templates plus LLM refinement:
+
+“Autopsy structured & cause/manner extracted.”
+
+“Time of death band estimated (23:30–07:00).”
+
+“Digital anomalies cluster identified (01:40–04:00).”
+
+“Hotspot #1 created (score 0.93).”
+
+“Homicide probability increased (0.35 → 0.8).”
+
+Generates narrative (1–3 sentences)
+
+LLM takes:
+
+Inputs: what changed (dataRefs, hypothesisDelta, uncertaintyDelta).
+
+Context: case metadata, previous steps.
+
+Outputs a short narrative for investigator:
+
+“Using the structured autopsy report, the system identified blunt force trauma to the head as the primary cause of death and provisionally classified the manner as homicide with high confidence. This step creates a medical baseline for later digital evidence analysis.”
+
+These narratives align with XAI guidance that explanations should be case‑specific, concise, and integrated with reasoning steps, not just generic model introspection.
+
+Populate HypothesisDelta / UncertaintyDelta if applicable
+
+For steps that changed hypotheses: fill before/after + main drivers (“Hotspot #1”, “Autopsy cause”).
+
+For steps that changed uncertainty: “TOD band narrowed from 12h to 6h as cooling model and signs converged.”
+
+After this, we have full ReplayStep objects.
+
+3.5 ReplaySummary Builder
+Final module:
+
+Identifies key turning points:
+
+Steps where:
+
+Homicide probability crosses a threshold (e.g., >0.7).
+
+TOD band shrinks significantly.
+
+First critical hotspot appears.
+
+Bias/uncertainty triggers an escalation.
+
+Synthesizes an overall narrative:
+
+3–7 bullet or paragraph summary describing:
+
+“What did the system do first? What did it do next? What was the main line of argument? Where are we uncertain?”
+
+Extracts unresolved questions from Gap Auditor & Bias Monitor:
+
+“We still lack digital evidence between 02:00–04:00.”
+
+“No CCTV confirms the victim leaving the building.”
+
+This global summary is what the top of the Replay UI can show as a textual overview, consistent with XAI frameworks that emphasize communicating limitations and open questions.
+
+4. Example End‑to‑End Replay
+Suppose we run AIVENTRA on a new case and complete full pipeline.
+
+Step A – Raw events
+Events in time:
+
+AUTOPSY_RUN_DONE
+
+TOD_RUN_DONE
+
+ANOMALY_RUN_DONE (AE+IF)
+
+COLLISION_RUN_DONE
+
+HOTSPOTS_CREATED
+
+HYPOTHESIS_UPDATE (homicide ↑)
+
+UNCERTAINTY_REPORT_READY (bias/uncertainty)
+
+NBE_SUGGESTIONS_READY
+
+Step B – ReasoningTraceSteps (fine‑grained)
+A few examples:
+
+Step 0: extract_autopsy → outputs AutopsyExtraction.
+
+Step 1: update_tod → outputs TodResult with 6‑h band.
+
+Step 2: detect_anomalies → outputs 3 AnomalyWindows.
+
+Step 3: create_hotspots → outputs Hotspot #1 & #2.
+
+Step 4: update_hypothesis → homicide 0.35 → 0.8.
+
+Step 5: generate_uncertainty_report → flags digital modality dominance.
+
+Step C – ReplaySteps (compressed)
+The Replay Agent groups and narrates:
+
+Step 0 – Autopsy processed
+
+kind: AUTOPSY, view: AUTOPSY.
+
+narrative: “The system converted the autopsy report into structured findings, identifying blunt force trauma to the head and a preliminary homicide classification.”
+
+Step 1 – Time of death estimated
+
+kind: TOD, view: TOD.
+
+narrative: “Using body temperature, postmortem signs, and environmental data, the TOD Agent estimated death most likely between 23:30 and 07:00, centered at 03:30, with moderate uncertainty.”
+
+Step 2 – Digital anomalies detected
+
+kind: ANOMALY, view: TIMELINE.
+
+narrative: “The timeline model flagged a cluster of unusual phone and movement behavior between 01:40 and 04:00, including travel to an unfamiliar location and an extended silence period.”
+
+Step 3 – Hotspots created
+
+kind: HOTSPOT, view: HOTSPOT, context: hotspot-1.
+
+narrative: “The system combined TOD, anomalies, and CCTV events into Hotspot #1, rated highly relevant and overlapping the estimated TOD band.”
+
+Step 4 – Homicide hypothesis strengthened
+
+kind: HYPOTHESIS_UPDATE, view: GRAPH.
+
+HypothesisDelta: homicide 0.35 → 0.8, driven by Autopsy + Hotspot #1.
+
+narrative: “Given the autopsy’s homicide indicators and the new hotspot, the Hypothesis Manager increased the homicide probability to 0.8, while accident remained possible but less likely.”
+
+Step 5 – Uncertainty & bias check
+
+kind: BIAS_CHECK, view: SUMMARY.
+
+narrative: “The Bias & Uncertainty Monitor noted that the homicide conclusion relies heavily on digital anomalies, which are moderately calibrated, and that there is limited digital evidence around the center of the TOD interval. It recommended human review and potential collection of additional evidence.”
+
+Step 6 – Next‑Best‑Evidence suggestions
+
+kind: NBE_ACTION, view: TIMELINE.
+
+narrative: “The system suggested obtaining additional CCTV from 02:00–04:00 and extended phone records for contacts involved in the hotspot period to reduce uncertainty.”
+
+The UI then uses these steps in a stepper or timeline replay:
+
+User clicks Step 3 → front‑end switches to Hotspot view, scrolls to 01:40–04:00 window, highlights Hotspot #1.
+
+Text panel shows Step 3 narrative and key drivers.
+
+User jumps to Step 5 → summary view shows uncertainty warnings and bias flags.
+
+5. Training Mode / Data Generation
+The “Reasoning Replay & Training Mode” also exploits ReplayScript as training data:
+
+Supervised imitation: future LLM or agent versions can be trained to reproduce similar step sequences and narrations from raw evidence.
+
+Evaluation: compare ReplayScripts across versions to see if new models:
+
+Skip important steps,
+
+Make fewer/more mistakes,
+
+Provide better calibrated uncertainty.
+
+Forensic XAI work emphasizes building unified frameworks where explanations, uncertainty, and decision sequences are logged and can be reused to improve future models; ReplayScript is exactly that artifact in AIVENTRA.
+
+6. Implementation Notes
+Language: Python backend; Replay agent can be a microservice or part of orchestrator.
+
+Storage: Store ReplayScript as JSON blobs in a replay_scripts table keyed by (caseId, pipelineRunId).
+
+Idempotence: Regenerate ReplayScript whenever pipeline re‑runs, store versions.
+
+UI contract:
+
+GET /cases/{id}/replay → returns ReplayScript.
+
+Steps contain all IDs the UI needs to link into timeline/hotspot/graph views.
+

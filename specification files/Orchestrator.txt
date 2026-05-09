@@ -1,0 +1,223 @@
+O-01 — Orchestrator: Full Implementation Specification
+Service: orchestrator
+Port: 8001
+Queue: Redis Streams (primary) + PostgreSQL fallback
+
+1. Purpose & Responsibilities
+The Orchestrator manages the full lifecycle of a pipeline run. It knows the dependency graph of agents, dispatches tasks in the correct order, monitors completion, handles failures with retry/fallback, and emits progress events to the WebSocket layer.
+
+Core responsibilities:
+
+Receive trigger_pipeline command from Gateway
+
+Evaluate which agents can run in parallel vs sequence
+
+Dispatch tasks to agent queues with signed task tokens
+
+Monitor task completion and trigger downstream agents
+
+Handle failures: retry (up to 3x), then mark FAILED with partial results
+
+Compute pipeline progress % for UI
+
+Emit pipeline_complete when all agents finish
+
+2. Agent Execution DAG
+text
+TIER 0 (Parallel):
+    evidence_parser
+          │
+          ├── [if scanned] → ocr
+          │
+          └── format_normalizer (waits for parser + ocr)
+                    │
+    TIER 1 (Parallel, all wait for format_normalizer):
+          ├── autopsy_agent
+          ├── cdr_analyzer
+          └── financial_analyzer
+                    │
+    TIER 2 (Parallel, waits for Tier 1):
+          ├── tod_agent          ← needs autopsy output
+          └── timeline_anomaly   ← needs all Tier 1 outputs
+                    │
+    TIER 3 (Parallel, waits for Tier 2):
+          └── hotspot_engine     ← needs tod + timeline + cdr + financial
+                    │
+    TIER 4 (Sequential):
+          └── hypothesis_manager ← needs all prior
+                    │
+    TIER 5:
+          └── reasoning_replay   ← needs all steps from all agents
+3. Pipeline Run Lifecycle
+python
+class PipelineStatus(str, Enum):
+    PENDING     = "PENDING"
+    RUNNING     = "RUNNING"
+    PARTIAL     = "PARTIAL"    # some agents failed but core ones succeeded
+    COMPLETE    = "COMPLETE"
+    FAILED      = "FAILED"
+
+class AgentTaskStatus(str, Enum):
+    WAITING     = "WAITING"
+    DISPATCHED  = "DISPATCHED"
+    RUNNING     = "RUNNING"
+    COMPLETE    = "COMPLETE"
+    FAILED      = "FAILED"
+    SKIPPED     = "SKIPPED"    # skipped if no relevant data (e.g. no CDR uploaded)
+4. Pipeline Trigger
+python
+async def trigger_pipeline(case_id: UUID, triggered_by: UUID) -> UUID:
+    pipeline_run_id = uuid4()
+
+    # Create pipeline run record:
+    await db.execute("""
+        INSERT INTO pipeline_runs
+        (pipeline_run_id, case_id, status, triggered_by, started_at)
+        VALUES ($1,$2,'PENDING',$3,NOW())
+    """, pipeline_run_id, case_id, triggered_by)
+
+    # Determine which agents to run based on uploaded files:
+    files = await db.fetch("SELECT doc_type FROM case_files WHERE case_id=$1", case_id)
+    doc_types = {f["doc_type"] for f in files}
+
+    agents_to_run = build_agent_plan(doc_types)
+
+    # Create per-agent task records:
+    for agent_id, config in agents_to_run.items():
+        await db.execute("""
+            INSERT INTO agent_tasks
+            (task_id, pipeline_run_id, case_id, agent_id, status, tier, depends_on)
+            VALUES ($1,$2,$3,$4,'WAITING',$5,$6)
+        """, uuid4(), pipeline_run_id, case_id, agent_id,
+             config["tier"], json.dumps(config["depends_on"]))
+
+    # Start Tier 0:
+    await dispatch_tier(pipeline_run_id, case_id, tier=0)
+
+    # Emit to WebSocket:
+    await emit_to_case(case_id, "pipeline_started", {
+        "pipeline_run_id": str(pipeline_run_id),
+        "agents_planned":  list(agents_to_run.keys()),
+        "progress":        0
+    })
+
+    return pipeline_run_id
+5. Agent Plan Builder
+python
+def build_agent_plan(doc_types: Set[str]) -> Dict[str, AgentConfig]:
+    plan = {
+        "evidence_parser": {"tier": 0, "depends_on": [], "always": True}
+    }
+
+    has_scanned = check_if_any_scanned(doc_types)
+    if has_scanned:
+        plan["ocr"] = {"tier": 0, "depends_on": [], "always": False}
+
+    plan["format_normalizer"] = {
+        "tier": 1,
+        "depends_on": ["evidence_parser"] + (["ocr"] if has_scanned else [])
+    }
+
+    if "AUTOPSY_REPORT" in doc_types:
+        plan["autopsy"] = {"tier": 2, "depends_on": ["format_normalizer"]}
+        plan["tod"]     = {"tier": 3, "depends_on": ["autopsy"]}
+
+    if "CDR" in doc_types:
+        plan["cdr_analyzer"] = {"tier": 2, "depends_on": ["format_normalizer"]}
+
+    if "FINANCIAL_RECORDS" in doc_types:
+        plan["financial_analyzer"] = {"tier": 2, "depends_on": ["format_normalizer"]}
+
+    # Timeline needs at least one Tier 2 agent:
+    tier2 = [a for a in ("autopsy","cdr_analyzer","financial_analyzer") if a in plan]
+    if tier2:
+        plan["timeline_anomaly"] = {"tier": 3, "depends_on": tier2}
+
+    hotspot_deps = [a for a in ("tod","timeline_anomaly","cdr_analyzer","financial_analyzer")
+                    if a in plan]
+    if len(hotspot_deps) >= 2:
+        plan["hotspot"] = {"tier": 4, "depends_on": hotspot_deps}
+
+    plan["hypothesis_manager"] = {
+        "tier": 5,
+        "depends_on": [a for a in plan if plan[a].get("tier",0) <= 4]
+    }
+    plan["reasoning_replay"]   = {
+        "tier": 6,
+        "depends_on": list(plan.keys())
+    }
+
+    return plan
+6. Dispatch + Completion Monitoring
+python
+async def dispatch_tier(pipeline_run_id: UUID, case_id: UUID, tier: int):
+    tasks = await db.fetch("""
+        SELECT * FROM agent_tasks
+        WHERE pipeline_run_id=$1 AND tier=$2 AND status='WAITING'
+    """, pipeline_run_id, tier)
+
+    for task in tasks:
+        task_token = issue_task_token(task["agent_id"], pipeline_run_id, case_id)
+        await redis_stream.xadd(f"agent:{task['agent_id']}:tasks", {
+            "task_token":      task_token,
+            "pipeline_run_id": str(pipeline_run_id),
+            "case_id":         str(case_id),
+            "task_id":         str(task["task_id"])
+        })
+        await db.execute(
+            "UPDATE agent_tasks SET status='DISPATCHED', dispatched_at=NOW() WHERE task_id=$1",
+            task["task_id"]
+        )
+
+async def on_agent_complete(task_id: UUID, pipeline_run_id: UUID,
+                             case_id: UUID, success: bool):
+    status = "COMPLETE" if success else "FAILED"
+    await db.execute(
+        "UPDATE agent_tasks SET status=$1, completed_at=NOW() WHERE task_id=$2",
+        status, task_id
+    )
+
+    # Check if all tasks in current tier are done:
+    current_tier = await db.fetchval(
+        "SELECT tier FROM agent_tasks WHERE task_id=$1", task_id
+    )
+    pending_in_tier = await db.fetchval("""
+        SELECT COUNT(*) FROM agent_tasks
+        WHERE pipeline_run_id=$1 AND tier=$2
+        AND status NOT IN ('COMPLETE','FAILED','SKIPPED')
+    """, pipeline_run_id, current_tier)
+
+    if pending_in_tier == 0:
+        next_tier = current_tier + 1
+        next_tasks = await db.fetchval("""
+            SELECT COUNT(*) FROM agent_tasks
+            WHERE pipeline_run_id=$1 AND tier=$2
+        """, pipeline_run_id, next_tier)
+
+        if next_tasks > 0:
+            await dispatch_tier(pipeline_run_id, case_id, next_tier)
+            progress = compute_progress(pipeline_run_id)
+            await emit_to_case(case_id, "pipeline_progress", {"progress": progress})
+        else:
+            # All tiers done:
+            await finalize_pipeline(pipeline_run_id, case_id)
+7. Retry Policy
+python
+RETRY_POLICY = {
+    "max_attempts":     3,
+    "backoff_seconds":  [10, 30, 90],   # exponential
+    "non_retryable":    ["INVALID_DATA", "SCHEMA_ERROR"]
+}
+
+async def handle_agent_failure(task_id: UUID, error_code: str,
+                                attempt: int) -> bool:
+    if error_code in RETRY_POLICY["non_retryable"]:
+        await mark_task_failed(task_id, "NON_RETRYABLE_ERROR")
+        return False
+    if attempt >= RETRY_POLICY["max_attempts"]:
+        await mark_task_failed(task_id, "MAX_RETRIES_EXCEEDED")
+        return False
+    delay = RETRY_POLICY["backoff_seconds"][attempt - 1]
+    await asyncio.sleep(delay)
+    await redispatch_task(task_id)
+    return True

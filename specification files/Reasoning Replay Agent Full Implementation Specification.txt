@@ -1,0 +1,450 @@
+M-11 — Reasoning Replay Agent: Full Implementation Specification
+Agent ID: reasoning_replay
+Tier: 3 (runs after all analysis agents complete)
+Port: 8040
+
+1. Purpose & Responsibilities
+The Reasoning Replay Agent is the transparency and auditability layer of AIVENTRA. It collects every ReplayStep emitted by every agent during a pipeline run and transforms them into a structured, human-readable chain of reasoning — like a court-ready audit trail of how the system reached its conclusions.
+
+Core responsibilities:
+
+Collect all ReplayStep records for a pipeline run from the DB
+
+Order them chronologically and by agent dependency
+
+Detect and surface reasoning gaps (missing steps, low-confidence jumps)
+
+Detect reasoning contradictions (two agents reached conflicting conclusions)
+
+Generate an LLM narrative that explains the full chain in plain English
+
+Build a step-indexed graph (DAG) showing which conclusions depend on which evidence
+
+Produce a ReasoningReplayReport for the case UI and for export
+
+2. Input
+json
+{
+  "task_token": "<JWT>",
+  "pipeline_run_id": "uuid",
+  "case_id": "uuid",
+  "agent_id": "reasoning_replay",
+  "payload": {
+    "collect_from_agents": [
+      "ocr", "format_normalizer", "autopsy",
+      "tod", "cdr_analyzer", "financial_analyzer",
+      "timeline_anomaly", "hotspot", "hypothesis_manager"
+    ],
+    "include_raw_steps": true,
+    "generate_narrative": true,
+    "export_format": "JSON"
+  }
+}
+3. ReplayStep Schema (Emitted by Every Agent)
+Every agent emits these throughout execution. The Reasoning Replay Agent is the consumer of all of them.
+
+python
+class TriggerType(str, Enum):
+    MODEL_OUTPUT        = "MODEL_OUTPUT"       # LLM produced a structured output
+    LLM_EXTRACTION      = "LLM_EXTRACTION"     # LLM extracted fields from text
+    LLM_NARRATIVE       = "LLM_NARRATIVE"      # LLM wrote a narrative
+    RULE                = "RULE"               # deterministic rule fired
+    CONSISTENCY_CHECK   = "CONSISTENCY_CHECK"  # cross-check rule ran
+    ML_INFERENCE        = "ML_INFERENCE"       # ML model produced prediction
+    PHYSICS_MODEL       = "PHYSICS_MODEL"      # physics equation applied
+    BAYESIAN_FUSION     = "BAYESIAN_FUSION"    # probabilistic combination
+    MONTE_CARLO         = "MONTE_CARLO"        # MC sampling run
+    ANOMALY_DETECTION   = "ANOMALY_DETECTION"  # anomaly model fired
+    HYPOTHESIS_SCORE    = "HYPOTHESIS_SCORE"   # hypothesis weight updated
+    CONTRADICTION       = "CONTRADICTION"      # contradiction detected
+    DATA_NORMALIZATION  = "DATA_NORMALIZATION" # data was normalized/mapped
+
+class ReplayStep(BaseModel):
+    step_id:          UUID                  # unique per step
+    pipeline_run_id:  UUID
+    case_id:          UUID
+    agent_id:         str
+    step_index:       int                   # sequential within agent
+    global_index:     Optional[int]         # set by Replay Agent (global order)
+
+    trigger_type:     TriggerType
+    timestamp:        datetime              # when this step ran
+
+    input_summary:    str                   # what the step was given (≤ 200 chars)
+    interpretation:   str                   # what the step concluded (≤ 300 chars)
+    confidence:       float                 # 0.0–1.0
+    evidence_ids:     List[UUID]            # file_ids or event_ids used
+
+    warnings:         List[str]             # any warnings at this step
+    tokens_used:      Optional[int]         # for LLM steps
+    duration_ms:      Optional[int]         # execution time
+
+    parent_step_ids:  List[UUID]            # which prior steps this depends on
+    child_step_ids:   List[UUID]            # populated by Replay Agent
+4. Collection Phase
+python
+async def collect_all_replay_steps(
+    pipeline_run_id: UUID,
+    agent_ids: List[str]
+) -> List[ReplayStep]:
+    """
+    Pull all ReplayStep rows for this pipeline run from DB.
+    Sort by (agent execution order, then step_index within agent).
+    """
+    steps = await db.query(
+        "SELECT * FROM replay_steps WHERE pipeline_run_id = $1 ORDER BY timestamp ASC",
+        pipeline_run_id
+    )
+
+    # Assign global_index (cross-agent sequential order):
+    for i, step in enumerate(steps):
+        step.global_index = i + 1
+
+    # Build parent → child linkage:
+    step_map = {s.step_id: s for s in steps}
+    for step in steps:
+        for parent_id in step.parent_step_ids:
+            if parent_id in step_map:
+                step_map[parent_id].child_step_ids.append(step.step_id)
+
+    return steps
+5. Reasoning Gap Detection
+python
+CONFIDENCE_GAP_THRESHOLD = 0.30  # delta > 0.30 between consecutive steps = gap
+
+def detect_reasoning_gaps(steps: List[ReplayStep]) -> List[ReasoningGap]:
+    """
+    Detect:
+    1. Confidence cliff: step confidence drops > 0.30 from previous step
+    2. Missing evidence: step references evidence not in prior steps
+    3. Unsupported conclusion: high-confidence conclusion with no prior evidence steps
+    """
+    gaps = []
+
+    for i in range(1, len(steps)):
+        prev, curr = steps[i-1], steps[i]
+
+        # Gap type 1: Confidence cliff
+        if prev.confidence - curr.confidence > CONFIDENCE_GAP_THRESHOLD:
+            gaps.append(ReasoningGap(
+                type        = "CONFIDENCE_CLIFF",
+                step_id     = curr.step_id,
+                description = f"Confidence dropped from {prev.confidence:.0%} to "
+                              f"{curr.confidence:.0%} at step '{curr.agent_id}': "
+                              f"{curr.input_summary[:100]}",
+                severity    = "HIGH" if (prev.confidence - curr.confidence) > 0.50 else "MEDIUM"
+            ))
+
+        # Gap type 2: High-confidence conclusion with no supporting prior steps
+        if (curr.trigger_type == TriggerType.HYPOTHESIS_SCORE
+                and curr.confidence > 0.80
+                and not curr.parent_step_ids):
+            gaps.append(ReasoningGap(
+                type        = "UNSUPPORTED_CONCLUSION",
+                step_id     = curr.step_id,
+                description = f"High-confidence hypothesis ({curr.confidence:.0%}) "
+                              f"with no linked parent reasoning steps.",
+                severity    = "HIGH"
+            ))
+
+    return gaps
+6. Contradiction Detection
+python
+CONTRADICTION_CHECKS = [
+    {
+        "id":   "MANNER_CONTRADICTION",
+        "desc": "Autopsy manner of death contradicts Hypothesis Manager primary hypothesis",
+        "check": lambda steps: _check_manner_hypothesis_conflict(steps)
+    },
+    {
+        "id":   "TOD_CONSISTENCY_CONTRADICTION",
+        "desc": "TOD estimate inconsistency flag present but Hypothesis used TOD without caveat",
+        "check": lambda steps: _check_tod_consistency_used_with_warning(steps)
+    },
+    {
+        "id":   "EVIDENCE_COVERAGE_GAP",
+        "desc": "File evidence was uploaded but no agent produced a ReplayStep referencing it",
+        "check": lambda steps: _check_unused_evidence(steps)
+    }
+]
+
+def _check_manner_hypothesis_conflict(steps: List[ReplayStep]) -> Optional[ReasoningContradiction]:
+    autopsy_step = next(
+        (s for s in steps if s.agent_id == "autopsy"
+         and "manner_of_death" in s.interpretation.lower()), None
+    )
+    hypothesis_step = next(
+        (s for s in steps if s.agent_id == "hypothesis_manager"
+         and "primary_hypothesis" in s.interpretation.lower()), None
+    )
+    if not autopsy_step or not hypothesis_step:
+        return None
+
+    # Extract manner from interpretations (simple keyword check):
+    autopsy_manner    = extract_manner_keyword(autopsy_step.interpretation)
+    hypothesis_manner = extract_manner_keyword(hypothesis_step.interpretation)
+
+    if autopsy_manner and hypothesis_manner and autopsy_manner != hypothesis_manner:
+        return ReasoningContradiction(
+            type        = "MANNER_CONTRADICTION",
+            step_a_id   = autopsy_step.step_id,
+            step_b_id   = hypothesis_step.step_id,
+            description = f"Autopsy concluded '{autopsy_manner}' but "
+                          f"Hypothesis Manager concluded '{hypothesis_manner}'",
+            severity    = "HIGH"
+        )
+    return None
+7. Reasoning DAG Construction
+python
+def build_reasoning_dag(steps: List[ReplayStep]) -> ReasoningDag:
+    """
+    Build a directed acyclic graph where:
+    - Nodes = ReplaySteps
+    - Edges = parent → child dependency
+    Group nodes by agent for visual layering.
+    """
+    nodes = []
+    edges = []
+
+    for step in steps:
+        nodes.append(DagNode(
+            id          = str(step.step_id),
+            label       = f"[{step.global_index}] {step.agent_id}: {step.trigger_type}",
+            agent_id    = step.agent_id,
+            confidence  = step.confidence,
+            trigger_type= step.trigger_type,
+            summary     = step.interpretation[:120]
+        ))
+        for child_id in step.child_step_ids:
+            edges.append(DagEdge(
+                source = str(step.step_id),
+                target = str(child_id)
+            ))
+
+    return ReasoningDag(nodes=nodes, edges=edges)
+8. LLM Narrative Generation
+python
+REPLAY_NARRATIVE_PROMPT = """You are a forensic intelligence analyst writing the
+reasoning chain explanation for an AI-assisted investigation report.
+
+The following is an ordered list of reasoning steps taken by the AIVENTRA system
+while analyzing the evidence for this case. Write a clear, structured narrative
+explaining HOW the system reached its final conclusion — in plain English suitable
+for a judge, senior officer, or lawyer.
+
+Structure your narrative as:
+1. Evidence Ingestion Summary (1–2 sentences: what was uploaded and processed)
+2. Key Medical Findings (from autopsy analysis)
+3. Time of Death Estimation (physics + ML approach and result)
+4. Communication Pattern Findings (CDR analysis highlights)
+5. Financial Pattern Findings (if any)
+6. Anomaly Windows (what periods were flagged and why)
+7. Hypothesis Scoring (what evidence pushed toward which conclusion)
+8. Final Conclusion and Confidence
+9. Caveats and Uncertainties (any gaps, contradictions, or low-confidence steps)
+
+Rules:
+- Plain English, no jargon without explanation
+- Cite the specific step numbers (e.g. "Step 4 found...")
+- Quantify confidence levels (e.g. "with 78% confidence")
+- Explicitly state any contradictions found
+- Do not name persons — use "the deceased", "Subject A", "Contact-1" etc.
+- Limit to 500 words
+
+REASONING STEPS (ordered):
+{steps_json}
+
+CONTRADICTIONS DETECTED:
+{contradictions_json}
+
+REASONING GAPS:
+{gaps_json}"""
+
+async def generate_replay_narrative(
+    steps:          List[ReplayStep],
+    contradictions: List[ReasoningContradiction],
+    gaps:           List[ReasoningGap]
+) -> str:
+    steps_summary = [
+        {
+            "step":          s.global_index,
+            "agent":         s.agent_id,
+            "trigger":       s.trigger_type,
+            "input":         s.input_summary,
+            "conclusion":    s.interpretation,
+            "confidence":    f"{s.confidence:.0%}",
+            "warnings":      s.warnings
+        }
+        for s in steps
+    ]
+
+    response = await ai_gateway.complete(
+        model       = "gemini-2.0-flash",
+        user        = REPLAY_NARRATIVE_PROMPT.format(
+                          steps_json         = json.dumps(steps_summary, indent=2),
+                          contradictions_json= json.dumps([c.dict() for c in contradictions]),
+                          gaps_json          = json.dumps([g.dict() for g in gaps])
+                      ),
+        temperature = 0.3,
+        max_tokens  = 800
+    )
+    return response.text.strip()
+9. Step Index Table (for UI)
+python
+def build_step_index_table(steps: List[ReplayStep]) -> List[StepIndexRow]:
+    """
+    Produces the flat table shown in the UI's Reasoning Replay tab.
+    Each row = one step with all metadata.
+    """
+    return [
+        StepIndexRow(
+            global_index  = s.global_index,
+            agent_id      = s.agent_id,
+            trigger_type  = s.trigger_type,
+            input_summary = s.input_summary,
+            interpretation= s.interpretation,
+            confidence    = s.confidence,
+            warnings      = s.warnings,
+            duration_ms   = s.duration_ms,
+            tokens_used   = s.tokens_used,
+            timestamp     = s.timestamp.isoformat()
+        )
+        for s in steps
+    ]
+10. Output Schema
+python
+class ReasoningReplayReport(BaseModel):
+    pipeline_run_id:        UUID
+    case_id:                UUID
+    generated_at:           datetime
+
+    total_steps:            int
+    agents_covered:         List[str]
+    total_llm_tokens_used:  int
+    total_duration_ms:      int
+
+    step_index_table:       List[StepIndexRow]
+    reasoning_dag:          ReasoningDag
+
+    contradictions:         List[ReasoningContradiction]
+    reasoning_gaps:         List[ReasoningGap]
+    gap_count:              int
+    contradiction_count:    int
+
+    narrative:              str             # 500-word plain English chain
+    confidence_summary: Dict[str, float] = {
+        # Final confidence per agent's primary conclusion
+        "autopsy":            float,
+        "tod":                float,
+        "cdr_analyzer":       float,
+        "financial_analyzer": float,
+        "hypothesis_manager": float
+    }
+    overall_case_confidence: float          # weighted average of above
+
+class ReasoningContradiction(BaseModel):
+    type:        str
+    step_a_id:   UUID
+    step_b_id:   UUID
+    description: str
+    severity:    str    # LOW/MEDIUM/HIGH
+
+class ReasoningGap(BaseModel):
+    type:        str
+    step_id:     UUID
+    description: str
+    severity:    str
+11. Overall Case Confidence
+python
+CONFIDENCE_WEIGHTS = {
+    "autopsy":            0.30,
+    "tod":                0.20,
+    "cdr_analyzer":       0.20,
+    "financial_analyzer": 0.10,
+    "hypothesis_manager": 0.20
+}
+
+def compute_overall_confidence(
+    confidence_summary: Dict[str, float],
+    contradictions:     List[ReasoningContradiction],
+    gaps:               List[ReasoningGap]
+) -> float:
+    base = sum(
+        confidence_summary.get(agent, 0.5) * weight
+        for agent, weight in CONFIDENCE_WEIGHTS.items()
+    )
+
+    # Penalize for contradictions:
+    high_contradictions = sum(1 for c in contradictions if c.severity == "HIGH")
+    base -= high_contradictions * 0.05
+
+    # Penalize for gaps:
+    high_gaps = sum(1 for g in gaps if g.severity == "HIGH")
+    base -= high_gaps * 0.03
+
+    return max(0.10, round(base, 4))
+12. Replay Steps (Meta — the Agent's Own Steps)
+python
+# Step 1: Collection
+log_replay_step(ReplayStep(
+    agent_id       = "reasoning_replay",
+    trigger_type   = TriggerType.DATA_NORMALIZATION,
+    input_summary  = f"Collecting replay steps from {len(agent_ids)} agents",
+    interpretation = f"Collected {total_steps} total steps. "
+                     f"Agents: {', '.join(agents_covered)}. "
+                     f"Total LLM tokens across pipeline: {total_tokens}.",
+    confidence     = 1.0
+))
+
+# Step 2: Gap & Contradiction Analysis
+log_replay_step(ReplayStep(
+    agent_id       = "reasoning_replay",
+    trigger_type   = TriggerType.CONSISTENCY_CHECK,
+    input_summary  = f"Running gap detection and contradiction checks on {total_steps} steps",
+    interpretation = f"Found {len(gaps)} reasoning gaps ({high_gaps} high severity) "
+                     f"and {len(contradictions)} contradictions. "
+                     f"Overall case confidence: {overall_confidence:.0%}.",
+    confidence     = overall_confidence
+))
+
+# Step 3: Narrative
+log_replay_step(ReplayStep(
+    agent_id       = "reasoning_replay",
+    trigger_type   = TriggerType.LLM_NARRATIVE,
+    input_summary  = "Generating plain-English reasoning chain narrative",
+    interpretation = f"Narrative generated ({len(narrative.split())} words). "
+                     f"Key conclusion: {primary_hypothesis} at {primary_confidence:.0%}.",
+    confidence     = overall_confidence
+))
+13. WebSocket Events
+python
+# After collection:
+emit_ws("replay_steps_collected",  { "count": total_steps, "agents": agents_covered })
+
+# After gap detection:
+emit_ws("reasoning_gaps_found",     { "gaps": len(gaps), "contradictions": len(contradictions) })
+
+# After narrative:
+emit_ws("reasoning_replay_complete",{ "overall_confidence": overall_confidence,
+                                       "narrative_preview": narrative[:200] })
+14. Performance Targets
+Metric	Target
+DB collection (500 steps)	< 2 seconds
+Gap/contradiction detection	< 0.5 seconds
+DAG construction	< 1 second
+LLM narrative generation	< 8 seconds
+Total agent timeout	60 seconds
+15. UI Integration
+The Reasoning Replay Agent feeds the Reasoning Replay Tab in the case UI, which renders:
+
+Step Index Table — scrollable table, all steps, color-coded by confidence (green ≥ 0.80, amber 0.60–0.79, red < 0.60)
+
+DAG Viewer — interactive graph, nodes grouped by agent tier, edges show dependency, click node to expand full step detail
+
+Contradiction Banner — red alert at top if any HIGH contradiction detected
+
+Gap Warnings — inline yellow cards within the step table at gap locations
+
+Narrative Panel — full 500-word plain English explanation, exportable as PDF
+
+Overall Confidence Badge — single percentage on the case header, derived from overall_case_confidence

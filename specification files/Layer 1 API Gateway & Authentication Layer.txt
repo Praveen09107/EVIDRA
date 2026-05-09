@@ -1,0 +1,1650 @@
+AIVENTRA — Layer 1: API Gateway & Authentication Layer
+Full Technical Specification
+Layer: 1 of 4 | Domain: Ingress, Identity, Authorization, Rate Limiting, Session Management
+Runtime: FastAPI (Python 3.12) | Port: 8000 (internal), 443 (external via Nginx)
+
+PART I — LAYER PURPOSE & BOUNDARIES
+Layer 1 is the only entry point into the AIVENTRA system. Nothing reaches the database, the orchestrator, or any agent without passing through every control gate in this layer. Its responsibilities divide into five domains:
+
+TLS Termination & Request Routing — Nginx handles TLS, routes to FastAPI
+
+Authentication — 3-factor: email + bcrypt password + TOTP, issues RS256 JWTs
+
+Session Management — short-lived access tokens, long-lived refresh tokens, Redis-backed blacklist
+
+Authorization (RBAC) — per-endpoint role enforcement with case-level assignment checks
+
+Rate Limiting & DDoS Protection — per-IP and per-user Redis sliding window counters
+
+Layer 1 does not perform any forensic computation, agent dispatch, or LLM calls. Its only external side effects are: (1) writes to users, audit_log tables; (2) reads/writes to Redis auth namespace; (3) issues JWT tokens.
+
+PART II — INFRASTRUCTURE STACK
+2.1 Components
+text
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           LAYER 1 — RUNTIME STACK                              │
+├──────────────────┬──────────────────────────────────────────────────────────────┤
+│ Component        │ Spec                                                         │
+├──────────────────┼──────────────────────────────────────────────────────────────┤
+│ Reverse Proxy    │ Nginx 1.26 — TLS termination, static caching, health checks │
+│ ASGI Server      │ Uvicorn 0.29 — 4 workers, lifespan management               │
+│ Web Framework    │ FastAPI 0.111 — async, Pydantic v2 validation                │
+│ Auth Crypto      │ PyJWT 2.8 (RS256), bcrypt 4.1 (cost factor 12)             │
+│ TOTP             │ pyotp 2.9.0 — RFC 6238 TOTP, 30s window, ±1 step tolerance  │
+│ Rate Limiting    │ Redis 7.2 — sliding window counters (Lua scripts)           │
+│ Token Storage    │ Redis 7.2 — blacklist sorted set, refresh token registry    │
+│ DB Access        │ asyncpg 0.29 — async PostgreSQL, min=5 / max=20 pool        │
+│ Schema Validate  │ Pydantic v2 — strict mode, no extra fields                  │
+│ Middleware       │ Custom: AuthMiddleware, RateLimitMiddleware, CORSMiddleware  │
+├──────────────────┼──────────────────────────────────────────────────────────────┤
+│ Key Files        │ keys/auth_private.pem (RS256 signing — NEVER leaves server) │
+│                  │ keys/auth_public.pem  (RS256 verification)                  │
+│                  │ keys/orchestrator_public.pem (verifying agent output sigs)  │
+└──────────────────┴──────────────────────────────────────────────────────────────┘
+2.2 Network Topology
+text
+External Client (browser / mobile)
+         │
+         │ HTTPS :443
+         ▼
+┌─────────────────────┐
+│   Nginx (TLS term)  │  ← certs/fullchain.pem, certs/privkey.pem
+│   Port 443 → 8000   │  ← HTTP/2 enabled, HSTS, OCSP stapling
+└──────────┬──────────┘
+           │ HTTP/1.1 internal
+           │ :8000
+           ▼
+┌──────────────────────────────────────────┐
+│       FastAPI Application                │
+│  Middleware Stack (bottom-up execution)  │
+│  1. CORSMiddleware                       │
+│  2. RateLimitMiddleware                  │
+│  3. SecurityHeadersMiddleware            │
+│  4. AuthMiddleware (JWT validation)      │
+│  5. Route Handler                        │
+└──────────────────────────────────────────┘
+           │
+           │ asyncpg
+           ▼
+    ┌─────────────┐         ┌─────────────────┐
+    │ PostgreSQL  │         │ Redis           │
+    │ users table │         │ auth namespace  │
+    │ audit_log   │         │ rate limit ns   │
+    │ cases table │         │ token blacklist │
+    └─────────────┘         └─────────────────┘
+2.3 Nginx Configuration (Layer 1 Relevant Sections)
+text
+# /etc/nginx/conf.d/aiventra.conf
+
+upstream fastapi_backend {
+    server api:8000;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name aiventra.internal;
+
+    # TLS
+    ssl_certificate     /certs/fullchain.pem;
+    ssl_certificate_key /certs/privkey.pem;
+    ssl_protocols       TLSv1.3;                  # TLS 1.3 ONLY
+    ssl_ciphers         TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
+    ssl_session_timeout 1d;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_stapling        on;
+    ssl_stapling_verify on;
+
+    # HSTS
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # Security headers (Layer 1 responsibility)
+    add_header X-Frame-Options          "DENY"              always;
+    add_header X-Content-Type-Options   "nosniff"           always;
+    add_header Referrer-Policy          "no-referrer"       always;
+    add_header Permissions-Policy       "camera=(), microphone=(), geolocation=()" always;
+    add_header Content-Security-Policy  "default-src 'self'; script-src 'self'; object-src 'none'" always;
+
+    # Rate limiting at Nginx layer (coarse — before FastAPI)
+    limit_req_zone $binary_remote_addr zone=auth_zone:10m rate=10r/m;
+    limit_req_zone $binary_remote_addr zone=api_zone:10m  rate=100r/m;
+
+    location /auth/ {
+        limit_req zone=auth_zone burst=5 nodelay;
+        proxy_pass http://fastapi_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header X-Real-IP       $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host            $host;
+    }
+
+    location /ws/ {
+        proxy_pass http://fastapi_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        limit_req zone=api_zone burst=30 nodelay;
+        proxy_pass http://fastapi_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header X-Real-IP       $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host            $host;
+    }
+
+    # Block direct access to internal health from external
+    location /internal/ {
+        deny all;
+    }
+}
+
+# HTTP → HTTPS redirect
+server {
+    listen 80;
+    server_name aiventra.internal;
+    return 301 https://$host$request_uri;
+}
+PART III — DATA MODELS (Layer 1 Owned)
+3.1 PostgreSQL — users Table
+sql
+CREATE TABLE users (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id       UUID NOT NULL REFERENCES organizations(id),
+    email                 TEXT NOT NULL UNIQUE,
+    password_hash         TEXT NOT NULL,           -- bcrypt(cost=12), never plaintext
+    full_name             TEXT NOT NULL,
+    role                  TEXT NOT NULL CHECK (role IN (
+                            'ADMIN', 'LEAD_INVESTIGATOR', 'ANALYST', 'MEDICAL_EXAMINER'
+                          )),
+    badge_number          TEXT UNIQUE,             -- optional official ID
+    totp_secret           TEXT NOT NULL,           -- base32, AES-encrypted at rest
+    totp_enabled          BOOLEAN NOT NULL DEFAULT TRUE,
+    is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+    must_change_password  BOOLEAN NOT NULL DEFAULT FALSE,
+    failed_login_count    INTEGER NOT NULL DEFAULT 0,
+    locked_until          TIMESTAMPTZ,             -- set on 5 failed logins
+    last_login_at         TIMESTAMPTZ,
+    last_login_ip         INET,
+    password_changed_at   TIMESTAMPTZ DEFAULT NOW(),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Indexes
+CREATE INDEX idx_users_email        ON users(email);
+CREATE INDEX idx_users_org_role     ON users(organization_id, role);
+CREATE INDEX idx_users_active       ON users(is_active) WHERE is_active = TRUE;
+Field Notes:
+
+password_hash: stored as $2b$12$<22-char-salt><31-char-hash> — bcrypt output. Cost factor 12 chosen to require ~300ms per verification (brute-force resistant).
+
+totp_secret: 32-character base32 string, AES-256-CBC encrypted at rest using AIVENTRA_MASTER_KEY before insert. Raw secret never persisted.
+
+locked_until: set to NOW() + 15 minutes on 5th consecutive failed login. NULL means not locked.
+
+3.2 PostgreSQL — refresh_token_registry Table
+sql
+CREATE TABLE refresh_token_registry (
+    jti           UUID PRIMARY KEY,           -- JWT ID, unique per token
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    issued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at    TIMESTAMPTZ NOT NULL,       -- NOW() + 7 days
+    last_used_at  TIMESTAMPTZ,
+    ip_address    INET,
+    user_agent    TEXT,
+    is_revoked    BOOLEAN NOT NULL DEFAULT FALSE,
+    revoked_at    TIMESTAMPTZ,
+    revoked_by    TEXT                        -- "user", "admin", "system"
+);
+
+CREATE INDEX idx_refresh_user       ON refresh_token_registry(user_id);
+CREATE INDEX idx_refresh_active     ON refresh_token_registry(user_id, is_revoked)
+             WHERE is_revoked = FALSE;
+CREATE INDEX idx_refresh_expires    ON refresh_token_registry(expires_at);
+3.3 Redis — Auth Namespace Structure
+text
+Key pattern                                 Type        TTL         Purpose
+──────────────────────────────────────────────────────────────────────────────────────
+aiventra:auth:blacklist                     ZSET        —           Access token blacklist
+                                                                    score = exp timestamp
+                                                                    member = jti
+
+aiventra:auth:refresh:{jti}                 STRING      7 days      Active refresh token
+                                                                    value = user_id
+
+aiventra:auth:totp_used:{user_id}:{code}    STRING      90 sec      TOTP replay prevention
+                                                                    value = "1"
+
+aiventra:rate:auth:{ip}                     ZSET        2 min       Auth endpoint rate limit
+                                                                    sliding window of req timestamps
+
+aiventra:rate:api:{user_id}                 ZSET        1 min       API rate limit per user
+                                                                    sliding window
+
+aiventra:rate:ip:{ip}                       ZSET        1 min       IP-level API rate limit
+
+aiventra:security:failed_login:{ip}         STRING      15 min      Failed login counter per IP
+aiventra:security:failed_login:{user_id}    STRING      15 min      Failed login counter per user
+
+aiventra:session:{user_id}                  SET         —           Set of active session JTIs
+                                                                    (for /auth/me active sessions)
+3.4 JWT Token Schemas
+Access Token Payload
+json
+{
+  "iss":   "aiventra-api",
+  "sub":   "550e8400-e29b-41d4-a716-446655440000",
+  "jti":   "a3f89b12-1234-4567-89ab-cdef01234567",
+  "iat":   1746816000,
+  "exp":   1746819600,
+  "typ":   "access",
+  "role":  "LEAD_INVESTIGATOR",
+  "org":   "org_01",
+  "name":  "Investigator B9921"
+}
+sub: user UUID
+
+jti: unique token ID (UUID v4) — used for blacklisting on logout
+
+exp: iat + 3600 (1 hour)
+
+typ: "access" — prevents refresh tokens being used as access tokens
+
+Algorithm: RS256 — private key signs, public key verifies; microservices only need public key
+
+Refresh Token Payload
+json
+{
+  "iss":  "aiventra-api",
+  "sub":  "550e8400-e29b-41d4-a716-446655440000",
+  "jti":  "b9f34a21-9876-4321-abcd-ef0123456789",
+  "iat":  1746816000,
+  "exp":  1747420800,
+  "typ":  "refresh"
+}
+exp: iat + 604800 (7 days)
+
+typ: "refresh" — strictly rejected by all non-/auth/refresh endpoints
+
+Stored: as httpOnly, Secure, SameSite=Strict cookie + registry in DB + Redis
+
+PART IV — COMPLETE AUTHENTICATION WORKFLOW
+4.1 Registration (Admin-Created User) — POST /admin/users
+text
+TRIGGER: POST /admin/users
+CALLER:  Authenticated ADMIN user
+BODY:
+{
+  "email":       "investigator@agency.gov",
+  "full_name":   "Officer Ravi Shankar",
+  "role":        "LEAD_INVESTIGATOR",
+  "badge_number": "B9921"
+}
+
+═══════════════════════════════════════════════════════════════
+STEP 1: LAYER 1 MIDDLEWARE STACK (runs before handler)
+═══════════════════════════════════════════════════════════════
+
+1.1  CORSMiddleware:
+     - Check Origin header against ALLOWED_ORIGINS list
+     - If not in list → 403, stop
+     - Set response headers: Access-Control-Allow-Origin: <origin>
+
+1.2  RateLimitMiddleware:
+     - Extract IP from X-Real-IP header (set by Nginx)
+     - Redis ZADD + ZRANGEBYSCORE sliding window check (see Section 7.1)
+     - This endpoint: admin_zone — 30 req/min per user
+     - If exceeded → 429 Too Many Requests, stop
+
+1.3  SecurityHeadersMiddleware:
+     - Attaches X-Request-ID: uuid4() to request state (for log correlation)
+
+1.4  AuthMiddleware:
+     - Extract Authorization: Bearer <token> header
+     - Decode JWT with auth_public.pem (RS256)
+     - Verify: algorithm == RS256, issuer == "aiventra-api", type == "access"
+     - Verify: exp > now (not expired)
+     - Verify: jti NOT in Redis blacklist (aiventra:auth:blacklist ZSCORE)
+     - Load user: SELECT * FROM users WHERE id = sub AND is_active = TRUE
+     - Attach user to request.state.user
+
+═══════════════════════════════════════════════════════════════
+STEP 2: ROUTE HANDLER — create_user()
+═══════════════════════════════════════════════════════════════
+
+2.1  RBAC Check:
+     require_role(request.state.user, ["ADMIN"])
+     → If role != ADMIN → 403 Forbidden
+
+2.2  Input Validation (Pydantic v2 strict mode):
+     - email: EmailStr validator → normalized to lowercase
+     - full_name: 2–100 chars
+     - role: Literal["ADMIN","LEAD_INVESTIGATOR","ANALYST","MEDICAL_EXAMINER"]
+     - badge_number: optional, regex r"^[A-Z0-9]{2,20}$"
+     - No extra fields allowed (model_config = {"extra": "forbid"})
+     → Validation failure → 422 Unprocessable Entity
+
+2.3  Duplicate Check:
+     SELECT id FROM users WHERE email = $1
+     → If exists → 409 Conflict {"error": "EMAIL_ALREADY_EXISTS"}
+
+2.4  Temporary Password Generation:
+     temp_password = secrets.token_urlsafe(16)
+     password_hash = bcrypt.hashpw(
+         temp_password.encode("utf-8"),
+         bcrypt.gensalt(rounds=12)
+     ).decode("utf-8")
+     → bcrypt cost=12 takes ~300ms intentionally (brute-force mitigation)
+
+2.5  TOTP Secret Generation:
+     raw_totp_secret = pyotp.random_base32()  # 32-char base32 string
+     Encryption:
+       iv = os.urandom(16)
+       cipher = AES.new(MASTER_KEY_BYTES, AES.MODE_CBC, iv)
+       padded = pad(raw_totp_secret.encode(), AES.block_size)
+       encrypted_secret = base64.b64encode(iv + cipher.encrypt(padded)).decode()
+
+2.6  Database Insert:
+     INSERT INTO users (
+       id, organization_id, email, password_hash, full_name,
+       role, badge_number, totp_secret, totp_enabled, is_active,
+       must_change_password, created_at, updated_at
+     ) VALUES (
+       gen_random_uuid(), $org_id, $email, $password_hash, $full_name,
+       $role, $badge_number, $encrypted_secret, TRUE, TRUE,
+       TRUE,    ← forces password change on first login
+       NOW(), NOW()
+     )
+     RETURNING id
+
+2.7  TOTP Provisioning URI Construction:
+     totp_uri = pyotp.TOTP(raw_totp_secret).provisioning_uri(
+         name=email,
+         issuer_name="AIVENTRA"
+     )
+     → Returns: "otpauth://totp/AIVENTRA:investigator@agency.gov?secret=XXXXX&issuer=AIVENTRA"
+     → Frontend generates QR code from this URI client-side (never stored)
+
+2.8  Audit Log:
+     INSERT audit_log: {
+       action: "USER_CREATED",
+       result: "SUCCESS",
+       actor_id: request.state.user.id,
+       actor_role: "ADMIN",
+       resource_type: "USER",
+       resource_id: new_user_id,
+       ip_address: request_ip,
+       context: { email, role, badge_number }
+     }
+
+2.9  Response:
+     HTTP 201 Created
+     {
+       "user_id":             "<uuid>",
+       "email":               "investigator@agency.gov",
+       "role":                "LEAD_INVESTIGATOR",
+       "temp_password":       "xK9mP2nQ...",  ← shown ONCE, never stored in plain
+       "totp_provisioning_uri": "otpauth://...",
+       "must_change_password": true,
+       "message": "Share credentials securely. User must scan TOTP QR and change password on first login."
+     }
+4.2 Login Flow — POST /auth/login (FULL DETAIL)
+text
+TRIGGER: POST /auth/login
+AUTHENTICATION: None (public endpoint)
+BODY:
+{
+  "email":    "investigator@agency.gov",
+  "password": "xK9mP2nQ...",
+  "totp_code": "482917"
+}
+
+═══════════════════════════════════════════════════════════════
+STEP 1: NGINX PRE-PROCESSING
+═══════════════════════════════════════════════════════════════
+
+1.1  Nginx rate limit: auth_zone = 10 req/min per IP
+     If exceeded → 429 returned by Nginx before FastAPI sees request
+
+1.2  Request forwarded with:
+     X-Real-IP:       lient IP>
+     X-Forwarded-For: lient IP, proxy IPs>
+     X-Request-ID:    <generated by Nginx or FastAPI middleware>
+
+═══════════════════════════════════════════════════════════════
+STEP 2: FASTAPI MIDDLEWARE STACK
+═══════════════════════════════════════════════════════════════
+
+2.1  CORSMiddleware:
+     - Validates Origin header
+     - /auth/login: allowed from FRONTEND_ORIGIN only
+
+2.2  RateLimitMiddleware — IP sliding window:
+     ip = request.headers.get("X-Real-IP")
+     Redis Lua script (atomic):
+       now_ms = current time in milliseconds
+       window = 120000  ← 2 minutes
+       key = "aiventra:rate:auth:{ip}"
+       ZREMRANGEBYSCORE key 0 (now_ms - window)    ← remove old entries
+       count = ZCARD key
+       if count >= 10:                              ← 10 attempts per 2 min per IP
+         return BLOCKED
+       ZADD key now_ms now_ms
+       EXPIRE key 120
+       return ALLOWED
+     → If BLOCKED → 429, stop
+     → Audit: RATE_LIMIT_HIT (result: BLOCKED, context: {ip, endpoint: /auth/login})
+
+2.3  AuthMiddleware:
+     - /auth/login is in EXEMPT_PATHS set → skips JWT check
+     - Passes through
+
+═══════════════════════════════════════════════════════════════
+STEP 3: ROUTE HANDLER — login()
+═══════════════════════════════════════════════════════════════
+
+3.1  Input Validation:
+     email:     EmailStr → lowercased, max 254 chars
+     password:  str, min 1 char, max 256 chars (no actual validation — bcrypt will reject wrong ones)
+     totp_code: str matching r"^\d{6}$" (exactly 6 digits)
+     Extra fields: forbidden
+
+3.2  Constant-Time Email Lookup:
+     user = await db.fetchrow(
+         "SELECT * FROM users WHERE email = $1",
+         email.lower()
+     )
+
+     CRITICAL — if user not found, still run bcrypt to prevent timing oracle:
+     if user is None:
+         bcrypt.checkpw(password.encode(), DUMMY_HASH)   ← ~300ms constant-time wait
+         await _record_failed_login(ip=request_ip, email=email, reason="USER_NOT_FOUND")
+         raise HTTPException(401, "INVALID_CREDENTIALS")
+         ← Generic message — never reveal "user not found" vs "wrong password"
+
+3.3  Account Lock Check:
+     if user.locked_until is not None and user.locked_until > NOW():
+       remaining_minutes = ceil((user.locked_until - NOW()).seconds / 60)
+       await _record_failed_login(ip, email, "ACCOUNT_LOCKED")
+       raise HTTPException(401, "ACCOUNT_TEMPORARILY_LOCKED",
+                           headers={"Retry-After": str(remaining_seconds)})
+
+3.4  Account Active Check:
+     if not user.is_active:
+       await _record_failed_login(ip, email, "ACCOUNT_DEACTIVATED")
+       raise HTTPException(403, "ACCOUNT_DEACTIVATED")
+
+3.5  Password Verification (bcrypt):
+     password_valid = bcrypt.checkpw(
+         password.encode("utf-8"),
+         user.password_hash.encode("utf-8")
+     )
+     → Runs in ~300ms regardless of correctness (timing attack prevention)
+
+     if not password_valid:
+       await _handle_failed_password(user, ip)  ← increments counter, maybe locks
+       raise HTTPException(401, "INVALID_CREDENTIALS")
+
+3.6  TOTP Verification:
+     Decrypt TOTP secret:
+       encrypted_bytes = base64.b64decode(user.totp_secret)
+       iv = encrypted_bytes[:16]
+       ciphertext = encrypted_bytes[16:]
+       cipher = AES.new(MASTER_KEY_BYTES, AES.MODE_CBC, iv)
+       raw_secret = unpad(cipher.decrypt(ciphertext), AES.block_size).decode()
+
+     Verify code:
+       totp = pyotp.TOTP(raw_secret)
+       code_valid = totp.verify(
+           totp_code,
+           valid_window=1   ← accepts current window ± 1 (30s × 3 = 90s tolerance)
+       )
+       → pyotp internally checks: current_interval, current_interval-1, current_interval+1
+
+     TOTP Replay Prevention:
+       replay_key = f"aiventra:auth:totp_used:{user.id}:{totp_code}"
+       already_used = await redis.get(replay_key)
+       if already_used:
+         await _record_failed_login(ip, email, "TOTP_REPLAY_ATTEMPT")
+         raise HTTPException(401, "TOTP_CODE_ALREADY_USED")
+       → Set replay key with 90s TTL (covers the 3-window validity period)
+       await redis.set(replay_key, "1", ex=90)
+
+     if not code_valid:
+       await _handle_failed_password(user, ip)
+       raise HTTPException(401, "INVALID_CREDENTIALS")
+       ← Same error as wrong password — never reveal which factor failed
+
+3.7  Reset Failed Login Counter:
+     UPDATE users SET
+       failed_login_count = 0,
+       locked_until = NULL,
+       last_login_at = NOW(),
+       last_login_ip = $ip
+     WHERE id = $user_id
+
+     Redis DEL aiventra:security:failed_login:{ip}
+     Redis DEL aiventra:security:failed_login:{user_id}
+
+3.8  Access Token Generation:
+     access_jti = str(uuid4())
+     now = int(time.time())
+
+     access_payload = {
+       "iss":  "aiventra-api",
+       "sub":  str(user.id),
+       "jti":  access_jti,
+       "iat":  now,
+       "exp":  now + 3600,           ← 1 hour
+       "typ":  "access",
+       "role": user.role,
+       "org":  str(user.organization_id),
+       "name": user.full_name
+     }
+
+     access_token = jwt.encode(
+         access_payload,
+         load_private_key("keys/auth_private.pem"),
+         algorithm="RS256"
+     )
+
+3.9  Refresh Token Generation:
+     refresh_jti = str(uuid4())
+     refresh_expires = now + 604800   ← 7 days
+
+     refresh_payload = {
+       "iss": "aiventra-api",
+       "sub": str(user.id),
+       "jti": refresh_jti,
+       "iat": now,
+       "exp": refresh_expires,
+       "typ": "refresh"
+     }
+
+     refresh_token = jwt.encode(
+         refresh_payload,
+         load_private_key("keys/auth_private.pem"),
+         algorithm="RS256"
+     )
+
+3.10  Persist Refresh Token:
+      INSERT refresh_token_registry:
+      (jti=refresh_jti, user_id=user.id,
+       expires_at=datetime.fromtimestamp(refresh_expires),
+       ip_address=request_ip, user_agent=request.headers.get("User-Agent"))
+
+      Redis SETEX aiventra:auth:refresh:{refresh_jti}  604800  str(user.id)
+      → Dual storage: Redis for speed, DB for persistence + revocation audit
+
+      Redis SADD aiventra:session:{user.id}  {access_jti}
+      → Track active sessions for this user
+
+3.11  Audit:
+      INSERT audit_log: {
+        action: "SUCCESSFUL_LOGIN",
+        result: "SUCCESS",
+        actor_id: user.id,
+        actor_role: user.role,
+        ip_address: request_ip,
+        user_agent: user_agent,
+        context: { must_change_password: user.must_change_password }
+      }
+
+3.12  must_change_password check:
+      if user.must_change_password:
+        → Include warning in response: force_password_change: true
+        → Frontend must redirect to /change-password before any other action
+        → Access token payload includes "must_change_password": true
+        → AuthMiddleware will block all non-auth endpoints until changed
+
+3.13  Response Construction:
+      Access token → returned in response body (Authorization header flow)
+      Refresh token → set as httpOnly cookie [web:678][web:681]:
+
+      response.set_cookie(
+          key="aiventra_refresh",
+          value=refresh_token,
+          max_age=604800,
+          httponly=True,          ← JavaScript cannot read this
+          secure=True,            ← HTTPS only
+          samesite="strict",      ← CSRF protection
+          path="/auth/refresh"    ← Only sent to refresh endpoint
+      )
+
+      HTTP 200 OK
+      {
+        "access_token":         "<RS256 JWT>",
+        "token_type":           "Bearer",
+        "expires_in":           3600,
+        "user": {
+          "id":                 "<uuid>",
+          "email":              "investigator@agency.gov",
+          "full_name":          "Officer Ravi Shankar",
+          "role":               "LEAD_INVESTIGATOR",
+          "badge_number":       "B9921"
+        },
+        "force_password_change": false
+      }
+4.3 _handle_failed_password() — Lockout Sub-Workflow
+text
+async def _handle_failed_password(user, ip):
+
+1.  Increment DB counter:
+    UPDATE users SET
+      failed_login_count = failed_login_count + 1,
+      locked_until = CASE
+        WHEN failed_login_count + 1 >= 5
+        THEN NOW() + INTERVAL '15 minutes'
+        ELSE NULL
+      END
+    WHERE id = $user_id
+    RETURNING failed_login_count, locked_until
+
+2.  Increment Redis counters (for IP-level tracking):
+    Redis INCR aiventra:security:failed_login:{ip}    EX 900
+    Redis INCR aiventra:security:failed_login:{user_id} EX 900
+
+3.  If new_failed_count >= 5:
+    a. Account is now locked → locked_until = NOW() + 15 min
+    b. Revoke all active sessions:
+       → SELECT jti FROM refresh_token_registry WHERE user_id=$1 AND is_revoked=FALSE
+       → For each jti:
+           UPDATE refresh_token_registry SET is_revoked=TRUE, revoked_at=NOW(), revoked_by="system"
+           Redis DEL aiventra:auth:refresh:{jti}
+    c. INSERT audit_log: {action: "ACCOUNT_LOCKED", result: "ALERT", actor_id: user.id,
+                           context: {reason: "5_FAILED_LOGINS", locked_until}}
+    d. WS broadcast to ADMIN: {type: SECURITY_ALERT, alert_type: "ACCOUNT_LOCKED", user_id}
+
+4.  INSERT audit_log: {action: "FAILED_LOGIN", result: "FAILURE",
+                        actor_id: user.id, ip_address: ip,
+                        context: {failed_count: new_count, reason: "WRONG_CREDENTIAL"}}
+4.4 Token Refresh Flow — POST /auth/refresh
+text
+TRIGGER: POST /auth/refresh
+AUTH:    httpOnly refresh token cookie (automatically sent by browser)
+         OR refresh_token in body (for mobile clients)
+
+═══════════════════════════════════════════════════════════════
+STEP 1: MIDDLEWARE
+═══════════════════════════════════════════════════════════════
+
+1.1  RateLimitMiddleware: refresh_zone → 20 req/min per IP
+1.2  AuthMiddleware: /auth/refresh in EXEMPT_PATHS → skips access token check
+
+═══════════════════════════════════════════════════════════════
+STEP 2: HANDLER — refresh_token()
+═══════════════════════════════════════════════════════════════
+
+2.1  Extract refresh token:
+     token = request.cookies.get("aiventra_refresh")
+     OR request.json.get("refresh_token")
+     If neither: raise HTTPException(401, "REFRESH_TOKEN_MISSING")
+
+2.2  Decode without verification first (to extract jti):
+     unverified = jwt.decode(token, options={"verify_signature": False})
+     jti = unverified.get("jti")
+     If no jti: raise HTTPException(401, "MALFORMED_REFRESH_TOKEN")
+
+2.3  Typ check (BEFORE signature verification):
+     if unverified.get("typ") != "refresh":
+       → This is an access token being replayed as refresh — ATTACK
+       INSERT audit_log: {action: "TOKEN_TYPE_CONFUSION_ATTACK", result: "ALERT"}
+       raise HTTPException(401, "INVALID_TOKEN_TYPE")
+
+2.4  Signature and Claims Verification:
+     payload = jwt.decode(
+         token,
+         load_public_key("keys/auth_public.pem"),
+         algorithms=["RS256"],
+         options={
+           "require": ["exp", "iat", "sub", "jti", "typ"],
+           "verify_exp": True,
+           "verify_iss": True
+         },
+         issuer="aiventra-api"
+     )
+     Failure → 401 INVALID_REFRESH_TOKEN
+
+2.5  Redis Existence Check:
+     stored_user_id = await redis.get(f"aiventra:auth:refresh:{jti}")
+     if stored_user_id is None:
+       → Either expired or already revoked
+       INSERT audit_log: {action: "REFRESH_TOKEN_INVALID", result: "FAILURE"}
+       raise HTTPException(401, "REFRESH_TOKEN_INVALID")
+
+2.6  DB Revocation Check:
+     row = await db.fetchrow(
+         "SELECT is_revoked, user_id FROM refresh_token_registry WHERE jti = $1",
+         jti
+     )
+     if row.is_revoked:
+       → POSSIBLE THEFT — token was revoked but attacker has it
+       INSERT audit_log: {action: "REVOKED_REFRESH_TOKEN_USED", result: "ALERT",
+                           context: {jti, sub: payload["sub"]}}
+       WS broadcast to ADMIN: SECURITY_ALERT → REVOKED_TOKEN_REPLAY
+       raise HTTPException(401, "REFRESH_TOKEN_REVOKED")
+
+2.7  User Validity Check:
+     user = await db.fetchrow("SELECT * FROM users WHERE id = $1 AND is_active = TRUE",
+                               UUID(payload["sub"]))
+     if not user:
+       raise HTTPException(401, "USER_INACTIVE")
+
+2.8  REFRESH TOKEN ROTATION (security best practice):
+     Old token is invalidated, new one issued.
+
+     a. Revoke old refresh token:
+        UPDATE refresh_token_registry SET is_revoked=TRUE, revoked_at=NOW(), revoked_by="rotation"
+        WHERE jti=$old_jti
+        Redis DEL aiventra:auth:refresh:{old_jti}
+
+     b. Issue new access token (same as step 3.8 in login flow)
+     c. Issue new refresh token (same as step 3.9 in login flow)
+     d. Persist new refresh token (step 3.10)
+
+2.9  Update last_used_at:
+     UPDATE refresh_token_registry SET last_used_at=NOW() WHERE jti=$old_jti
+
+2.10  Audit:
+      INSERT audit_log: {action: "TOKEN_REFRESHED", result: "SUCCESS",
+                          actor_id: user.id, ip_address: request_ip}
+
+2.11  Response:
+      Set new httpOnly refresh cookie
+      Return new access token (same structure as login response)
+      HTTP 200 OK
+4.5 Logout Flow — POST /auth/logout
+text
+TRIGGER: POST /auth/logout
+AUTH:    Valid access token (Bearer)
+BODY:    { "logout_all_devices": false }   ← optional
+
+═══════════════════════════════════════════════════════════════
+STEP 1: MIDDLEWARE (full stack — token must be valid to logout)
+═══════════════════════════════════════════════════════════════
+
+1.1  AuthMiddleware fully validates access token
+1.2  Attaches user to request.state.user
+
+═══════════════════════════════════════════════════════════════
+STEP 2: HANDLER — logout()
+═══════════════════════════════════════════════════════════════
+
+2.1  Extract access token jti:
+     access_jti = request.state.token_payload["jti"]
+     access_exp  = request.state.token_payload["exp"]
+
+2.2  Blacklist access token:
+     Redis ZADD aiventra:auth:blacklist  {access_exp}  {access_jti}
+     → Score = expiry time → ZREMRANGEBySCORE used by cleanup job to prune expired entries
+     → Access token is now immediately unusable even before its exp
+
+2.3  Revoke current refresh token:
+     refresh_token = request.cookies.get("aiventra_refresh")
+     if refresh_token:
+       payload = jwt.decode(refresh_token, options={"verify_signature": False})
+       refresh_jti = payload.get("jti")
+       if refresh_jti:
+         UPDATE refresh_token_registry
+         SET is_revoked=TRUE, revoked_at=NOW(), revoked_by="user"
+         WHERE jti = $refresh_jti AND user_id = $user_id
+         Redis DEL aiventra:auth:refresh:{refresh_jti}
+
+2.4  If logout_all_devices == True:
+     SELECT jti FROM refresh_token_registry
+     WHERE user_id=$1 AND is_revoked=FALSE
+     For each jti:
+       UPDATE ... SET is_revoked=TRUE, revoked_by="user_all_devices"
+       Redis DEL aiventra:auth:refresh:{jti}
+     Redis DEL aiventra:session:{user.id}  ← clear session registry
+
+2.5  Clear refresh cookie:
+     response.delete_cookie("aiventra_refresh", path="/auth/refresh")
+
+2.6  Audit:
+     INSERT audit_log: {action: "LOGOUT", result: "SUCCESS",
+                         actor_id: user.id, ip_address: request_ip,
+                         context: {all_devices: logout_all_devices}}
+
+2.7  Response: HTTP 200 OK  { "message": "Logged out successfully" }
+4.6 Password Change Flow — POST /auth/change-password
+text
+TRIGGER: POST /auth/change-password
+AUTH:    Valid access token
+BODY:
+{
+  "current_password": "xK9mP2nQ...",
+  "new_password":     "Secure@2026#!inv",
+  "totp_code":        "193847"
+}
+
+2.1  AuthMiddleware validates token (normal flow)
+
+2.2  RBAC: any authenticated user can change own password (no role gate)
+
+2.3  Current password verification:
+     bcrypt.checkpw(current_password.encode(), user.password_hash.encode())
+     → False → 401 WRONG_CURRENT_PASSWORD
+
+2.4  New password strength validation:
+     Rules (Pydantic validator):
+     - Min 12 chars
+     - At least 1 uppercase, 1 lowercase, 1 digit, 1 special char
+     - Not same as current password:
+       bcrypt.checkpw(new_password.encode(), user.password_hash.encode())
+       → True → 400 SAME_AS_CURRENT_PASSWORD
+     - Not in common password list (top-10k checked)
+     → Failure → 400 WEAK_PASSWORD with specific reason
+
+2.5  TOTP re-verification (password change requires TOTP):
+     Same as 3.6 in login flow — decrypt secret, verify code, check replay
+
+2.6  Hash new password:
+     new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+2.7  Update DB:
+     UPDATE users SET
+       password_hash = $new_hash,
+       must_change_password = FALSE,
+       password_changed_at = NOW(),
+       updated_at = NOW()
+     WHERE id = $user_id
+
+2.8  Revoke ALL existing tokens (password change = full re-auth):
+     Blacklist current access token (same as logout 2.2)
+     Revoke all refresh tokens (same as logout_all_devices 2.4)
+
+2.9  Issue new access + refresh tokens (fresh login state)
+
+2.10  Audit:
+      INSERT audit_log: {action: "PASSWORD_CHANGED", result: "SUCCESS", actor_id}
+
+2.11  Response: HTTP 200 OK  {
+        "message": "Password changed successfully. All sessions terminated.",
+        "access_token": "<new access token>",
+        ...
+      }
+PART V — AUTHORIZATION MIDDLEWARE (Full Detail)
+5.1 AuthMiddleware — Request Processing Pipeline
+python
+class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Runs on EVERY request except EXEMPT_PATHS.
+    Validates JWT, checks blacklist, loads user, checks must_change_password.
+    """
+
+    EXEMPT_PATHS = {
+        "/auth/login",
+        "/auth/refresh",
+        "/health",
+        "/ready",
+        "/docs",         ← disabled in production
+        "/openapi.json", ← disabled in production
+    }
+
+    async def dispatch(self, request: Request, call_next):
+
+        # PHASE 1: Exempt path check
+        if request.url.path in self.EXEMPT_PATHS:
+            return await call_next(request)
+
+        # PHASE 2: Extract token
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "MISSING_AUTH_TOKEN",
+                         "detail": "Authorization: Bearer <token> header required"}
+            )
+        token = auth_header[7:]
+
+        # PHASE 3: Decode (without verify first — to extract jti for blacklist check)
+        try:
+            unverified = jwt.decode(token, options={"verify_signature": False,
+                                                      "verify_exp": False})
+        except jwt.DecodeError:
+            return JSONResponse(status_code=401,
+                                content={"error": "MALFORMED_TOKEN"})
+
+        # PHASE 4: Type check — reject refresh tokens on API endpoints
+        if unverified.get("typ") != "access":
+            await log_audit_event(
+                action="WRONG_TOKEN_TYPE", result="BLOCKED",
+                ip_address=request.headers.get("X-Real-IP"),
+                context={"typ": unverified.get("typ"), "path": request.url.path}
+            )
+            return JSONResponse(status_code=401,
+                                content={"error": "INVALID_TOKEN_TYPE"})
+
+        # PHASE 5: Blacklist check (Redis — fast path, before DB)
+        jti = unverified.get("jti", "")
+        score = await redis.zscore("aiventra:auth:blacklist", jti)
+        if score is not None:
+            return JSONResponse(status_code=401,
+                                content={"error": "TOKEN_REVOKED"})
+
+        # PHASE 6: Full cryptographic verification
+        try:
+            payload = jwt.decode(
+                token,
+                load_public_key("keys/auth_public.pem"),
+                algorithms=["RS256"],
+                options={
+                    "require": ["exp", "iat", "sub", "jti", "role", "typ"],
+                    "verify_exp": True,
+                    "verify_iss": True,
+                    "strict_aud": False    ← no audience claim required
+                },
+                issuer="aiventra-api"
+            )
+        except jwt.ExpiredSignatureError:
+            return JSONResponse(status_code=401,
+                                content={"error": "TOKEN_EXPIRED",
+                                         "detail": "Token has expired. Please refresh."})
+        except jwt.InvalidIssuerError:
+            await log_audit_event(action="FORGED_TOKEN_ISSUER", result="ALERT", ...)
+            return JSONResponse(status_code=401,
+                                content={"error": "TOKEN_ISSUER_INVALID"})
+        except jwt.InvalidAlgorithmError:
+            # Algorithm confusion attack — RS256 downgraded to HS256
+            await log_audit_event(action="ALGORITHM_CONFUSION_ATTACK", result="ALERT", ...)
+            return JSONResponse(status_code=401,
+                                content={"error": "ALGORITHM_NOT_ALLOWED"})
+        except jwt.InvalidSignatureError:
+            await log_audit_event(action="INVALID_TOKEN_SIGNATURE", result="ALERT", ...)
+            return JSONResponse(status_code=401,
+                                content={"error": "TOKEN_SIGNATURE_INVALID"})
+        except jwt.DecodeError as e:
+            return JSONResponse(status_code=401,
+                                content={"error": "TOKEN_DECODE_FAILED"})
+
+        # PHASE 7: Load user from DB (not from JWT — JWT is stateless but user state can change)
+        user = await db.fetchrow(
+            "SELECT id, email, full_name, role, organization_id, is_active, "
+            "must_change_password, locked_until FROM users WHERE id = $1",
+            UUID(payload["sub"])
+        )
+        if user is None:
+            return JSONResponse(status_code=401, content={"error": "USER_NOT_FOUND"})
+
+        if not user["is_active"]:
+            return JSONResponse(status_code=403, content={"error": "ACCOUNT_DEACTIVATED"})
+
+        if user["locked_until"] and user["locked_until"] > datetime.utcnow():
+            return JSONResponse(status_code=403, content={"error": "ACCOUNT_LOCKED"})
+
+        # PHASE 8: must_change_password gate
+        CHANGE_PASSWORD_EXEMPT = {"/auth/change-password", "/auth/logout", "/auth/me"}
+        if user["must_change_password"] and request.url.path not in CHANGE_PASSWORD_EXEMPT:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "MUST_CHANGE_PASSWORD",
+                         "detail": "Please change your temporary password before proceeding."}
+            )
+
+        # PHASE 9: Attach to request state
+        request.state.user         = user
+        request.state.token_payload = payload
+        request.state.token_jti    = jti
+
+        # PHASE 10: Process request
+        response = await call_next(request)
+        return response
+5.2 RBAC Enforcement — require_role() & require_case_access()
+python
+def require_role(user, allowed_roles: list[str]):
+    """
+    Simple role check. Called at the top of every route handler.
+    ADMIN has access to everything.
+    """
+    if user["role"] == "ADMIN":
+        return  # ADMIN bypasses all role gates
+    if user["role"] not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "INSUFFICIENT_ROLE",
+                "required": allowed_roles,
+                "current":  user["role"]
+            }
+        )
+
+async def require_case_access(user, case_id: UUID, db):
+    """
+    Verifies that the user is assigned to this specific case.
+    ADMIN bypasses this check.
+    """
+    if user["role"] == "ADMIN":
+        return  # Admin sees all cases
+
+    row = await db.fetchrow(
+        """
+        SELECT 1 FROM cases
+        WHERE id = $1
+        AND (
+          $2 = ANY(assigned_investigators)  -- user is assigned
+          OR created_by = $2                -- user created it
+        )
+        """,
+        case_id, user["id"]
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "CASE_ACCESS_DENIED",
+                    "detail": "You are not assigned to this case."}
+        )
+
+# Usage in every case-scoped endpoint:
+@router.get("/cases/{case_id}")
+async def get_case(case_id: UUID, request: Request, db=Depends(get_db)):
+    require_role(request.state.user, ["ADMIN", "LEAD_INVESTIGATOR", "ANALYST", "MEDICAL_EXAMINER"])
+    await require_case_access(request.state.user, case_id, db)
+    # ... rest of handler
+5.3 Role Permission Matrix
+text
+ENDPOINT GROUP                    ADMIN   LEAD_INV   ANALYST   MED_EXAM
+──────────────────────────────────────────────────────────────────────────
+POST   /admin/users               ✅       ❌          ❌        ❌
+GET    /admin/users               ✅       ❌          ❌        ❌
+PATCH  /admin/users/{id}/...      ✅       ❌          ❌        ❌
+GET    /admin/security            ✅       ❌          ❌        ❌
+GET    /audit/{case_id}           ✅       ❌          ❌        ❌
+GET    /audit/verify/{case_id}    ✅       ❌          ❌        ❌
+
+POST   /cases                     ✅       ✅          ❌        ❌
+GET    /cases/{id}                ✅       ✅(own)     ✅(own)   ✅(own)
+PATCH  /cases/{id}                ✅       ✅(own)     ❌        ❌
+PATCH  /cases/{id}/status         ✅       ✅(own)     ❌        ❌
+POST   /cases/{id}/assign         ✅       ✅(own)     ❌        ❌
+
+POST   /evidence/upload           ✅       ✅(own)     ❌        ❌
+GET    /evidence/{id}             ✅       ✅(own)     ✅(own)   ✅(own)
+GET    /evidence/{id}/download    ✅       ✅(own)     ❌        ✅(own med only)
+DELETE /evidence/{id}             ✅       ❌          ❌        ❌
+
+POST   /agents/run                ✅       ✅(own)     ❌        ❌
+GET    /agents/status/{case_id}   ✅       ✅(own)     ✅(own)   ✅(own)
+GET    /agents/outputs/{case_id}  ✅       ✅(own)     ✅(own)   ✅(own)
+
+GET    /reports/{case_id}         ✅(full) ✅(partial) ✅(masked) ✅(medical only)
+GET    /reports/{case_id}/pdf     ✅       ✅          ❌        ❌
+GET    /replay/{case_id}          ✅       ✅(own)     ❌        ❌
+
+GET    /cases/{id}/hypothesis     ✅       ✅(own)     ✅(own)   ❌
+GET    /cases/{id}/timeline       ✅       ✅(own)     ✅(own)   ✅(own)
+GET    /cases/{id}/hotspots       ✅       ✅(own)     ✅(own)   ❌
+
+(own) = only for cases assigned to them
+PART VI — RATE LIMITING (Full Specification)
+6.1 Rate Limit Architecture
+Layer 1 implements three independent rate limiting layers in cascade:
+
+text
+Request arrives
+      │
+      ▼
+[Layer A: Nginx coarse limit]
+  auth endpoints:  10 req/min per IP
+  api endpoints:  100 req/min per IP
+      │
+      ▼ (if passed Nginx)
+[Layer B: FastAPI RateLimitMiddleware]
+  Sliding window per (IP × endpoint_group)
+  Sliding window per (user_id × endpoint_group)  ← if authenticated
+      │
+      ▼ (if passed middleware)
+[Layer C: Endpoint-specific limits in handler]
+  e.g., evidence upload: 10 uploads per case per hour
+  e.g., pipeline run: 3 runs per case per 30 min
+6.2 Redis Lua Script — Sliding Window Rate Limiter
+lua
+-- rate_limit.lua
+-- Called with: EVALSHA <sha> 1 <key> <now_ms> <window_ms> <max_requests>
+
+local key        = KEYS[1]
+local now_ms     = tonumber(ARGV[1])
+local window_ms  = tonumber(ARGV[2])
+local max_reqs   = tonumber(ARGV[3])
+
+local window_start = now_ms - window_ms
+
+-- Remove entries outside the window
+redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+
+-- Count current requests in window
+local count = redis.call('ZCARD', key)
+
+if count >= max_reqs then
+    -- Return: blocked, current count, window_ms
+    return {0, count, window_ms}
+end
+
+-- Add current request
+redis.call('ZADD', key, now_ms, now_ms .. ':' .. math.random(1000000))
+
+-- Set TTL
+redis.call('PEXPIRE', key, window_ms)
+
+-- Return: allowed, new count, window_ms
+return {1, count + 1, window_ms}
+6.3 Rate Limit Tiers
+python
+RATE_LIMIT_TIERS = {
+    # (endpoint_group): (window_ms, max_requests, key_type)
+
+    "auth_login":         (120_000, 10,  "ip"),        # 10 per 2min per IP
+    "auth_refresh":       (60_000,  20,  "ip"),        # 20 per 1min per IP
+    "auth_change_pass":   (600_000, 5,   "user"),      # 5 per 10min per user
+    "case_create":        (3600_000,10,  "user"),      # 10 cases/hr per user
+    "evidence_upload":    (3600_000,20,  "user"),      # 20 uploads/hr per user
+    "pipeline_run":       (1800_000,3,   "case_user"), # 3 pipeline runs/30min per case per user
+    "report_download":    (3600_000,30,  "user"),      # 30 downloads/hr
+    "api_general":        (60_000,  120, "user"),      # 120 req/min general
+    "api_general_ip":     (60_000,  200, "ip"),        # 200 req/min per IP (unauthenticated)
+    "admin_endpoints":    (60_000,  60,  "user"),      # 60 req/min admin
+}
+6.4 RateLimitMiddleware Full Implementation
+python
+class RateLimitMiddleware(BaseHTTPMiddleware):
+
+    # Maps path prefix → tier name
+    PATH_TO_TIER = {
+        "/auth/login":          "auth_login",
+        "/auth/refresh":        "auth_refresh",
+        "/auth/change-password":"auth_change_pass",
+        "/admin/":              "admin_endpoints",
+        "/cases":               "api_general",
+        "/evidence/upload":     "evidence_upload",
+        "/agents/run":          "pipeline_run",
+        "/reports":             "report_download",
+    }
+
+    async def dispatch(self, request: Request, call_next):
+        ip      = request.headers.get("X-Real-IP", "unknown")
+        user_id = getattr(getattr(request.state, "user", None), "id", None)
+        path    = request.url.path
+        now_ms  = int(time.time() * 1000)
+
+        # Determine tier
+        tier = "api_general"
+        for prefix, t in self.PATH_TO_TIER.items():
+            if path.startswith(prefix):
+                tier = t
+                break
+
+        window_ms, max_reqs, key_type = RATE_LIMIT_TIERS[tier]
+
+        # Build Redis key
+        if key_type == "ip":
+            redis_key = f"aiventra:rate:{tier}:{ip}"
+        elif key_type == "user" and user_id:
+            redis_key = f"aiventra:rate:{tier}:{user_id}"
+        else:
+            redis_key = f"aiventra:rate:{tier}:{ip}"  # fallback to IP
+
+        # Execute Lua script (atomic)
+        result = await redis.evalsha(
+            RATE_LIMIT_LUA_SHA,
+            1, redis_key, now_ms, window_ms, max_reqs
+        )
+        allowed, current_count, window = result
+
+        if not allowed:
+            retry_after = window_ms // 1000
+            await log_audit_event(
+                action="RATE_LIMIT_HIT", result="BLOCKED",
+                actor_id=str(user_id) if user_id else None,
+                ip_address=ip,
+                context={"tier": tier, "count": current_count, "max": max_reqs}
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "RATE_LIMIT_EXCEEDED",
+                    "detail": f"Too many requests. Retry after {retry_after} seconds.",
+                    "retry_after": retry_after
+                },
+                headers={
+                    "Retry-After":       str(retry_after),
+                    "X-RateLimit-Limit": str(max_reqs),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(int(time.time()) + retry_after)
+                }
+            )
+
+        # Attach rate limit headers to all responses
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"]     = str(max_reqs)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, max_reqs - current_count))
+        response.headers["X-RateLimit-Reset"]     = str(int(time.time()) + window_ms // 1000)
+        return response
+PART VII — WEBSOCKET AUTHENTICATION WORKFLOW
+7.1 WS Handshake — GET /ws/case/{case_id}
+text
+Layer 1 also authenticates WebSocket connections.
+WS connections CANNOT use httpOnly cookies for auth easily → use token in query param or
+first message protocol.
+
+APPROACH: Token in first message (safest — avoids URL logging of tokens)
+
+═══════════════════════════════════════════════════════════════
+STEP 1: Initial Connection (unauthenticated)
+═══════════════════════════════════════════════════════════════
+
+1.1  Client sends: WS connect to wss://host/ws/case/{case_id}
+     (no auth header — WebSocket upgrade doesn't support Authorization header natively)
+
+1.2  FastAPI WS handler: websocket_endpoint() accepts connection
+     await websocket.accept()
+
+1.3  Server sends auth challenge:
+     await websocket.send_json({
+         "type": "AUTH_REQUIRED",
+         "message": "Send your access token in the next message"
+     })
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Client Auth Message
+═══════════════════════════════════════════════════════════════
+
+2.1  Client sends:
+     { "type": "AUTH", "token": "<access_token>" }
+
+2.2  Server receives within 10 seconds:
+     try:
+       msg = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+     except asyncio.TimeoutError:
+       await websocket.close(code=4001, reason="AUTH_TIMEOUT")
+       return
+
+2.3  Validate message structure:
+     if msg.get("type") != "AUTH" or not msg.get("token"):
+       await websocket.close(code=4001, reason="MALFORMED_AUTH")
+       return
+
+═══════════════════════════════════════════════════════════════
+STEP 3: Token Validation (same pipeline as HTTP)
+═══════════════════════════════════════════════════════════════
+
+3.1  Full JWT validation (phases 3–8 from AuthMiddleware)
+     → Blacklist check
+     → RS256 signature verify
+     → Load user from DB
+     → Active + lock checks
+     If any check fails:
+       await websocket.close(code=4001, reason="AUTH_FAILED")
+       INSERT audit_log: WS_AUTH_FAILURE
+       return
+
+3.2  Case access check:
+     await require_case_access(user, case_id, db)
+     If denied:
+       await websocket.close(code=4003, reason="CASE_ACCESS_DENIED")
+       return
+
+═══════════════════════════════════════════════════════════════
+STEP 4: Authenticated Session Established
+═══════════════════════════════════════════════════════════════
+
+4.1  Add connection to case room:
+     ws_manager.connect(case_id, user.id, websocket)
+     → In-memory registry: Dict[case_id, Dict[user_id, WebSocket]]
+
+4.2  Send initial state:
+     initial_state = await build_case_initial_state(case_id, user, db)
+     await websocket.send_json({"type": "INITIAL_STATE", "data": initial_state})
+
+4.3  Register keepalive:
+     asyncio.create_task(ws_keepalive(websocket))
+     → Every 30s: send { "type": "PING" }
+     → If client doesn't respond (connection dropped): disconnect
+
+4.4  Audit: WS_CONNECTED → {case_id, user_id, ip}
+
+═══════════════════════════════════════════════════════════════
+STEP 5: Token Expiry Handling During Active Connection
+═══════════════════════════════════════════════════════════════
+
+5.1  Background task: check token exp every 60s
+     if payload["exp"] < time.time() + 300:  ← expiring in 5 min
+       await websocket.send_json({
+         "type": "TOKEN_EXPIRING",
+         "expires_in": payload["exp"] - int(time.time()),
+         "message": "Access token expiring soon. Please refresh."
+       })
+     if payload["exp"] < time.time():
+       await websocket.close(code=4001, reason="TOKEN_EXPIRED")
+       → Client should reconnect with new token after refresh
+
+5.2  On reconnection:
+     Client calls POST /auth/refresh → gets new access token
+     Client re-opens WS and sends new token in AUTH message
+PART VIII — HEALTH & READINESS PROBES
+8.1 Liveness Probe — GET /health
+text
+PURPOSE:    "Is the process alive?"
+AUTH:       None — called by Docker/Nginx/Kubernetes
+RETURNS:    200 if process responding, 500 if dead
+
+Handler:
+async def health():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+Nginx uses this to route traffic.
+If this returns non-200: Nginx removes instance from upstream pool.
+8.2 Readiness Probe — GET /ready
+text
+PURPOSE:    "Is the application ready to serve real requests?"
+AUTH:       None (but blocked from external by Nginx location /internal/)
+RETURNS:    200 if all deps healthy, 503 if any dep down
+
+Handler:
+async def ready():
+    checks = {}
+
+    # PostgreSQL check
+    try:
+        await db.fetchval("SELECT 1")
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"FAIL: {str(e)}"
+
+    # Redis check
+    try:
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"FAIL: {str(e)}"
+
+    # Auth key check
+    try:
+        load_private_key("keys/auth_private.pem")
+        checks["auth_keys"] = "ok"
+    except Exception as e:
+        checks["auth_keys"] = f"FAIL: {str(e)}"
+
+    all_ok = all(v == "ok" for v in checks.values())
+    status_code = 200 if all_ok else 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status":    "ready" if all_ok else "degraded",
+            "checks":    checks,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+PART IX — AUDIT LOG (Layer 1 Events)
+9.1 Complete Layer 1 Audit Events
+text
+EVENT                           RESULT     TRIGGER
+──────────────────────────────────────────────────────────────────────────────────
+USER_CREATED                    SUCCESS    Admin creates new user
+SUCCESSFUL_LOGIN                SUCCESS    All 3 factors verified
+FAILED_LOGIN                    FAILURE    Wrong password / TOTP
+TOTP_REPLAY_ATTEMPT             ALERT      Same TOTP code used twice
+ACCOUNT_LOCKED                  ALERT      5 failed logins
+ACCOUNT_UNLOCKED                SUCCESS    Admin manually unlocks
+LOGOUT                          SUCCESS    User logs out
+TOKEN_REFRESHED                 SUCCESS    Refresh token rotated
+TOKEN_REVOKED                   SUCCESS    Admin revokes user token
+REVOKED_REFRESH_TOKEN_USED      ALERT      Attacker replays revoked token → all sessions killed
+WRONG_TOKEN_TYPE                ALERT      Refresh token used as access token (type confusion)
+ALGORITHM_CONFUSION_ATTACK      ALERT      RS256 → HS256 downgrade attempt
+INVALID_TOKEN_SIGNATURE         ALERT      Forged/tampered token presented
+TOKEN_ISSUER_INVALID            ALERT      Wrong issuer in token
+PASSWORD_CHANGED                SUCCESS    User changes password
+RATE_LIMIT_HIT                  BLOCKED    Request blocked by rate limiter
+RATE_LIMIT_HIT_AUTH             BLOCKED    Auth endpoint rate limited (more sensitive)
+WS_CONNECTED                    SUCCESS    WebSocket authenticated
+WS_AUTH_FAILURE                 FAILURE    WebSocket auth failed
+WS_AUTH_TIMEOUT                 FAILURE    WebSocket didn't send token in 10s
+USER_DEACTIVATED                SUCCESS    Admin deactivates user
+USER_ACTIVATED                  SUCCESS    Admin reactivates user
+TOTP_RESET                      SUCCESS    Admin resets TOTP secret
+ROLE_CHANGED                    SUCCESS    Admin changes user role
+BULK_SESSION_TERMINATED         SUCCESS    All sessions for user killed (admin action)
+PII_DEMASKED                    SUCCESS    Report served with PII revealed (role-gated)
+SECURITY_DASHBOARD_VIEWED       SUCCESS    Admin viewed security metrics
+AUDIT_CHAIN_VERIFIED            SUCCESS    Admin verified audit chain
+PART X — STARTUP & SHUTDOWN LIFECYCLE
+10.1 FastAPI Application Lifespan
+python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Runs on startup and shutdown. Manages all Layer 1 resources.
+    """
+
+    # ═══ STARTUP ════════════════════════════════════════════════════════════
+
+    # 1. Load cryptographic keys
+    logger.info("Loading auth keys...")
+    app.state.auth_private_key = load_private_key("keys/auth_private.pem")
+    app.state.auth_public_key  = load_public_key("keys/auth_public.pem")
+    logger.info("✅ Auth keys loaded (RS256)")
+
+    # 2. PostgreSQL connection pool
+    logger.info("Connecting to PostgreSQL...")
+    app.state.db_pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=5,
+        max_size=20,
+        max_inactive_connection_lifetime=300,
+        command_timeout=30,
+        server_settings={
+            "application_name": "aiventra-api",
+            "statement_timeout": "30000",
+            "lock_timeout":       "5000"
+        }
+    )
+    # Verify connectivity
+    async with app.state.db_pool.acquire() as conn:
+        version = await conn.fetchval("SELECT version()")
+        logger.info(f"✅ PostgreSQL connected: {version[:50]}")
+
+    # 3. Run database migrations
+    logger.info("Running database migrations...")
+    await run_alembic_migrations()
+    logger.info("✅ Database migrations complete")
+
+    # 4. Redis connection
+    logger.info("Connecting to Redis...")
+    app.state.redis = await aioredis.from_url(
+        REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_keepalive=True,
+        socket_keepalive_options={TCP_KEEPIDLE: 60, TCP_KEEPINTVL: 10, TCP_KEEPCNT: 3}
+    )
+    await app.state.redis.ping()
+    logger.info("✅ Redis connected")
+
+    # 5. Load Lua scripts into Redis
+    logger.info("Loading Redis Lua scripts...")
+    with open("scripts/rate_limit.lua") as f:
+        lua_script = f.read()
+    app.state.rate_limit_sha = await app.state.redis.script_load(lua_script)
+    logger.info(f"✅ Rate limit Lua script loaded: {app.state.rate_limit_sha[:8]}...")
+
+    # 6. MinIO connection check
+    logger.info("Checking MinIO...")
+    await init_minio()
+    logger.info("✅ MinIO storage ready")
+
+    # 7. Start background tasks
+    logger.info("Starting background tasks...")
+    app.state.cleanup_task = asyncio.create_task(blacklist_cleanup_worker())
+    app.state.token_expiry_task = asyncio.create_task(expired_token_cleanup_worker())
+    logger.info("✅ Background tasks started")
+
+    # 8. Log startup audit event
+    await log_audit_event(
+        action="SYSTEM_STARTUP",
+        result="SUCCESS",
+        context={"version": APP_VERSION, "environment": ENVIRONMENT}
+    )
+
+    logger.info("🚀 AIVENTRA API Layer 1 ready")
+
+    yield  # ← Application runs here
+
+    # ═══ SHUTDOWN ═══════════════════════════════════════════════════════════
+
+    logger.info("Shutting down AIVENTRA API...")
+
+    # 1. Stop background tasks
+    app.state.cleanup_task.cancel()
+    app.state.token_expiry_task.cancel()
+    await asyncio.gather(
+        app.state.cleanup_task,
+        app.state.token_expiry_task,
+        return_exceptions=True
+    )
+
+    # 2. Close all WebSocket connections gracefully
+    await ws_manager.disconnect_all("SERVER_SHUTDOWN")
+
+    # 3. Close DB pool
+    await app.state.db_pool.close()
+
+    # 4. Close Redis
+    await app.state.redis.aclose()
+
+    # 5. Audit
+    await log_audit_event(action="SYSTEM_SHUTDOWN", result="SUCCESS")
+    logger.info("✅ Graceful shutdown complete")
+10.2 Background Worker — Token Blacklist Cleanup
+python
+async def blacklist_cleanup_worker():
+    """
+    Runs every 10 minutes.
+    Removes expired JTIs from the sorted set blacklist.
+    Without cleanup, the blacklist grows indefinitely.
+    """
+    while True:
+        try:
+            now_epoch = int(time.time())
+            # Remove all entries with score (exp) <= now
+            removed = await redis.zremrangebyscore(
+                "aiventra:auth:blacklist",
+                "-inf",
+                now_epoch
+            )
+            if removed > 0:
+                logger.debug(f"Blacklist cleanup: removed {removed} expired JTIs")
+        except Exception as e:
+            logger.error(f"Blacklist cleanup error: {e}")
+        await asyncio.sleep(600)  # 10 minutes
+PART XI — ERROR RESPONSE CATALOG
+All Layer 1 errors follow a consistent JSON schema:
+
+json
+{
+  "error":   "MACHINE_READABLE_CODE",
+  "detail":  "Human readable message for developer",
+  "path":    "/auth/login",
+  "request_id": "req_a1b2c3d4"
+}
+Complete Layer 1 error catalog:
+
+text
+HTTP   ERROR_CODE                        CAUSE
+────────────────────────────────────────────────────────────────────────────
+400    WEAK_PASSWORD                     New password fails strength rules
+400    SAME_AS_CURRENT_PASSWORD          New password == old password
+400    MALFORMED_REQUEST                 Pydantic validation failure
+400    MISSING_REQUIRED_FIELD            Required field absent
+
+401    MISSING_AUTH_TOKEN                No Bearer token in Authorization header
+401    MALFORMED_TOKEN                   JWT cannot be decoded (not valid JWT)
+401    TOKEN_EXPIRED                     JWT exp has passed
+401    TOKEN_REVOKED                     JTI found in Redis blacklist
+401    INVALID_TOKEN_TYPE                Refresh token used where access token needed
+401    TOKEN_SIGNATURE_INVALID           HMAC/RSA signature verification failed
+401    TOKEN_ISSUER_INVALID              iss claim != "aiventra-api"
+401    TOKEN_DECODE_FAILED               General JWT decode error
+401    INVALID_CREDENTIALS               Wrong password or TOTP (generic — no specifics)
+401    TOTP_CODE_ALREADY_USED            TOTP replay prevention triggered
+401    REFRESH_TOKEN_MISSING             No refresh cookie/body on /auth/refresh
+401    REFRESH_TOKEN_INVALID             JTI not in Redis / DB (expired or not issued)
+401    REFRESH_TOKEN_REVOKED             JTI revoked in DB — token theft suspected
+401    MALFORMED_REFRESH_TOKEN           Refresh token decode failed
+401    USER_NOT_FOUND                    user.id from JWT sub doesn't exist
+401    INVALID_TOKEN_TYPE                typ claim wrong (type confusion attack)
+401    ALGORITHM_NOT_ALLOWED             alg != RS256 (algorithm confusion attack)
+
+403    ACCOUNT_DEACTIVATED               is_active == FALSE
+403    ACCOUNT_LOCKED                    locked_until > NOW()
+403    INSUFFICIENT_ROLE                 User role not in allowed list for endpoint
+403    CASE_ACCESS_DENIED                User not assigned to requested case
+403    MUST_CHANGE_PASSWORD              must_change_password=TRUE, non-exempt path
+403    ORIGIN_NOT_ALLOWED                CORS origin check failed
+
+404    CASE_NOT_FOUND                    Case ID doesn't exist or user can't see it
+404    USER_NOT_FOUND                    Target user for admin operation not found
+404    EVIDENCE_NOT_FOUND                Evidence file not found in case
+
+409    EMAIL_ALREADY_EXISTS              Duplicate email on user creation
+409    BADGE_NUMBER_TAKEN                Duplicate badge number
+
+422    VALIDATION_ERROR                  Pydantic v2 validation failure (body fields)
+
+429    RATE_LIMIT_EXCEEDED               Sliding window rate limit hit
+       (headers: Retry-After, X-RateLimit-*)
+
+500    INTERNAL_SERVER_ERROR             Unexpected exception (logged, generic message)
+503    SERVICE_UNAVAILABLE               DB or Redis down (readiness probe returning 503)
+PART XII — LAYER 1 COMPLETE FILE STRUCTURE
+text
+api/
+├── main.py                          ← FastAPI app, lifespan, middleware mount
+├── config.py                        ← Pydantic Settings (env var loading)
+│
+├── middleware/
+│   ├── auth.py                      ← AuthMiddleware (JWT validate, load user)
+│   ├── rate_limit.py                ← RateLimitMiddleware (Redis sliding window)
+│   ├── cors.py                      ← CORSMiddleware config
+│   └── security_headers.py          ← X-Frame-Options, CSP, etc.
+│
+├── routers/
+│   ├── auth.py                      ← /auth/* routes (login, logout, refresh, change-pass)
+│   ├── admin_users.py               ← /admin/users/* routes
+│   └── websocket.py                 ← /ws/case/{case_id}
+│
+├── models/
+│   ├── user.py                      ← User Pydantic schemas (request/response)
+│   ├── auth.py                      ← LoginRequest, TokenResponse schemas
+│   └── common.py                    ← ErrorResponse, PaginatedResponse
+│
+├── services/
+│   ├── auth_service.py              ← token generation, password hashing, TOTP
+│   ├── user_service.py              ← user CRUD operations
+│   └── audit_service.py             ← log_audit_event(), chain management
+│
+├── core/
+│   ├── database.py                  ← asyncpg pool setup + dependency
+│   ├── redis_client.py              ← aioredis setup + dependency
+│   ├── minio_client.py              ← MinIO client setup
+│   ├── security.py                  ← load_private_key, load_public_key
+│   └── dependencies.py              ← get_db, get_redis, get_current_user
+│
+├── exceptions/
+│   └── handlers.py                  ← Global exception handlers → ErrorResponse
+│
+├── scripts/
+│   └── rate_limit.lua               ← Sliding window Lua script
+│
+└── tests/
+    ├── test_auth.py                 ← Login, logout, refresh, TOTP tests
+    ├── test_rbac.py                 ← Role enforcement tests
+    ├── test_rate_limit.py           ← Rate limit behavior tests
+    ├── test_security.py             ← Algorithm confusion, token type confusion tests
+    └── fixtures/                   ← Test users, tokens, keys
+This is the complete, fully-specified Layer 1 — API Gateway & Authentication Layer technical document covering every request processing step, every cryptographic operation, every Redis interaction, every database write, every error path, and every security control from TLS termination through JWT issuance to RBAC enforcement.

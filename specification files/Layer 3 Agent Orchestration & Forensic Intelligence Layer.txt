@@ -1,0 +1,2417 @@
+AIVENTRA — Layer 3: Agent Orchestration & Forensic Intelligence Layer
+Full Technical Specification
+Layer: 3 of 4 | Domain: Multi-Agent Pipeline, Orchestrator, All 11 Forensic Agents, Inter-Agent Communication, mTLS, Circuit Breakers
+Runtime: Python 3.12 (FastAPI per agent) | Ports: 8010–8021 (one per agent) + 8009 (Orchestrator)
+
+PART I — LAYER PURPOSE & BOUNDARIES
+Layer 3 is the forensic intelligence engine of AIVENTRA. It takes encrypted evidence references from Layer 2, orchestrates 11 specialized agents in a dependency-aware DAG, and produces signed structured outputs that feed Layer 4's report and replay systems.
+
+Five core responsibilities:
+
+Orchestration — DAG-aware pipeline dispatcher with retry, circuit breaking, and partial failure recovery
+
+Evidence Decryption Bridge — secure internal evidence reading via task-token-gated calls to Layer 2
+
+Forensic Analysis — 11 specialized agents across 3 execution tiers covering all forensic domains
+
+Inter-Agent Security — mTLS mutual authentication, one-time task tokens, output signing
+
+Replay Chain Construction — every inference step logged as a cryptographically linked step record
+
+Boundary contracts:
+
+Receives: pipeline_run_id, case_id, evidence_ids[] from Layer 1 API (via Redis Stream)
+
+Reads: encrypted evidence via evidence_reader service (Layer 2 internal, not HTTP)
+
+Writes: agent_runs, agent_outputs, timeline_events, hypothesis_snapshots, replay_steps to PostgreSQL
+
+Feeds: Layer 4 (Report Generator, Reasoning Replay Viewer) reads all agent_outputs and replay_steps
+
+Emits: WebSocket events for every state transition to Layer 1 WS manager
+
+PART II — ORCHESTRATOR ARCHITECTURE
+2.1 Orchestrator Component Stack
+text
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                         ORCHESTRATOR — FULL ARCHITECTURE                          │
+│                                                                                    │
+│  Redis Stream: aiventra:pipeline:tasks                                            │
+│       │                                                                            │
+│       │ XREADGROUP (consumer group: "orchestrators")                              │
+│       ▼                                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │                      Orchestrator Worker Process                            │  │
+│  │                                                                             │  │
+│  │  PipelineContext {                                                          │  │
+│  │    pipeline_run_id: UUID                                                    │  │
+│  │    case_id:         UUID                                                    │  │
+│  │    evidence_ids:    List[UUID]                                              │  │
+│  │    mode:            FULL | PARTIAL | RERUN                                  │  │
+│  │    triggered_by:    user_id                                                 │  │
+│  │    config:          PipelineConfig                                          │  │
+│  │    agent_statuses:  Dict[agent_id, AgentRunStatus]                         │  │
+│  │    agent_outputs:   Dict[agent_id, SignedOutput]                            │  │
+│  │    start_time:      datetime                                                │  │
+│  │    replay_steps:    List[ReplayStep]                                        │  │
+│  │  }                                                                          │  │
+│  │                                                                             │  │
+│  │  DAG Executor                                                               │  │
+│  │    ├── Tier 1 (parallel): evidence_parser, ocr [→ format_normalizer]       │  │
+│  │    ├── Tier 2 (parallel): autopsy, tod, digital_timeline, anomaly_detector  │  │
+│  │    └── Tier 3 (parallel): hotspot, hypothesis_manager, reasoning_replay,   │  │
+│  │                             report_generator                                │  │
+│  │                                                                             │  │
+│  │  Circuit Breaker Registry  {agent_id → CircuitBreaker}                     │  │
+│  │  Task Token Issuer         (RS256 JWT per dispatch)                         │  │
+│  │  Retry Scheduler           (exponential backoff, 3 max)                    │  │
+│  │  WS Event Emitter          (publishes to Layer 1 ws_manager)               │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                    │
+│  Per-Agent Microservice (×11):                                                    │
+│  ┌─────────────────────────────────────┐                                          │
+│  │  FastAPI + uvicorn (1 worker)       │                                          │
+│  │  POST /run                          │  ← receives task from orchestrator       │
+│  │  GET  /health                       │                                          │
+│  │  mTLS client cert verification      │  ← only accepts calls from orchestrator  │
+│  │  Task token verification            │                                          │
+│  │  Evidence reader calls              │  ← via Layer 2 internal service          │
+│  │  LLM gateway calls                  │  ← via AI Gateway (internal)             │
+│  │  Output signer                      │  ← RS256 signs every output              │
+│  └─────────────────────────────────────┘                                          │
+└────────────────────────────────────────────────────────────────────────────────────┘
+2.2 Agent DAG Definition
+python
+AGENT_DAG = {
+    # TIER 1 — Evidence Processing (no dependencies)
+    "evidence_parser": {
+        "tier":         1,
+        "port":         8020,
+        "depends_on":   [],
+        "timeout_sec":  60,
+        "max_retries":  3,
+        "critical":     True,   # pipeline cannot proceed without this
+        "description":  "File type detection, text/binary routing, integrity gate"
+    },
+    "ocr": {
+        "tier":         1,
+        "port":         8021,
+        "depends_on":   ["evidence_parser"],   # needs routing decision first
+        "timeout_sec":  120,
+        "max_retries":  3,
+        "critical":     True,
+        "description":  "Tesseract OCR for scanned documents"
+    },
+    "format_normalizer": {
+        "tier":         1,
+        "port":         8022,
+        "depends_on":   ["evidence_parser", "ocr"],
+        "timeout_sec":  60,
+        "max_retries":  3,
+        "critical":     True,
+        "description":  "Normalize all text to unified ForensicDocument schema"
+    },
+
+    # TIER 2 — Forensic Analysis (depends on normalized documents)
+    "autopsy": {
+        "tier":         2,
+        "port":         8023,
+        "depends_on":   ["format_normalizer"],
+        "timeout_sec":  120,
+        "max_retries":  3,
+        "critical":     False,
+        "description":  "Autopsy report structured extraction via LLM"
+    },
+    "tod": {
+        "tier":         2,
+        "port":         8024,
+        "depends_on":   ["format_normalizer", "autopsy"],
+        "timeout_sec":  90,
+        "max_retries":  3,
+        "critical":     False,
+        "description":  "Time-of-death estimation: Henssge + ML + Bayesian MC"
+    },
+    "digital_timeline": {
+        "tier":         2,
+        "port":         8025,
+        "depends_on":   ["format_normalizer"],
+        "timeout_sec":  120,
+        "max_retries":  3,
+        "critical":     False,
+        "description":  "CDR, location, financial → unified timeline events"
+    },
+    "anomaly_detector": {
+        "tier":         2,
+        "port":         8026,
+        "depends_on":   ["digital_timeline"],
+        "timeout_sec":  120,
+        "max_retries":  3,
+        "critical":     False,
+        "description":  "Autoencoder + Isolation Forest anomaly detection on timeline"
+    },
+
+    # TIER 3 — Intelligence Fusion (depends on Tier 2 outputs)
+    "hotspot_correlation": {
+        "tier":         3,
+        "port":         8027,
+        "depends_on":   ["anomaly_detector", "tod"],
+        "timeout_sec":  90,
+        "max_retries":  3,
+        "critical":     False,
+        "description":  "Spatial/temporal hotspot windows from anomaly + TOD"
+    },
+    "hypothesis_manager": {
+        "tier":         3,
+        "port":         8028,
+        "depends_on":   ["autopsy", "tod", "hotspot_correlation", "digital_timeline"],
+        "timeout_sec":  150,
+        "max_retries":  3,
+        "critical":     False,
+        "description":  "Bayesian hypothesis posterior + LLM narrative"
+    },
+    "reasoning_replay": {
+        "tier":         3,
+        "port":         8029,
+        "depends_on":   ["hypothesis_manager", "hotspot_correlation", "anomaly_detector"],
+        "timeout_sec":  90,
+        "max_retries":  3,
+        "critical":     False,
+        "description":  "Construct cryptographic replay chain of all inference steps"
+    },
+    "report_generator": {
+        "tier":         3,
+        "port":         8030,
+        "depends_on":   ["reasoning_replay", "hypothesis_manager", "tod", "autopsy",
+                          "digital_timeline", "hotspot_correlation", "anomaly_detector"],
+        "timeout_sec":  180,
+        "max_retries":  2,
+        "critical":     False,
+        "description":  "Compile all outputs into final forensic intelligence report"
+    },
+}
+
+# Tier groupings for parallel dispatch
+TIER_GROUPS = {
+    1: ["evidence_parser", "ocr", "format_normalizer"],
+    2: ["autopsy", "tod", "digital_timeline", "anomaly_detector"],
+    3: ["hotspot_correlation", "hypothesis_manager", "reasoning_replay", "report_generator"],
+}
+2.3 Data Models — Orchestrator Owned
+sql
+-- agent_runs: one row per agent per pipeline execution
+CREATE TABLE agent_runs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pipeline_run_id     UUID NOT NULL,
+    case_id             UUID NOT NULL REFERENCES cases(id),
+    agent_id            TEXT NOT NULL,
+    tier                INTEGER NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN (
+                          'PENDING','RUNNING','DONE','FAILED','SKIPPED'
+                        )),
+    retry_count         INTEGER NOT NULL DEFAULT 0,
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    duration_ms         INTEGER,
+    llm_tokens_used     INTEGER DEFAULT 0,
+    error_message       TEXT,
+    task_token_jti      TEXT,                -- JTI of the task token used
+    archived            BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_runs_pipeline     ON agent_runs(pipeline_run_id);
+CREATE INDEX idx_runs_case_status  ON agent_runs(case_id, status);
+CREATE INDEX idx_runs_agent        ON agent_runs(agent_id, pipeline_run_id);
+
+-- agent_outputs: signed output blobs from each agent
+CREATE TABLE agent_outputs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id              UUID NOT NULL REFERENCES agent_runs(id),
+    pipeline_run_id     UUID NOT NULL,
+    case_id             UUID NOT NULL,
+    agent_id            TEXT NOT NULL,
+    output_schema       TEXT NOT NULL,       -- e.g. "AutopsyOutput_v1"
+    output_json         JSONB NOT NULL,      -- full signed output payload
+    output_hash         TEXT NOT NULL,       -- SHA-256 of canonical payload JSON
+    signature           TEXT NOT NULL,       -- RSA-PKCS1v15 sig of output_hash
+    model_version       TEXT NOT NULL,
+    superseded          BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- immutable after insert
+CREATE TRIGGER trg_prevent_output_update
+  BEFORE UPDATE ON agent_outputs
+  FOR EACH ROW
+  WHEN (OLD.superseded = FALSE)             -- allow superseded flag update only
+  EXECUTE FUNCTION prevent_modification();
+
+CREATE INDEX idx_outputs_case_agent    ON agent_outputs(case_id, agent_id);
+CREATE INDEX idx_outputs_pipeline      ON agent_outputs(pipeline_run_id);
+CREATE INDEX idx_outputs_latest        ON agent_outputs(case_id, agent_id, superseded)
+             WHERE superseded = FALSE;
+
+-- replay_steps: cryptographic inference chain
+CREATE TABLE replay_steps (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id              UUID NOT NULL REFERENCES agent_runs(id),
+    pipeline_run_id     UUID NOT NULL,
+    case_id             UUID NOT NULL,
+    seq                 INTEGER NOT NULL,
+    agent_id            TEXT NOT NULL,
+    trigger_type        TEXT NOT NULL CHECK (trigger_type IN (
+                          'INPUT','RULE','MODEL_OUTPUT','BAYESIAN_UPDATE',
+                          'LLM_EXTRACTION','LLM_NARRATIVE','CONSISTENCY_CHECK',
+                          'INTEGRITY_GATE','ANOMALY_DETECTED','HOTSPOT_IDENTIFIED'
+                        )),
+    input_summary       TEXT NOT NULL,
+    interpretation      TEXT NOT NULL,       -- PII-masked narrative
+    confidence          NUMERIC(5,4),        -- 0.0000 to 1.0000
+    evidence_ids        UUID[],
+    input_data          JSONB,               -- full input snapshot (masked)
+    model_version       TEXT,
+    step_hash           TEXT NOT NULL,       -- SHA-256 of canonical step content
+    prev_step_hash      TEXT NOT NULL,       -- previous step's step_hash (chain linkage)
+    signature           TEXT NOT NULL,       -- RS256 sig of step_hash
+    timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_replay_run_seq    ON replay_steps(run_id, seq);
+CREATE INDEX idx_replay_case       ON replay_steps(case_id, pipeline_run_id);
+CREATE INDEX idx_replay_ordered    ON replay_steps(pipeline_run_id, seq ASC);
+
+-- timeline_events: digital forensic events
+CREATE TABLE timeline_events (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    case_id             UUID NOT NULL REFERENCES cases(id),
+    pipeline_run_id     UUID NOT NULL,
+    event_time          TIMESTAMPTZ NOT NULL,
+    event_time_end      TIMESTAMPTZ,         -- for duration events
+    event_type          TEXT NOT NULL,       -- CALL, SMS, LOCATION, TRANSACTION, etc.
+    source              TEXT NOT NULL,       -- CDR, LOCATION_DATA, FINANCIAL_RECORDS, etc.
+    actor_masked        TEXT,                -- [PERSON_1]
+    counterparty_masked TEXT,                -- [PERSON_2]
+    location_masked     TEXT,                -- [ADDRESS_1]
+    event_details       JSONB,              -- full masked event data
+    is_anomalous        BOOLEAN NOT NULL DEFAULT FALSE,
+    anomaly_score       NUMERIC(8,6),
+    anomaly_flags       TEXT[],
+    hotspot_id          UUID,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_timeline_case_time   ON timeline_events(case_id, event_time);
+CREATE INDEX idx_timeline_anomalous   ON timeline_events(case_id, is_anomalous)
+             WHERE is_anomalous = TRUE;
+CREATE INDEX idx_timeline_case_range  ON timeline_events(case_id, event_time, event_time_end);
+CREATE INDEX idx_timeline_source      ON timeline_events(case_id, source);
+PART III — ORCHESTRATOR FULL WORKFLOW
+3.1 Pipeline Trigger → Queue → Pickup
+text
+═══════════════════════════════════════════════════════════════
+STEP 1: API Enqueue (Layer 1 handler: POST /agents/run)
+═══════════════════════════════════════════════════════════════
+
+1.1  After Layer 1 auth + RBAC:
+     require_role(["ADMIN", "LEAD_INVESTIGATOR"])
+     await require_case_access(user, case_id, db)
+
+1.2  Validate evidence_ids all belong to case_id:
+     SELECT COUNT(*) FROM evidence_files
+     WHERE id = ANY($evidence_ids)
+     AND case_id = $case_id
+     AND status = 'ACTIVE'
+     → count must equal len(evidence_ids) → else 400 EVIDENCE_NOT_IN_CASE
+
+1.3  Check no active pipeline already running:
+     SELECT COUNT(*) FROM agent_runs
+     WHERE case_id=$1
+     AND pipeline_run_id = (latest)
+     AND status = 'RUNNING'
+     → If > 0 → 409 PIPELINE_ALREADY_RUNNING
+
+1.4  Generate pipeline_run_id = uuid4()
+
+1.5  Create PENDING agent_run rows (one per agent, 11 total):
+     async with db.transaction():
+       for agent_id, spec in AGENT_DAG.items():
+         INSERT agent_runs (pipeline_run_id, case_id, agent_id, tier,
+                             status='PENDING', created_at=NOW())
+
+1.6  Enqueue to Redis Stream:
+     await redis.xadd(
+         "aiventra:pipeline:tasks",
+         {
+             "pipeline_run_id": str(pipeline_run_id),
+             "case_id":         str(case_id),
+             "evidence_ids":    json.dumps([str(e) for e in evidence_ids]),
+             "mode":            mode,
+             "triggered_by":    str(user.id),
+             "triggered_at":    datetime.utcnow().isoformat()
+         }
+     )
+
+1.7  Audit: PIPELINE_TRIGGERED
+1.8  WS broadcast: PIPELINE_TRIGGERED → {pipeline_run_id, total_agents: 11}
+
+1.9  HTTP 202 Accepted {
+       "pipeline_run_id": str(pipeline_run_id),
+       "status":          "QUEUED",
+       "estimated_duration_minutes": 8
+     }
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Orchestrator Picks Up Task
+═══════════════════════════════════════════════════════════════
+
+2.1  Orchestrator main loop (runs continuously):
+     while True:
+       messages = await redis.xreadgroup(
+           groupname="orchestrators",
+           consumername=f"orchestrator-{hostname}",
+           streams={"aiventra:pipeline:tasks": ">"},
+           count=1,
+           block=5000   ← block 5 seconds waiting for messages
+       )
+       if messages:
+         stream_name, entries = messages[0]
+         for msg_id, fields in entries:
+           await _process_pipeline_task(fields, msg_id)
+           await redis.xack("aiventra:pipeline:tasks", "orchestrators", msg_id)
+
+2.2  _process_pipeline_task() parses fields into PipelineContext:
+     ctx = PipelineContext(
+         pipeline_run_id = UUID(fields["pipeline_run_id"]),
+         case_id         = UUID(fields["case_id"]),
+         evidence_ids    = json.loads(fields["evidence_ids"]),
+         mode            = fields["mode"],
+         triggered_by    = UUID(fields["triggered_by"]),
+         start_time      = datetime.utcnow(),
+         agent_statuses  = {a: "PENDING" for a in AGENT_DAG},
+         agent_outputs   = {},
+         replay_steps    = [],
+         replay_seq      = 0
+     )
+
+2.3  UPDATE agent_runs SET status='PENDING' WHERE pipeline_run_id=$1
+     (already set in step 1.5, this is a sanity reset)
+
+2.4  WS broadcast: PIPELINE_STARTED → {pipeline_run_id, queue_wait_ms}
+3.2 Tier-by-Tier DAG Execution
+text
+═══════════════════════════════════════════════════════════════
+TIER 1 EXECUTION: evidence_parser → ocr → format_normalizer
+═══════════════════════════════════════════════════════════════
+
+NOTE: Within Tier 1, ocr depends on evidence_parser output,
+      and format_normalizer depends on both. So Tier 1 is
+      actually sequential with internal dependency, not fully parallel.
+      True parallel = tiers 2 and 3.
+
+STEP 3.1: Dispatch evidence_parser
+────────────────────────────────────────────────────────────────
+3.1.1  Circuit breaker check:
+       cb = circuit_breakers["evidence_parser"]
+       if cb.state == "OPEN":
+         if time.time() < cb.open_until:
+           → SKIP this agent, mark SKIPPED
+           → Pipeline cannot proceed (evidence_parser is CRITICAL)
+           → Fail entire pipeline with CRITICAL_AGENT_UNAVAILABLE
+
+3.1.2  Issue task token:
+       task_token = issue_task_token(
+           target="evidence_parser",
+           case_id=ctx.case_id,
+           operation="run",
+           ttl=300
+       )
+       Store jti → UPDATE agent_runs SET task_token_jti=jti WHERE ...
+
+3.1.3  Build request payload:
+       payload = {
+           "pipeline_run_id": str(ctx.pipeline_run_id),
+           "case_id":         str(ctx.case_id),
+           "evidence_ids":    [str(e) for e in ctx.evidence_ids],
+           "task_token":      task_token,
+           "config":          ctx.config.dict()
+       }
+
+3.1.4  Mark RUNNING:
+       UPDATE agent_runs SET status='RUNNING', started_at=NOW()
+       WHERE pipeline_run_id=$1 AND agent_id='evidence_parser'
+       WS broadcast: AGENT_STARTED → {agent_id: evidence_parser}
+
+3.1.5  Dispatch with mTLS:
+       async with httpx.AsyncClient(
+           cert=("certs/orchestrator.crt", "keys/orchestrator.key"),
+           verify="certs/internal_ca.crt",
+           timeout=AGENT_DAG["evidence_parser"]["timeout_sec"]
+       ) as client:
+           response = await client.post(
+               "https://evidence_parser:8020/run",
+               json=payload
+           )
+
+3.1.6  Handle response:
+       if response.status_code == 200:
+         output = response.json()
+         → verify output signature (Section 5.1)
+         → store in agent_outputs table
+         → ctx.agent_outputs["evidence_parser"] = output
+         → ctx.agent_statuses["evidence_parser"] = "DONE"
+         circuit_breakers["evidence_parser"].record_success()
+         UPDATE agent_runs SET status='DONE', completed_at=NOW(),
+           duration_ms=elapsed, llm_tokens_used=output.meta.llm_tokens
+         WS broadcast: AGENT_COMPLETE
+       else:
+         → handle failure (Section 3.3)
+
+STEP 3.2: Dispatch ocr (depends on evidence_parser DONE)
+────────────────────────────────────────────────────────────────
+3.2.1  Check dependency: evidence_parser must be DONE
+       If evidence_parser FAILED:
+         → check if any evidence files need OCR
+         → evidence_parser output has routing: needs_ocr: bool
+         → If routing unavailable: skip OCR, forward_normalizer uses raw Layer 2 text
+         → Mark ocr as SKIPPED (not FAILED — graceful)
+
+3.2.2  Routing decision from evidence_parser output:
+       needs_ocr_ids = [f for f in evidence_parser_output.files
+                        if f.needs_ocr == True]
+       If len(needs_ocr_ids) == 0:
+         → Mark ocr SKIPPED (no scanned documents in this case)
+         → Log replay step: {trigger: INPUT, interpretation: "No scanned files requiring OCR"}
+         → Skip dispatch
+       Else:
+         → Dispatch ocr with needs_ocr_ids
+
+3.2.3  Same dispatch pattern (steps 3.1.1–3.1.6) for ocr
+
+STEP 3.3: Dispatch format_normalizer (depends on evidence_parser + ocr DONE/SKIPPED)
+────────────────────────────────────────────────────────────────
+3.3.1  Wait for both dependencies in DONE or SKIPPED state
+3.3.2  Assemble input: combine evidence_parser text extracts + ocr results
+3.3.3  Dispatch format_normalizer with combined text corpus
+
+═══════════════════════════════════════════════════════════════
+TIER 2 EXECUTION: autopsy + tod + digital_timeline + anomaly_detector
+═══════════════════════════════════════════════════════════════
+
+NOTE: autopsy, tod, digital_timeline run fully in PARALLEL.
+      anomaly_detector depends on digital_timeline.
+
+STEP 3.4: Dispatch Tier 2 parallel group
+────────────────────────────────────────────────────────────────
+3.4.1  Confirm format_normalizer is DONE
+3.4.2  normalized_output = ctx.agent_outputs["format_normalizer"]
+
+3.4.3  Dispatch autopsy, tod, digital_timeline CONCURRENTLY:
+       tasks = [
+           _dispatch_agent("autopsy",          ctx, depends_output=normalized_output),
+           _dispatch_agent("tod",               ctx, depends_output=normalized_output),
+           _dispatch_agent("digital_timeline",  ctx, depends_output=normalized_output),
+       ]
+       results = await asyncio.gather(*tasks, return_exceptions=True)
+
+3.4.4  Process results:
+       for agent_id, result in zip(["autopsy","tod","digital_timeline"], results):
+         if isinstance(result, Exception):
+           await _handle_agent_failure(agent_id, ctx, str(result))
+         else:
+           ctx.agent_outputs[agent_id] = result
+           ctx.agent_statuses[agent_id] = "DONE"
+
+3.4.5  Wait for digital_timeline DONE/FAILED before anomaly_detector:
+       if ctx.agent_statuses["digital_timeline"] == "DONE":
+         await _dispatch_agent("anomaly_detector", ctx,
+                                depends_output=ctx.agent_outputs["digital_timeline"])
+       else:
+         await _mark_agent_skipped("anomaly_detector",
+                                    reason="digital_timeline failed")
+
+═══════════════════════════════════════════════════════════════
+TIER 3 EXECUTION: hotspot + hypothesis + replay + report (parallel with deps)
+═══════════════════════════════════════════════════════════════
+
+STEP 3.5: Dispatch Tier 3
+────────────────────────────────────────────────────────────────
+3.5.1  hotspot depends on: anomaly_detector + tod
+       hypothesis depends on: autopsy + tod + hotspot + digital_timeline
+       reasoning_replay depends on: hypothesis + hotspot + anomaly_detector
+       report_generator depends on: ALL tier 2 + reasoning_replay + hypothesis
+
+3.5.2  Dispatch hotspot (after anomaly_detector + tod done):
+       await _dispatch_agent("hotspot_correlation", ctx, depends_outputs={
+           "anomaly_detector": ctx.agent_outputs.get("anomaly_detector"),
+           "tod":              ctx.agent_outputs.get("tod")
+       })
+
+3.5.3  Dispatch hypothesis_manager (after autopsy + tod + hotspot + digital_timeline):
+       await _dispatch_agent("hypothesis_manager", ctx, depends_outputs={
+           "autopsy":             ctx.agent_outputs.get("autopsy"),
+           "tod":                 ctx.agent_outputs.get("tod"),
+           "hotspot_correlation": ctx.agent_outputs.get("hotspot_correlation"),
+           "digital_timeline":    ctx.agent_outputs.get("digital_timeline")
+       })
+       WS broadcast on completion: HYPOTHESIS_UPDATED
+
+3.5.4  Dispatch reasoning_replay:
+       await _dispatch_agent("reasoning_replay", ctx, depends_outputs={
+           "hypothesis_manager":   ctx.agent_outputs.get("hypothesis_manager"),
+           "hotspot_correlation":  ctx.agent_outputs.get("hotspot_correlation"),
+           "anomaly_detector":     ctx.agent_outputs.get("anomaly_detector"),
+           "all_replay_steps":     ctx.replay_steps   ← accumulated from all tiers
+       })
+
+3.5.5  Dispatch report_generator (after ALL others):
+       await _dispatch_agent("report_generator", ctx, depends_outputs={
+           a: ctx.agent_outputs.get(a) for a in AGENT_DAG
+           if a != "report_generator"
+       })
+
+═══════════════════════════════════════════════════════════════
+STEP 3.6: Pipeline Completion
+═══════════════════════════════════════════════════════════════
+
+3.6.1  Tally final statuses:
+       failed = [a for a in AGENT_DAG if ctx.agent_statuses[a] == "FAILED"]
+       done   = [a for a in AGENT_DAG if ctx.agent_statuses[a] == "DONE"]
+       skipped = [a for a in AGENT_DAG if ctx.agent_statuses[a] == "SKIPPED"]
+
+3.6.2  Determine overall status:
+       if len(failed) == 0: overall_status = "SUCCESS"
+       elif "report_generator" in done: overall_status = "PARTIAL"
+       else: overall_status = "FAILED"
+
+3.6.3  UPDATE cases SET status='UNDER_INVESTIGATION', updated_at=NOW()
+       (if it was still OPEN)
+
+3.6.4  Compute totals:
+       total_duration_ms  = int((datetime.utcnow() - ctx.start_time).total_seconds() * 1000)
+       total_llm_tokens   = sum(r.llm_tokens_used for r in agent_runs if r.status=="DONE")
+
+3.6.5  WS broadcast: PIPELINE_COMPLETE → {
+         status: overall_status,
+         failed_agents: failed,
+         skipped_agents: skipped,
+         total_duration_ms,
+         total_llm_tokens_used
+       }
+
+3.6.6  Audit: PIPELINE_COMPLETE → {pipeline_run_id, status, duration_ms, failed_agents}
+
+3.6.7  Redis XACK (acknowledge message consumed — done in step 2.1 after this returns)
+3.3 Agent Failure & Retry Workflow
+text
+═══════════════════════════════════════════════════════════════
+async def _handle_agent_failure(agent_id, ctx, error_msg):
+═══════════════════════════════════════════════════════════════
+
+1.  Load current retry_count from DB:
+    run = await db.fetchrow(
+        "SELECT retry_count FROM agent_runs
+         WHERE pipeline_run_id=$1 AND agent_id=$2",
+        ctx.pipeline_run_id, agent_id
+    )
+    retry_count = run.retry_count
+
+2.  Circuit breaker: record failure:
+    circuit_breakers[agent_id].record_failure()
+    → failure_count += 1
+    → If failure_count >= FAILURE_THRESHOLD (3):
+      state = "OPEN", open_until = time.time() + RECOVERY_TIMEOUT (60s)
+
+3.  If retry_count < MAX_RETRIES (3):
+    a.  Compute delay: delay = (2 ** retry_count) * 5 + random.uniform(0, 1)
+        → retry_count=0: ~5s | retry_count=1: ~10s | retry_count=2: ~20s
+    b.  WS broadcast: AGENT_RETRYING → {agent_id, retry_count, delay}
+    c.  UPDATE agent_runs SET retry_count=retry_count+1, status='PENDING'
+    d.  await asyncio.sleep(delay)
+    e.  Re-dispatch: return await _dispatch_agent(agent_id, ctx, ...)
+
+4.  If retry_count >= MAX_RETRIES:
+    a.  UPDATE agent_runs SET status='FAILED', error_message=$error_msg,
+                              completed_at=NOW()
+    b.  ctx.agent_statuses[agent_id] = "FAILED"
+    c.  Audit: AGENT_RUN_FAILURE → {agent_id, error_msg, retry_count}
+    d.  WS broadcast: AGENT_ERROR → {agent_id, error_summary, retry_count}
+
+5.  Downstream impact analysis:
+    For each downstream agent that depends on agent_id:
+      if ALL dependencies failed (no partial output available):
+        → Mark downstream SKIPPED (not FAILED — dependency unavailable)
+      else:
+        → Dispatch downstream with available partial outputs
+        → Downstream agents must handle missing inputs gracefully
+
+CIRCUIT BREAKER STATES:
+──────────────────────────────────────────────────────────────
+CLOSED:
+  - failure_count < FAILURE_THRESHOLD
+  - All requests pass through normally
+  - On each failure: failure_count++
+  - On each success: failure_count = 0
+
+OPEN:
+  - failure_count >= FAILURE_THRESHOLD (3)
+  - Requests REJECTED immediately (no dispatch)
+  - open_until = time.time() + RECOVERY_TIMEOUT (60s)
+  - After RECOVERY_TIMEOUT: transition to HALF_OPEN
+
+HALF_OPEN:
+  - One probe request allowed
+  - If succeeds: → CLOSED, failure_count = 0
+  - If fails: → OPEN, reset timer
+
+class CircuitBreaker:
+    state: str = "CLOSED"
+    failure_count: int = 0
+    FAILURE_THRESHOLD: int = 3
+    RECOVERY_TIMEOUT: int = 60
+    open_until: float = 0
+
+    def record_success(self):
+        self.failure_count = 0
+        self.state = "CLOSED"
+
+    def record_failure(self):
+        self.failure_count += 1
+        if self.failure_count >= self.FAILURE_THRESHOLD:
+            self.state = "OPEN"
+            self.open_until = time.time() + self.RECOVERY_TIMEOUT
+
+    def can_attempt(self) -> bool:
+        if self.state == "CLOSED":   return True
+        if self.state == "OPEN":
+            if time.time() > self.open_until:
+                self.state = "HALF_OPEN"
+                return True
+            return False
+        if self.state == "HALF_OPEN": return True  # one probe
+        return False
+PART IV — ALL 11 AGENTS: FULL SPECIFICATIONS
+4.1 Agent 1: Evidence Parser (Port 8020)
+text
+PURPOSE: Route each evidence file — determine type, extract text if possible,
+         decide whether OCR is needed, verify Layer 2 integrity before pipeline.
+
+═══════════════════════════════════════════════════════════════
+POST /run — Evidence Parser Handler
+═══════════════════════════════════════════════════════════════
+
+INPUT (from orchestrator):
+{
+  pipeline_run_id: UUID,
+  case_id: UUID,
+  evidence_ids: [UUID, ...],
+  task_token: str,
+  config: PipelineConfig
+}
+
+STEP 1: mTLS + Task Token Verification
+────────────────────────────────────────────────────────────────
+1.1  Verify TLS peer certificate: CN must == "orchestrator"
+     (Nginx/Python TLS layer rejects all other callers)
+1.2  verify_task_token(task_token, agent_id="evidence_parser", case_id)
+     → Verify: sub="evidence_parser", case_id, op="run", not expired, not replayed
+     → Mark JTI used in Redis
+
+STEP 2: For Each Evidence File
+────────────────────────────────────────────────────────────────
+2.1  Call evidence_reader.agent_read_evidence(file_id, "evidence_parser", case_id, task_token)
+     → Returns EvidenceReadResult with plaintext_bytes + metadata
+
+2.2  File routing decision:
+     result = {
+       file_id:       file_id,
+       mime_type:     evidence.mime_type,
+       size_bytes:    len(plaintext_bytes),
+       sha256:        sha256(plaintext_bytes),
+       needs_ocr:     False,
+       text_content:  None,
+       routing:       None,
+       page_count:    None
+     }
+
+     if mime_type == "application/pdf":
+         reader = pypdf.PdfReader(io.BytesIO(plaintext_bytes))
+         text = "\n".join([p.extract_text() or "" for p in reader.pages])
+         result.page_count = len(reader.pages)
+         if len(text.strip()) > 200:
+             result.text_content = text
+             result.needs_ocr    = False
+             result.routing      = "PDF_TEXT_LAYER"
+         else:
+             result.needs_ocr    = True    ← scanned PDF, no text layer
+             result.routing      = "PDF_SCANNED_NEEDS_OCR"
+
+     elif mime_type in [DOCX, DOC]:
+         result.text_content = extract_docx(plaintext_bytes)
+         result.needs_ocr    = False
+         result.routing      = "WORD_DOCUMENT"
+
+     elif mime_type in [XLSX, XLS, CSV]:
+         result.text_content = extract_tabular(plaintext_bytes, mime_type)
+         result.needs_ocr    = False
+         result.routing      = "TABULAR_DATA"
+
+     elif mime_type in [JPEG, PNG, TIFF]:
+         result.needs_ocr    = True
+         result.routing      = "IMAGE_NEEDS_OCR"
+
+     elif mime_type in [JSON, XML, TXT]:
+         result.text_content = plaintext_bytes.decode("utf-8", errors="replace")
+         result.needs_ocr    = False
+         result.routing      = "STRUCTURED_TEXT"
+
+2.3  Log replay step:
+     ctx.append_replay_step(ReplayStep(
+         agent_id:       "evidence_parser",
+         trigger_type:   "INPUT",
+         input_summary:  f"{evidence.mime_type} file {evidence.original_filename} ({size_bytes} bytes)",
+         interpretation: f"File identified as {result.routing}. "
+                         f"{'Text extracted directly.' if not result.needs_ocr else 'OCR required — no text layer detected.'}",
+         confidence:     0.99 if result.routing != "PDF_SCANNED_NEEDS_OCR" else 0.85,
+         evidence_ids:   [file_id]
+     ))
+
+STEP 3: Build + Sign Output
+────────────────────────────────────────────────────────────────
+3.1  output = {
+       files: [results],
+       summary: {
+         total_files:     len(evidence_ids),
+         needs_ocr_count: sum(1 for r in results if r.needs_ocr),
+         text_extractable_count: sum(1 for r in results if r.text_content),
+         total_text_chars: sum(len(r.text_content or "") for r in results)
+       },
+       warnings: []
+     }
+3.2  signed = sign_agent_output(output, "evidence_parser", case_id, run_id)
+3.3  persist: INSERT agent_outputs(...)
+3.4  HTTP 200: return signed
+4.2 Agent 2: OCR Agent (Port 8021)
+text
+PURPOSE: Apply Tesseract OCR to scanned PDFs and images.
+         Returns per-page text with confidence scores.
+
+INPUT: {evidence_ids_needing_ocr: [UUID], task_token}
+
+STEP 1: mTLS + Task Token
+STEP 2: For Each File Needing OCR
+────────────────────────────────────────────────────────────────
+2.1  evidence_reader.agent_read_evidence(file_id, "ocr", case_id, task_token)
+
+2.2  If PDF (scanned):
+     images = convert_from_bytes(plaintext_bytes, dpi=300, fmt="PNG")
+     ← pdf2image: converts each page to PIL Image at 300 DPI
+
+2.3  If image (JPEG/PNG/TIFF):
+     images = [Image.open(io.BytesIO(plaintext_bytes))]
+
+2.4  OCR each image:
+     pages = []
+     for i, img in enumerate(images):
+         # Preprocessing:
+         img_gray = img.convert("L")                ← grayscale
+         img_np   = numpy.array(img_gray)
+         img_bin  = cv2.adaptiveThreshold(           ← adaptive binarization
+             img_np, 255,
+             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+             cv2.THRESH_BINARY, 11, 2
+         )
+         img_processed = Image.fromarray(img_bin)
+
+         # Tesseract OCR:
+         ocr_data = pytesseract.image_to_data(
+             img_processed,
+             lang="eng",
+             config="--psm 1 --oem 3",   ← Auto page segmentation, LSTM engine
+             output_type=pytesseract.Output.DICT
+         )
+
+         # Compute average word confidence (filter conf == -1):
+         confidences = [c for c in ocr_data["conf"] if c != -1]
+         avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+
+         # Full page text:
+         page_text = pytesseract.image_to_string(img_processed, lang="eng",
+                                                   config="--psm 1 --oem 3")
+         pages.append({
+             "page_num":      i + 1,
+             "text":          page_text,
+             "confidence":    round(avg_confidence / 100, 4),
+             "word_count":    len([w for w in ocr_data["text"] if w.strip()]),
+             "char_count":    len(page_text)
+         })
+
+2.5  If avg confidence < 0.60:
+     → append warning: LOW_OCR_CONFIDENCE
+     → Log replay step with confidence = avg_confidence
+
+STEP 3: Build + Sign Output
+3.1  output = {
+       files: [{
+         file_id,
+         total_pages:     len(pages),
+         avg_confidence:  mean(p.confidence for p in pages),
+         full_text:       "\n\n".join(p.text for p in pages),
+         pages:           pages,
+         warnings:        [...]
+       }],
+       method: "TESSERACT_4_LSTM"
+     }
+3.2  sign_agent_output + persist + return
+4.3 Agent 3: Format Normalizer (Port 8022)
+text
+PURPOSE: Take all extracted text (from evidence_parser + ocr) and normalize
+         into a unified ForensicDocument schema with structured sections.
+
+INPUT: {
+  evidence_parser_output: SignedOutput,
+  ocr_output:             SignedOutput | null,
+  task_token
+}
+
+STEP 1: Verify upstream output signatures:
+verify_agent_output(evidence_parser_output)
+verify_agent_output(ocr_output) if present
+
+STEP 2: Merge text sources
+────────────────────────────────────────────────────────────────
+2.1  Build text corpus per file:
+     For each file in evidence_parser_output.files:
+       if file.needs_ocr and ocr_output:
+         ocr_file = find by file_id in ocr_output.files
+         text_content = ocr_file.full_text
+         source = "OCR"
+       else:
+         text_content = file.text_content
+         source = file.routing
+
+2.2  Classify each file by category → route to correct normalizer:
+     AUTOPSY_REPORT, TOXICOLOGY_REPORT → AutopsyNormalizer
+     CDR_RECORDS                        → CDRNormalizer
+     LOCATION_DATA                      → LocationNormalizer
+     FINANCIAL_RECORDS                  → FinancialNormalizer
+     WITNESS_STATEMENT                  → WitnessNormalizer
+     CRIME_SCENE_PHOTOS                 → ImageMetadataNormalizer
+     OTHER                              → GenericNormalizer
+
+STEP 3: Autopsy/Toxicology Normalization
+────────────────────────────────────────────────────────────────
+3.1  Clean text:
+     - Remove headers/footers (regex: page number patterns)
+     - Fix hyphenation artifacts ("hyper-\ntension" → "hypertension")
+     - Normalize whitespace
+     - Detect section boundaries (FINDINGS:, CONCLUSION:, etc.)
+
+3.2  PII masking (before any storage or LLM calls):
+     masked_text = pii_vault_service.mask(cleaned_text, case_id)
+
+3.3  Build ForensicDocument:
+     ForensicDocument {
+       file_id:         UUID,
+       document_type:   "AUTOPSY_REPORT",
+       source:          "OCR" | "PDF_TEXT_LAYER" | ...,
+       raw_text_masked: masked_text,
+       char_count:      len(masked_text),
+       page_count:      file.page_count,
+       detected_sections: [
+         {name: "CAUSE_OF_DEATH", start_char: 450, end_char: 620},
+         {name: "MANNER_OF_DEATH", start_char: 621, end_char: 750},
+         ...
+       ],
+       structured_tables: [...],      ← for XLSX/CSV files
+       quality_score:   0.0–1.0,      ← based on OCR confidence or text coherence
+       warnings:        []
+     }
+
+STEP 4: CDR Normalization
+────────────────────────────────────────────────────────────────
+4.1  Parse CSV/XLSX into row dicts
+4.2  Detect column schema:
+     Attempt to map columns to: {caller, callee, timestamp, duration, tower_id, call_type}
+     Using fuzzy matching: "Calling Number" → "caller", "Date/Time" → "timestamp"
+     If required columns unmappable → warning: CDR_SCHEMA_UNKNOWN
+
+4.3  Parse timestamps: try multiple formats in order:
+     ["%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%m/%d/%Y %I:%M %p", ...]
+
+4.4  Mask PII in CDR:
+     For each row: mask caller, callee phone numbers
+
+4.5  Build CDRDocument:
+     CDRDocument {
+       file_id,
+       document_type: "CDR_RECORDS",
+       records: [{
+         record_id:       UUID,
+         caller_masked:   "[PHONE_1]",
+         callee_masked:   "[PHONE_2]",
+         timestamp:       ISO datetime,
+         duration_sec:    int,
+         call_type:       "CALL" | "SMS" | "DATA",
+         tower_id:        str | null,
+         warnings:        []
+       }],
+       total_records: int,
+       date_range: {start, end},
+       parse_success_rate: 0.0–1.0
+     }
+
+STEP 5: Location Data Normalization
+────────────────────────────────────────────────────────────────
+5.1  Parse location records:
+     Detect format: Google Takeout JSON | CSV coordinates | Cell tower log
+     Map to: {timestamp, latitude, longitude, accuracy_m, source}
+
+5.2  Validate coordinates:
+     lat: -90 to 90, lon: -180 to 180
+     Flag out-of-range as DATA_QUALITY_WARNING
+
+5.3  Build LocationDocument with masked addresses (reverse-geocode skipped — too slow)
+
+STEP 6: Financial Records Normalization
+────────────────────────────────────────────────────────────────
+6.1  Parse bank statements / transaction logs
+6.2  Detect columns: {date, description, debit, credit, balance, account}
+6.3  Mask account numbers, party names
+6.4  Build FinancialDocument
+
+STEP 7: Build NormalizedCorpus Output
+────────────────────────────────────────────────────────────────
+7.1  output = {
+       documents: [ForensicDocument, CDRDocument, LocationDocument, FinancialDocument, ...],
+       summary: {
+         autopsy_docs:   int,
+         cdr_docs:       int,
+         location_docs:  int,
+         financial_docs: int,
+         total_records:  int,
+         total_text_chars: int,
+         pii_entities_masked: int
+       },
+       warnings: [...]
+     }
+7.2  sign_agent_output + persist + return
+4.4 Agent 4: Autopsy Agent (Port 8023)
+text
+PURPOSE: Extract structured forensic findings from autopsy/toxicology documents
+         using LLM with forensic-domain prompt.
+
+INPUT: {normalized_corpus (Tier 1 output), task_token}
+
+STEP 1: Verify format_normalizer output signature
+STEP 2: Extract autopsy + toxicology documents from corpus
+
+STEP 3: Build LLM Prompt
+────────────────────────────────────────────────────────────────
+3.1  Sanitize text: sanitize_evidence_text(masked_autopsy_text, "autopsy", case_id)
+     → 12-pattern injection scan → structural escape → delimiter wrap
+
+3.2  System prompt (never changeable by evidence content):
+     SYSTEM = """You are a forensic pathology analysis assistant.
+     Extract structured data ONLY from the provided evidence document.
+     Do NOT infer, assume, or extrapolate beyond what is explicitly stated.
+     If a field is not mentioned, return null.
+     Output MUST be valid JSON matching the AutopsyExtraction schema."""
+
+3.3  User prompt:
+     f"""Extract forensic findings from this autopsy report.
+
+     {sanitized_text}
+
+     Return JSON with this exact schema:
+     {{
+       "cause_of_death": "string | null",
+       "manner_of_death": "HOMICIDE | SUICIDE | ACCIDENT | NATURAL | UNDETERMINED | null",
+       "manner_confidence": float (0-1),
+       "time_of_death_mentioned": "string | null",
+       "wounds": [
+         {{"location": str, "type": str, "description": str, "defensive": bool}}
+       ],
+       "toxicology": {{
+         "substances_found": [{{"name": str, "level": str, "unit": str}}],
+         "alcohol_level": "string | null",
+         "drugs_present": bool | null
+       }},
+       "postmortem_signs": {{
+         "rigor_mortis_stage": "NONE|EARLY|FULL|RESOLVING|null",
+         "livor_mortis_stage": "NONE|EARLY|FIXED|null",
+         "decomposition_stage": "NONE|EARLY|MODERATE|ADVANCED|null",
+         "algor_mortis_notes": "string | null"
+       }},
+       "body_params": {{
+         "estimated_weight_kg": float | null,
+         "height_cm": float | null
+       }},
+       "injuries_summary": "string | null",
+       "pathologist_conclusion": "string | null",
+       "extraction_confidence": float (0-1)
+     }}"""
+
+3.4  Call AI Gateway:
+     response = await ai_gateway.complete(
+         model    = "gemini-2.0-flash",
+         system   = SYSTEM,
+         user     = user_prompt,
+         max_tokens = 2048,
+         temperature = 0.0,    ← deterministic extraction
+         response_format = "json_object"
+     )
+     llm_tokens = response.usage.total_tokens
+
+3.5  Parse and validate LLM JSON response:
+     extraction = AutopsyExtraction.model_validate_json(response.content)
+     → Pydantic v2 strict validation with field types
+
+3.6  Confidence calibration:
+     if extraction.manner_of_death is None:
+       extraction.manner_confidence = 0.0
+     if extraction.extraction_confidence < 0.5:
+       append warning: LOW_EXTRACTION_CONFIDENCE
+
+STEP 4: Replay Steps
+────────────────────────────────────────────────────────────────
+4.1  Log: trigger=INPUT, interpretation="Autopsy document received, {len} chars"
+4.2  Log: trigger=LLM_EXTRACTION,
+          interpretation=f"Manner of death extracted: {extraction.manner_of_death} "
+                         f"(confidence {extraction.manner_confidence:.2f}). "
+                         f"Cause of death: {extraction.cause_of_death}.",
+          confidence=extraction.extraction_confidence
+
+STEP 5: Sign + Persist
+5.1  output = AutopsyOutput(extraction=extraction, llm_tokens=llm_tokens, ...)
+5.2  sign_agent_output + persist agent_outputs row
+5.3  HTTP 200 return
+4.5 Agent 5: TOD Agent (Port 8024)
+text
+PURPOSE: Time-of-death estimation using Henssge physics model,
+         postmortem sign heuristics, ML surrogate, and Bayesian MC fusion.
+
+INPUT: {format_normalizer_output, autopsy_output, task_token}
+
+STEP 1: Verify upstream signatures
+STEP 2: Extract inputs
+────────────────────────────────────────────────────────────────
+2.1  From autopsy_output.extraction.postmortem_signs:
+     rigor_stage      = extraction.postmortem_signs.rigor_mortis_stage
+     livor_stage      = extraction.postmortem_signs.livor_mortis_stage
+     decomp_stage     = extraction.postmortem_signs.decomposition_stage
+     body_weight_kg   = extraction.body_params.estimated_weight_kg
+
+2.2  From normalized documents: scan for temperature mentions:
+     temp_pattern = r"(?:rectal|body|core|liver)\s+temp(?:erature)?\s*:?\s*(\d+\.?\d*)\s*°?[Cc]"
+     → extract measurements
+
+2.3  From case metadata: ambient_temp_c, discovery_time, last_seen_alive_time
+
+STEP 3: Henssge Physics Core
+────────────────────────────────────────────────────────────────
+3.1  If rectal_temp available:
+     pmi_physics = henssge_estimate(
+         temp_rectal    = rectal_temp,
+         temp_ambient   = ambient_temp_c,
+         weight_kg      = body_weight_kg or 70.0,   ← default if unknown
+         correction_factor = _get_correction_factor(clothing, environment)
+     )
+     → Returns {mean_hours, lower95, upper95}
+
+3.2  Correction factor table:
+     CORRECTION_FACTORS = {
+       ("INDOOR", "NONE",   "NONE"):    1.0,
+       ("INDOOR", "LIGHT",  "NONE"):    1.1,
+       ("INDOOR", "MEDIUM", "NONE"):    1.2,
+       ("INDOOR", "HEAVY",  "NONE"):    1.4,
+       ("OUTDOOR","NONE",   "NONE"):    0.9,
+       ("OUTDOOR","NONE",   "SHADE"):   1.0,
+       ("WATER",  "NONE",   "NONE"):    0.75,
+     }
+
+3.3  If no temperature available:
+     pmi_physics = None
+     → Fall back to signs-only mode
+
+STEP 4: Heuristic PMI Bands from Postmortem Signs
+────────────────────────────────────────────────────────────────
+4.1  PMI distributions per sign stage:
+
+     RIGOR_BANDS = {
+       "NONE":      GaussianPMI(mu=1.5, sigma=1.0, bounds=(0, 4)),
+       "EARLY":     GaussianPMI(mu=5.0, sigma=2.0, bounds=(2, 9)),
+       "FULL":      GaussianPMI(mu=18.0,sigma=8.0, bounds=(8, 36)),
+       "RESOLVING": GaussianPMI(mu=40.0,sigma=10.0,bounds=(24, 72)),
+     }
+     LIVOR_BANDS = {
+       "NONE":  GaussianPMI(mu=1.0, sigma=0.5, bounds=(0, 3)),
+       "EARLY": GaussianPMI(mu=6.0, sigma=2.5, bounds=(2, 12)),
+       "FIXED": GaussianPMI(mu=20.0,sigma=8.0, bounds=(10, 48)),
+     }
+     DECOMP_BANDS = {
+       "NONE":     GaussianPMI(mu=12.0, sigma=6.0,  bounds=(0,  36)),
+       "EARLY":    GaussianPMI(mu=48.0, sigma=12.0, bounds=(24, 72)),
+       "MODERATE": GaussianPMI(mu=96.0, sigma=24.0, bounds=(48, 168)),
+       "ADVANCED": GaussianPMI(mu=168.0,sigma=48.0, bounds=(96, 336)),
+     }
+
+4.2  Convert stages to likelihood functions over PMI hours (0–240h grid, step 0.5h):
+     pmi_grid = np.arange(0, 240.5, 0.5)
+     L_rigor  = gaussian_pdf(pmi_grid, rigor_band.mu, rigor_band.sigma) if rigor_stage else 1.0
+     L_livor  = gaussian_pdf(pmi_grid, livor_band.mu, livor_band.sigma) if livor_stage else 1.0
+     L_decomp = gaussian_pdf(pmi_grid, decomp_band.mu,decomp_band.sigma) if decomp_stage else 1.0
+
+STEP 5: ML Surrogate Model
+────────────────────────────────────────────────────────────────
+5.1  Build feature vector:
+     features = [
+         rectal_temp or 0,
+         ambient_temp_c or 20,
+         RIGOR_ORDINAL[rigor_stage or "NONE"],   # 0,1,2,3
+         LIVOR_ORDINAL[livor_stage or "NONE"],   # 0,1,2
+         DECOMP_ORDINAL[decomp_stage or "NONE"], # 0,1,2,3
+         body_weight_kg or 70,
+         CLOTHING_ORDINAL[clothing or "NONE"],   # 0,1,2
+         1 if indoor else 0,
+         humidity or 50,
+         time_since_last_seen_to_discovery_hours or 0
+     ]
+
+5.2  Load model (cached at agent startup):
+     model = joblib.load("models/pmi_rf_model.pkl")
+     ← RandomForestRegressor trained on synthetic PMI scenarios
+       (generated from Henssge physics under 10,000 parameter combinations)
+
+5.3  Predict:
+     features_scaled = scaler.transform([features])
+     pmi_ml_mean = model.predict(features_scaled)[0]
+
+     # Uncertainty from ensemble variance:
+     tree_predictions = [t.predict(features_scaled)[0] for t in model.estimators_]
+     pmi_ml_std = np.std(tree_predictions)
+     pmi_ml_lower95 = pmi_ml_mean - 1.96 * pmi_ml_std
+     pmi_ml_upper95 = pmi_ml_mean + 1.96 * pmi_ml_std
+
+5.4  Convert to likelihood over pmi_grid:
+     L_ml = gaussian_pdf(pmi_grid, pmi_ml_mean, max(pmi_ml_std, 1.0))
+
+STEP 6: Bayesian Fusion via Monte Carlo (10,000 samples)
+────────────────────────────────────────────────────────────────
+6.1  Prior construction:
+     discovery_time  = case.found_dead_at
+     last_seen_time  = case.last_seen_alive_at
+     if last_seen_time and discovery_time:
+       max_pmi_hours = (discovery_time - last_seen_time).total_seconds() / 3600
+       prior = uniform_prior(0, max_pmi_hours)
+     else:
+       prior = uniform_prior(0, 96)   ← wide prior if no timeline constraints
+
+6.2  Combined likelihood (pointwise product on pmi_grid):
+     component_weights = {
+       "physics": 0.4 if pmi_physics else 0.0,
+       "rigor":   0.2 if rigor_stage  else 0.0,
+       "livor":   0.15 if livor_stage else 0.0,
+       "decomp":  0.1 if decomp_stage else 0.0,
+       "ml":      0.35 if pmi_ml_mean else 0.0
+     }
+     # Normalize weights
+     total_w = sum(component_weights.values())
+     component_weights = {k: v/total_w for k,v in component_weights.items()}
+
+     L_physics = gaussian_pdf(pmi_grid, pmi_physics.mean_hours,
+                               (pmi_physics.upper95-pmi_physics.lower95)/4) if pmi_physics else 1.0
+
+     L_combined = (
+         L_physics ** component_weights["physics"] *
+         L_rigor   ** component_weights["rigor"]   *
+         L_livor   ** component_weights["livor"]   *
+         L_decomp  ** component_weights["decomp"]  *
+         L_ml      ** component_weights["ml"]
+     )
+
+6.3  Posterior = Prior * L_combined (unnormalized)
+     posterior = prior * L_combined
+     posterior = posterior / posterior.sum()            ← normalize to sum=1
+
+6.4  Monte Carlo sampling (10,000 samples):
+     samples = np.random.choice(pmi_grid, size=10000, p=posterior)
+
+6.5  Extract statistics:
+     pmi_median  = np.median(samples)
+     pmi_mean    = np.mean(samples)
+     pmi_lower68 = np.percentile(samples, 16)
+     pmi_upper68 = np.percentile(samples, 84)
+     pmi_lower95 = np.percentile(samples, 2.5)
+     pmi_upper95 = np.percentile(samples, 97.5)
+
+6.6  Convert PMI to TOD (subtract from discovery):
+     tod_mean    = discovery_time - timedelta(hours=pmi_mean)
+     tod_lower95 = discovery_time - timedelta(hours=pmi_upper95)
+     tod_upper95 = discovery_time - timedelta(hours=pmi_lower95)
+
+STEP 7: Consistency Check
+────────────────────────────────────────────────────────────────
+7.1  For each sign vs physics estimate:
+     physics_pmi = pmi_physics.mean_hours if pmi_physics else pmi_ml_mean
+     rigor_ok = RIGOR_BANDS[rigor_stage].bounds[0] <= physics_pmi <= RIGOR_BANDS[rigor_stage].bounds[1]
+     livor_ok = ...
+     decomp_ok = ...
+
+     consistency = {
+       "rigor":  "CONSISTENT" if rigor_ok else "INCONSISTENT",
+       "livor":  "CONSISTENT" if livor_ok else "INCONSISTENT",
+       "decomp": "CONSISTENT" if decomp_ok else "INCONSISTENT",
+     }
+     If any INCONSISTENT → append warnings, widen uncertainty band
+
+STEP 8: Replay Steps + Sign + Persist
+8.1  Log 3 replay steps:
+     - INPUT: {postmortem signs extracted, temperatures found, body weight}
+     - MODEL_OUTPUT: {Henssge estimate, ML surrogate estimate}
+     - CONSISTENCY_CHECK: {rigor/livor/decomp consistency vs posterior}
+8.2  WS broadcast: TOD_UPDATED → {tod_point_estimate, tod_window_95, pmi_mean}
+8.3  sign_agent_output + persist + return
+4.6 Agent 6: Digital Timeline Agent (Port 8025)
+text
+PURPOSE: Parse CDR, location, and financial records into unified timeline events.
+         Classify event types, compute inter-event deltas, build event graph.
+
+INPUT: {normalized_corpus (CDRDocument, LocationDocument, FinancialDocument)}
+
+STEP 1: Verify format_normalizer signature
+STEP 2: Parse Each Document Type into Timeline Events
+────────────────────────────────────────────────────────────────
+2.1  CDR Events:
+     For each CDR record:
+       INSERT timeline_events: {
+         case_id, pipeline_run_id,
+         event_time:          record.timestamp,
+         event_type:          "CALL" | "SMS" | "DATA",
+         source:              "CDR_RECORDS",
+         actor_masked:        record.caller_masked,
+         counterparty_masked: record.callee_masked,
+         event_details: {
+           duration_sec:   record.duration_sec,
+           tower_id:       record.tower_id,
+           call_direction: "OUTGOING" | "INCOMING" | "UNKNOWN"
+         }
+       }
+
+2.2  Location Events:
+     For each location record:
+       INSERT timeline_events: {
+         event_time:     record.timestamp,
+         event_type:     "LOCATION_FIX",
+         source:         "LOCATION_DATA",
+         location_masked: reverse_geocode_coarse(lat, lon) if enable_geocode else f"[LAT:{lat:.2f},LON:{lon:.2f}]",
+         event_details: {
+           lat:          record.latitude,
+           lon:          record.longitude,
+           accuracy_m:   record.accuracy_m,
+           provider:     record.source
+         }
+       }
+
+2.3  Financial Events:
+     For each transaction:
+       INSERT timeline_events: {
+         event_time:     transaction.date,
+         event_type:     "FINANCIAL_TRANSACTION",
+         source:         "FINANCIAL_RECORDS",
+         actor_masked:   transaction.account_masked,
+         event_details: {
+           amount:       transaction.amount,
+           direction:    "DEBIT" | "CREDIT",
+           description:  pii_vault.mask(transaction.description, case_id),
+           balance:      transaction.balance
+         }
+       }
+
+STEP 3: Timeline Sorting + Delta Computation
+────────────────────────────────────────────────────────────────
+3.1  Sort all events by event_time ASC
+3.2  Compute inter-event deltas:
+     For consecutive events (same source):
+       delta_minutes = (events[i+1].event_time - events[i].event_time).total_seconds() / 60
+       events[i].event_details["gap_to_next_minutes"] = delta_minutes
+
+3.3  Identify silence periods (per source):
+     CDR silence: gap > 120 minutes between calls/SMS → flag COMM_SILENCE
+     Location silence: gap > 60 minutes between fixes → flag LOCATION_GAP
+     For each silence period:
+       events[i].event_details["silence_flag"] = "COMM_SILENCE"
+
+STEP 4: Build Timeline Summary
+────────────────────────────────────────────────────────────────
+4.1  output = {
+       total_events:      int,
+       date_range:        {start, end},
+       event_type_counts: {CALL, SMS, LOCATION_FIX, FINANCIAL_TRANSACTION},
+       sources_present:   [CDR, LOCATION_DATA, FINANCIAL_RECORDS],
+       silence_periods:   [{start, end, source, duration_minutes}],
+       suspicious_gaps:   [{...}],
+       timeline_events_written: int
+     }
+4.2  Replay step: INPUT + MODEL_OUTPUT (timeline assembled)
+4.3  sign + persist + return
+4.7 Agent 7: Anomaly Detector (Port 8026)
+text
+PURPOSE: Detect statistical anomalies in the digital timeline using
+         Autoencoder (reconstruction error) + Isolation Forest.
+
+INPUT: {digital_timeline_output, task_token}
+
+STEP 1: Verify digital_timeline signature
+STEP 2: Load Timeline Events from DB
+────────────────────────────────────────────────────────────────
+2.1  SELECT * FROM timeline_events
+     WHERE case_id=$1 AND pipeline_run_id=$2
+     ORDER BY event_time ASC
+
+STEP 3: Feature Engineering
+────────────────────────────────────────────────────────────────
+3.1  For each event, build feature vector:
+     features[i] = [
+       hour_of_day,               # 0–23
+       day_of_week,               # 0–6
+       gap_to_prev_min,           # minutes since last event (same source)
+       gap_to_next_min,           # minutes to next event
+       duration_sec or 0,         # call duration
+       amount or 0,               # financial amount
+       is_call:         1|0,
+       is_sms:          1|0,
+       is_location:     1|0,
+       is_financial:    1|0,
+       is_nighttime:    1|0,      # 22:00–06:00
+       is_weekend:      1|0,
+     ]
+
+3.2  Standardize features:
+     scaler = StandardScaler().fit(features_matrix)
+     X = scaler.transform(features_matrix)
+
+STEP 4: Isolation Forest
+────────────────────────────────────────────────────────────────
+4.1  model_if = IsolationForest(
+         n_estimators=100,
+         contamination=0.1,    ← expect 10% anomalous
+         random_state=42
+     )
+     model_if.fit(X)
+     if_scores = model_if.decision_function(X)    ← negative = more anomalous
+     if_labels = model_if.predict(X)              ← -1 = anomaly, 1 = normal
+     if_anomaly_score = (1 - (if_scores - if_scores.min()) /
+                            (if_scores.max() - if_scores.min()))   ← normalize 0–1
+
+STEP 5: Autoencoder (PyTorch)
+────────────────────────────────────────────────────────────────
+5.1  Define autoencoder:
+     class TimelineAutoencoder(nn.Module):
+         def __init__(self, input_dim=12, encoding_dim=4):
+             encoder = nn.Sequential(
+                 nn.Linear(input_dim, 8), nn.ReLU(),
+                 nn.Linear(8, 4),         nn.ReLU(),
+                 nn.Linear(4, encoding_dim)
+             )
+             decoder = nn.Sequential(
+                 nn.Linear(encoding_dim, 4), nn.ReLU(),
+                 nn.Linear(4, 8),             nn.ReLU(),
+                 nn.Linear(8, input_dim)
+             )
+
+5.2  Train on this case's timeline (unsupervised):
+     X_tensor = torch.FloatTensor(X)
+     optimizer = Adam(model.parameters(), lr=0.001)
+     for epoch in range(100):
+         output = model(X_tensor)
+         loss   = MSELoss()(output, X_tensor)
+         optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+5.3  Reconstruction errors:
+     with torch.no_grad():
+         reconstructed = model(X_tensor)
+     ae_errors = ((X_tensor - reconstructed) ** 2).mean(dim=1).numpy()
+     ae_threshold = np.percentile(ae_errors, 90)    ← top 10% = anomalous
+     ae_anomaly_scores = np.clip(ae_errors / ae_threshold, 0, 1)
+
+STEP 6: Ensemble Score + Flagging
+────────────────────────────────────────────────────────────────
+6.1  Combined score (weighted average):
+     combined_scores = 0.5 * if_anomaly_score + 0.5 * ae_anomaly_scores
+
+6.2  For each event:
+     is_anomalous = combined_scores[i] > 0.7
+     anomaly_flags = []
+     if is_anomalous:
+       if event.hour_of_day in range(0, 5):     flags += ["UNUSUAL_HOUR"]
+       if gap_to_prev > 180 and is_call:         flags += ["COMM_SILENCE"]
+       if amount > mean_amount * 3:              flags += ["UNUSUAL_AMOUNT"]
+       if is_call and duration < 5:              flags += ["SHORT_SUSPICIOUS_CALL"]
+       if is_location and gap_to_prev > 120:     flags += ["LOCATION_GAP"]
+
+6.3  UPDATE timeline_events SET
+       is_anomalous    = $is_anomalous,
+       anomaly_score   = $combined_score,
+       anomaly_flags   = $flags
+     WHERE id = $event_id
+
+STEP 7: Replay Steps + Output
+7.1  Log replay step: ANOMALY_DETECTED
+     interpretation = f"Anomaly detection complete. {anomalous_count}/{total_events} events flagged. "
+                      f"Top anomaly types: {Counter(all_flags).most_common(3)}"
+7.2  WS broadcast: ANOMALY_FLAGGED
+7.3  output = {anomalous_count, anomaly_flag_distribution, model_params, threshold}
+7.4  sign + persist + return
+4.8 Agent 8: Hotspot Correlation Agent (Port 8027)
+text
+PURPOSE: Identify temporal windows of high anomaly density that overlap
+         with the TOD estimate — these are "critical investigative windows".
+
+INPUT: {anomaly_detector_output, tod_output}
+
+STEP 1: Verify both upstream signatures
+STEP 2: Load Anomalous Events
+────────────────────────────────────────────────────────────────
+2.1  SELECT * FROM timeline_events
+     WHERE case_id=$1 AND is_anomalous=TRUE
+     ORDER BY event_time ASC
+
+STEP 3: Temporal Clustering
+────────────────────────────────────────────────────────────────
+3.1  Sliding window (2-hour windows, 30-min step):
+     windows = []
+     window_duration = timedelta(hours=2)
+     step = timedelta(minutes=30)
+     start = earliest_event_time
+     while start <= latest_event_time:
+       end = start + window_duration
+       events_in_window = [e for e in anomalous_events
+                           if start <= e.event_time < end]
+       if events_in_window:
+         windows.append({
+           start, end,
+           event_count:  len(events_in_window),
+           avg_score:    mean(e.anomaly_score for e in events_in_window),
+           max_score:    max(e.anomaly_score for e in events_in_window),
+           flag_types:   Counter(f for e in events_in_window for f in e.anomaly_flags),
+           source_types: Counter(e.source for e in events_in_window)
+         })
+       start += step
+
+3.2  Score each window:
+     window.hotspot_score = (
+         0.4 * window.avg_score +
+         0.3 * min(window.event_count / 10, 1.0) +   ← density
+         0.3 * (1.0 if window.source_types["CDR"] > 0
+                     and window.source_types["LOCATION_DATA"] > 0 else 0.5)  ← multi-source
+     )
+
+STEP 4: TOD Overlap Detection
+────────────────────────────────────────────────────────────────
+4.1  Extract TOD window from tod_output:
+     tod_window_start = tod_output.tod_lower95
+     tod_window_end   = tod_output.tod_upper95
+
+4.2  For each hotspot window:
+     overlaps_tod = (window.start <= tod_window_end and
+                     window.end   >= tod_window_start)
+     window.overlaps_tod_window = overlaps_tod
+     window.tod_overlap_priority = "CRITICAL" if overlaps_tod else "HIGH" | "MEDIUM" | "LOW"
+
+4.3  Priority scoring:
+     if window.overlaps_tod_window and window.hotspot_score > 0.7:
+       priority = "CRITICAL"
+     elif window.hotspot_score > 0.7:
+       priority = "HIGH"
+     elif window.hotspot_score > 0.4:
+       priority = "MEDIUM"
+     else:
+       priority = "LOW"
+
+STEP 5: Write Hotspot Records + Output
+────────────────────────────────────────────────────────────────
+5.1  For each CRITICAL + HIGH window:
+     UPDATE timeline_events SET hotspot_id = hotspot_uuid
+     WHERE event_time BETWEEN window.start AND window.end AND is_anomalous=TRUE
+
+5.2  output = {
+       total_windows:    len(windows),
+       critical_count:   int,
+       high_count:       int,
+       hotspots: [
+         {start, end, priority, hotspot_score, event_count,
+          avg_anomaly_score, overlaps_tod_window, flag_types, source_diversity}
+       ]
+     }
+5.3  WS broadcast: HOTSPOT_IDENTIFIED
+5.4  Log replay step: HOTSPOT_IDENTIFIED
+5.5  sign + persist + return
+4.9 Agent 9: Hypothesis Manager (Port 8028)
+text
+PURPOSE: Maintain Bayesian posterior over 5 death hypotheses.
+         Update with each evidence signal. Generate LLM narrative.
+
+HYPOTHESES = ["HOMICIDE", "SUICIDE", "ACCIDENT", "NATURAL", "UNDETERMINED"]
+
+INPUT: {autopsy_output, tod_output, hotspot_output, digital_timeline_output}
+
+STEP 1: Verify all upstream signatures
+STEP 2: Initialize Prior
+────────────────────────────────────────────────────────────────
+2.1  Prior = uniform: {H: 0.2, S: 0.2, A: 0.2, N: 0.2, U: 0.2}
+
+STEP 3: Bayesian Updates (sequential)
+────────────────────────────────────────────────────────────────
+Evidence signal processing in defined order:
+
+Signal 1 — Manner of death from autopsy:
+3.1  manner = autopsy_output.extraction.manner_of_death
+     conf    = autopsy_output.extraction.manner_confidence
+
+     LIKELIHOOD_RATIOS["manner_HOMICIDE"] = {
+         "HOMICIDE":    conf / 0.2,
+         "SUICIDE":     (1-conf) * 0.25,
+         "ACCIDENT":    (1-conf) * 0.35,
+         "NATURAL":     (1-conf) * 0.30,
+         "UNDETERMINED":(1-conf) * 0.10
+     }
+
+     posterior = bayesian_update(prior, LIKELIHOOD_RATIOS[f"manner_{manner}"])
+     → posterior[h] = prior[h] * LR[h] / sum(prior[k]*LR[k] for k in H)
+
+     Log update step to hypothesis_snapshots table:
+     INSERT hypothesis_snapshots: {pipeline_run_id, case_id, update_seq=1,
+       evidence_signal="manner_of_death", signal_value=manner, signal_confidence=conf,
+       prior_posteriors=json(prior), posterior_after=json(posterior)}
+
+     Log replay step: BAYESIAN_UPDATE
+
+Signal 2 — Wound pattern (defensive wounds):
+3.2  if autopsy.wounds any w.defensive == True:
+     LR = {HOMICIDE: 4.0, SUICIDE: 0.5, ACCIDENT: 0.7, NATURAL: 0.1, UNDETERMINED: 0.8}
+     posterior = bayesian_update(posterior, LR)
+     log snapshot + replay_step
+
+Signal 3 — Toxicology (substances found):
+3.3  if toxicology.drugs_present:
+     LR = {HOMICIDE: 2.0, SUICIDE: 3.0, ACCIDENT: 2.5, NATURAL: 1.2, UNDETERMINED: 1.5}
+     posterior = bayesian_update(posterior, LR)
+     log snapshot + replay_step
+
+Signal 4 — Critical hotspot overlaps TOD:
+3.4  critical_hotspots = hotspot_output.hotspots where priority=="CRITICAL"
+     if any(h.overlaps_tod_window for h in critical_hotspots):
+     LR = {HOMICIDE: 3.5, SUICIDE: 1.5, ACCIDENT: 1.8, NATURAL: 0.3, UNDETERMINED: 1.0}
+     posterior = bayesian_update(posterior, LR)
+     log snapshot + replay_step
+
+Signal 5 — Comm silence before death:
+3.5  silence_near_tod = silence_periods where period overlaps tod_window
+     if silence_near_tod:
+     LR = {HOMICIDE: 2.0, SUICIDE: 1.5, ACCIDENT: 0.8, NATURAL: 0.6, UNDETERMINED: 1.2}
+     posterior = bayesian_update(posterior, LR)
+     log snapshot + replay_step
+
+Signal 6 — Unknown contact near TOD:
+3.6  Check if any CDR calls to unknown numbers within 2h of tod_mean
+     if found:
+     LR = {HOMICIDE: 2.5, SUICIDE: 0.8, ACCIDENT: 1.2, NATURAL: 0.5, UNDETERMINED: 1.2}
+     posterior = bayesian_update(posterior, LR)
+
+STEP 4: Normalize final posterior
+────────────────────────────────────────────────────────────────
+4.1  total = sum(posterior.values())
+     posterior = {h: v/total for h,v in posterior.items()}
+4.2  top_hypothesis = max(posterior, key=posterior.get)
+4.3  top_confidence = posterior[top_hypothesis]
+
+STEP 5: LLM Narrative Generation
+────────────────────────────────────────────────────────────────
+5.1  System prompt: "You are a forensic intelligence analyst writing a hypothesis
+     assessment narrative. Use only the evidence signals provided. Be objective.
+     Note uncertainty clearly."
+
+5.2  User prompt (sanitized):
+     f"""Evidence signals and Bayesian posteriors:
+     - Manner of death: {manner} (confidence {conf})
+     - Defensive wounds: {has_defensive}
+     - Toxicology findings: {tox_summary}
+     - Critical activity window overlaps TOD: {has_hotspot}
+     - Communication silence near TOD: {has_silence}
+     Final posteriors: {json(posterior)}
+
+     Write a 3-paragraph forensic assessment of the most likely manner of death,
+     the supporting evidence, and the main alternative hypotheses that remain open.
+     Do not reveal specific names, phone numbers, or addresses."""
+
+5.3  LLM call → parse narrative text (3 paragraphs)
+
+STEP 6: WS broadcast: HYPOTHESIS_UPDATED
+STEP 7: sign + persist + return
+4.10 Agent 10: Reasoning Replay Agent (Port 8029)
+text
+PURPOSE: Collect all replay_steps logged by every agent across the pipeline,
+         sort them into a single sequential chain, sign each step,
+         compute and verify the cryptographic hash chain.
+
+INPUT: {all agent replay steps accumulated in ctx.replay_steps, task_token}
+
+STEP 1: Load all replay steps from DB
+────────────────────────────────────────────────────────────────
+1.1  SELECT * FROM replay_steps
+     WHERE pipeline_run_id=$1
+     ORDER BY timestamp ASC, agent_id ASC
+
+1.2  Total steps: typically 60–80 depending on evidence richness
+
+STEP 2: Assign Global Sequential Numbers
+────────────────────────────────────────────────────────────────
+2.1  Sort by timestamp (agent-internal seq is local; global seq is cross-agent)
+2.2  Assign seq = 0, 1, 2, ... to each step in order
+
+STEP 3: Build Cryptographic Chain
+────────────────────────────────────────────────────────────────
+3.1  prev_hash = sha256(f"REPLAY_GENESIS:{pipeline_run_id}".encode()).hexdigest()
+     For each step in seq order:
+       # Canonical step content for hashing:
+       step_content = json.dumps({
+           "seq":              step.seq,
+           "agent_id":         step.agent_id,
+           "trigger_type":     step.trigger_type,
+           "input_summary":    step.input_summary,
+           "interpretation":   step.interpretation,
+           "confidence":       str(step.confidence),
+           "timestamp":        step.timestamp.isoformat()
+       }, sort_keys=True, separators=(",",":"))
+
+       step_hash = sha256(step_content.encode()).hexdigest()
+
+       # Sign step_hash with orchestrator private key:
+       signature = rsa_sign(step_hash, orchestrator_private_key)
+
+       UPDATE replay_steps SET
+         seq           = $seq,
+         step_hash     = $step_hash,
+         prev_step_hash = $prev_hash,
+         signature     = $signature
+       WHERE id = $step.id
+
+       prev_hash = step_hash   ← chain forward
+
+STEP 4: Chain Integrity Self-Verification
+────────────────────────────────────────────────────────────────
+4.1  Re-verify the entire chain just built:
+     prev = sha256(f"REPLAY_GENESIS:{pipeline_run_id}".encode()).hexdigest()
+     for step in sorted_steps:
+       recomputed = sha256(step_content_for(step).encode()).hexdigest()
+       assert recomputed == step.step_hash, "CHAIN_BUILD_ERROR"
+       assert step.prev_step_hash == prev, "CHAIN_LINKAGE_ERROR"
+       rsa_verify(step.step_hash, step.signature, orchestrator_public_key)
+       prev = step.step_hash
+     chain_valid = True
+
+STEP 5: Build Summary
+────────────────────────────────────────────────────────────────
+5.1  output = {
+       total_steps:       len(steps),
+       chain_valid:       True,
+       agent_step_counts: Counter(s.agent_id for s in steps),
+       trigger_type_distribution: Counter(s.trigger_type for s in steps),
+       first_step_hash:   steps[0].step_hash,
+       last_step_hash:    steps[-1].step_hash,
+       genesis_hash:      sha256(f"REPLAY_GENESIS:{pipeline_run_id}".encode()).hexdigest()
+     }
+5.2  sign + persist + return
+4.11 Agent 11: Report Generator (Port 8030)
+text
+PURPOSE: Compile all agent outputs into a comprehensive forensic intelligence
+         report with LLM-generated executive summary.
+
+INPUT: {all agent outputs, task_token}
+
+STEP 1: Verify ALL upstream agent output signatures (10 agents)
+────────────────────────────────────────────────────────────────
+1.1  For each agent_id in AGENT_DAG (except report_generator):
+     if agent_id in available_outputs:
+       verify_agent_output(available_outputs[agent_id])
+     else:
+       mark_section_unavailable(agent_id)
+
+STEP 2: Assemble Report Sections
+────────────────────────────────────────────────────────────────
+2.1  Section 1 — Case Overview:
+     Case metadata from DB (case_id, title, status, assigned investigators masked)
+     Evidence inventory: file count, categories, date range
+
+2.2  Section 2 — Autopsy & Toxicology:
+     From autopsy_output.extraction:
+     - Cause/manner of death with confidence
+     - Wound summary
+     - Toxicology findings
+     - PMI signs
+     All PII already masked (agent masked it during extraction)
+
+2.3  Section 3 — Time of Death:
+     From tod_output:
+     - tod_point_estimate, tod_window_95, pmi_mean
+     - Component contributions (physics, ML, signs)
+     - Consistency assessment
+
+2.4  Section 4 — Digital Timeline:
+     From digital_timeline_output + anomaly_detector_output:
+     - Total events by type
+     - Key anomalous periods
+     - Silence periods
+
+2.5  Section 5 — Hotspot Analysis:
+     From hotspot_output:
+     - All CRITICAL + HIGH windows
+Prepared using Claude Sonnet 4.6 Thinking
+continue
+
+Continuing from Agent 11 Report Generator (Section 2.5 onward) through all remaining sections of Layer 3, then closing out with the full security infrastructure, inter-agent protocol, and the complete Layer 3 → Layer 4 data contract.
+
+Agent 11: Report Generator — Continued (Port 8030)
+text
+2.5  Section 5 — Hotspot Analysis:
+     From hotspot_output:
+     - All CRITICAL + HIGH priority windows with:
+       {start_time, end_time, hotspot_score, event_count,
+        avg_anomaly_score, overlaps_tod_window, flag_types, source_diversity}
+     - Narrative: which windows overlap TOD and why they matter
+
+2.6  Section 6 — Hypothesis Assessment:
+     From hypothesis_manager_output:
+     - Final Bayesian posteriors for all 5 hypotheses
+     - Evidence signals that contributed to posterior shifts
+     - LLM narrative (3 paragraphs already generated by hypothesis agent)
+     - Ranked hypothesis table with credible intervals
+
+2.7  Section 7 — Reasoning Transparency:
+     From reasoning_replay_output:
+     - Total inference steps
+     - Chain integrity status (VALID / INVALID)
+     - Step count by agent
+     - Trigger type distribution
+     - Note: "Full step-by-step replay available in Reasoning Replay Viewer"
+
+2.8  Section 8 — Evidence Integrity:
+     For each evidence file:
+     - File name (masked if PII in filename), MIME type, size
+     - SHA-256 hash at upload
+     - Integrity status (VERIFIED / QUARANTINED)
+     - Custody log entry count
+
+2.9  Section 9 — Warnings & Limitations:
+     Collect all warnings across all agent outputs:
+     - LOW_OCR_CONFIDENCE
+     - CDR_SCHEMA_UNKNOWN
+     - INCONSISTENT_SIGNS
+     - LOW_EXTRACTION_CONFIDENCE
+     - AGENT_SKIPPED (with reason)
+     List each with source agent and recommended action
+
+STEP 3: Executive Summary via LLM
+────────────────────────────────────────────────────────────────
+3.1  Build prompt from report sections (sanitized summaries, not raw text):
+     system = """You are a forensic intelligence report writer.
+     Produce a factual, concise executive summary from the provided
+     structured forensic findings. Use cautious language for uncertain
+     findings. Never invent facts. Never include PII."""
+
+     user = f"""
+     Case summary inputs:
+     - Manner of death (pathologist): {manner_of_death} ({conf:.0%} confidence)
+     - Estimated TOD: {tod_point_estimate} (±{tod_window_half_hours:.1f}h, 95% CI)
+     - Top hypothesis: {top_hypothesis} (posterior {top_posterior:.0%})
+     - Anomalous events: {anomalous_count}/{total_events}
+     - Critical hotspots: {critical_hotspot_count}
+     - Warnings from pipeline: {warning_count}
+     - Agents skipped: {skipped_agents}
+
+     Write a 200-250 word forensic executive summary covering:
+     1. Overview of findings
+     2. Time of death and key physical evidence
+     3. Digital evidence summary and anomalies
+     4. Hypothesis assessment and confidence
+     5. Any material limitations or caveats
+
+     Do NOT include names, phone numbers, locations, or any PII."""
+
+3.2  LLM call (gemini-2.0-flash, temp=0.2, max_tokens=512)
+3.3  Validate response: word count 150–300, no PII patterns present
+     If PII detected → re-generate with stricter constraint appended
+
+STEP 4: Build Structured Report Object
+────────────────────────────────────────────────────────────────
+4.1  report = ForensicReport {
+       report_id:          UUID,
+       pipeline_run_id:    UUID,
+       case_id:            UUID,
+       generated_at:       datetime.utcnow(),
+       report_version:     1,
+       executive_summary:  llm_summary,
+       sections: {
+         case_overview:         Section1,
+         autopsy_toxicology:    Section2,
+         time_of_death:         Section3,
+         digital_timeline:      Section4,
+         hotspot_analysis:      Section5,
+         hypothesis_assessment: Section6,
+         reasoning_transparency:Section7,
+         evidence_integrity:    Section8,
+         warnings_limitations:  Section9
+       },
+       metadata: {
+         total_evidence_files:  int,
+         total_timeline_events: int,
+         total_anomalous_events:int,
+         total_replay_steps:    int,
+         llm_tokens_used:       int (this agent),
+         total_pipeline_tokens: int (cumulative from all agents),
+         chain_integrity_valid: bool,
+         agents_completed:      int,
+         agents_failed:         int,
+         agents_skipped:        int
+       },
+       hypothesis_posteriors: {
+         HOMICIDE:    float,
+         SUICIDE:     float,
+         ACCIDENT:    float,
+         NATURAL:     float,
+         UNDETERMINED:float
+       },
+       tod_estimate: {
+         point_estimate:   str (ISO),
+         window_lower_95:  str (ISO),
+         window_upper_95:  str (ISO),
+         pmi_mean_hours:   float
+       },
+       top_hypothesis:     str,
+       top_confidence:     float,
+       chain_valid:        bool,
+       warnings:           [Warning]
+     }
+
+STEP 5: Persist Report
+────────────────────────────────────────────────────────────────
+5.1  INSERT reports (
+       id, pipeline_run_id, case_id, report_version,
+       generated_at, report_json, executive_summary,
+       top_hypothesis, top_confidence, chain_valid,
+       llm_tokens, created_at
+     )
+
+5.2  UPDATE cases SET
+       last_report_id = $report_id,
+       report_generated_at = NOW(),
+       updated_at = NOW()
+     WHERE id = $case_id
+
+5.3  Audit: REPORT_GENERATED → {report_id, pipeline_run_id, top_hypothesis, chain_valid}
+
+STEP 6: Final Sign + WS Broadcast
+────────────────────────────────────────────────────────────────
+6.1  sign_agent_output(report, "report_generator", case_id, run_id)
+6.2  WS broadcast: REPORT_READY → {
+       report_id,
+       top_hypothesis,
+       top_confidence,
+       chain_valid,
+       warnings_count: len(report.warnings)
+     }
+6.3  HTTP 200 return
+PART V — INTER-AGENT SECURITY INFRASTRUCTURE
+5.1 mTLS Setup
+Every agent-to-orchestrator and orchestrator-to-agent call uses mutual TLS. No call reaches any agent without a valid orchestrator client cert.
+
+text
+CERTIFICATE HIERARCHY:
+──────────────────────────────────────────────────────────────
+Root CA (self-signed, internal only):
+  Subject: CN=AIVENTRA Internal CA, O=AIVENTRA, C=IN
+  Key:     RSA-4096
+  Validity:5 years
+  Location:certs/internal_ca.crt (cert only, key in HSM or env secret)
+
+Orchestrator Cert (issued by Internal CA):
+  Subject: CN=orchestrator, O=AIVENTRA
+  SANs:    DNS:orchestrator, DNS:orchestrator.aiventra.internal
+  Key:     RSA-2048
+  Validity:1 year (auto-renewed 30 days before expiry)
+  Files:   certs/orchestrator.crt, keys/orchestrator.key
+
+Per-Agent Cert (issued by Internal CA):
+  Subject: CN=evidence_parser (or ocr, autopsy, etc.), O=AIVENTRA
+  SANs:    DNS:{agent_id}, DNS:{agent_id}.aiventra.internal
+  Files:   certs/{agent_id}.crt, keys/{agent_id}.key
+
+VERIFICATION:
+──────────────────────────────────────────────────────────────
+Agents verify incoming requests:
+  1. TLS client cert must be signed by Internal CA
+  2. CN of client cert must == "orchestrator"
+  3. If CN mismatch → reject with 403 UNAUTHORIZED_CALLER
+
+Orchestrator verifies agent responses:
+  1. TLS server cert of agent must be signed by Internal CA
+  2. CN of server cert must == expected agent_id
+  3. If mismatch → circuit breaker failure + alert
+
+HTTPX CLIENT CONFIGURATION (orchestrator → agent):
+──────────────────────────────────────────────────────────────
+async with httpx.AsyncClient(
+    cert=(
+        f"certs/orchestrator.crt",      ← present our cert to agent
+        f"keys/orchestrator.key"
+    ),
+    verify="certs/internal_ca.crt",     ← verify agent's cert against our CA
+    timeout=httpx.Timeout(
+        connect=5.0,
+        read=float(AGENT_DAG[agent_id]["timeout_sec"]),
+        write=10.0,
+        pool=2.0
+    )
+) as client:
+    response = await client.post(f"https://{agent_id}:{port}/run", json=payload)
+5.2 Task Token System (One-Time Use JWT)
+python
+TASK_TOKEN_SPEC:
+──────────────────────────────────────────────────────────────
+Algorithm:  RS256 (RSA + SHA-256)
+Signing Key: TASK_TOKEN_PRIVATE_KEY (RSA-2048, from env/secrets)
+Verify Key:  TASK_TOKEN_PUBLIC_KEY  (shared to all agents at startup)
+
+CLAIMS:
+{
+  "iss": "aiventra-orchestrator",
+  "sub": "evidence_parser",          ← target agent
+  "op":  "run",                      ← permitted operation
+  "cid": "case-uuid-here",           ← case_id restriction
+  "pid": "pipeline-uuid-here",       ← pipeline_run_id restriction
+  "jti": "unique-token-id-uuid4",    ← one-time use ID
+  "iat": 1746732000,
+  "exp": 1746732300                  ← TTL: 300 seconds (5 minutes)
+}
+
+ISSUE (orchestrator):
+──────────────────────────────────────────────────────────────
+def issue_task_token(target_agent, case_id, pipeline_run_id, ttl=300):
+    jti = str(uuid4())
+    now = int(time.time())
+    payload = {
+        "iss": "aiventra-orchestrator",
+        "sub": target_agent,
+        "op":  "run",
+        "cid": str(case_id),
+        "pid": str(pipeline_run_id),
+        "jti": jti,
+        "iat": now,
+        "exp": now + ttl
+    }
+    token = jwt.encode(payload, TASK_TOKEN_PRIVATE_KEY, algorithm="RS256")
+    # Mark JTI as "issued" in Redis (for replay detection):
+    await redis.setex(f"task_token:issued:{jti}", ttl + 60, "1")
+    return token
+
+VERIFY (agent, on every /run request):
+──────────────────────────────────────────────────────────────
+async def verify_task_token(token, expected_agent, case_id, pipeline_run_id):
+    # 1. Decode + verify signature + expiry:
+    payload = jwt.decode(
+        token,
+        TASK_TOKEN_PUBLIC_KEY,
+        algorithms=["RS256"],
+        options={"verify_exp": True}
+    )
+
+    # 2. Validate claims:
+    assert payload["iss"] == "aiventra-orchestrator",  raise InvalidToken
+    assert payload["sub"] == expected_agent,           raise WrongAgent
+    assert payload["op"]  == "run",                    raise InvalidOp
+    assert payload["cid"] == str(case_id),             raise CaseMismatch
+    assert payload["pid"] == str(pipeline_run_id),     raise PipelineMismatch
+
+    # 3. One-time use check (replay prevention):
+    jti = payload["jti"]
+    already_used = await redis.exists(f"task_token:used:{jti}")
+    if already_used:
+        raise TokenAlreadyUsed(jti)
+
+    # 4. Mark as used (atomic — race condition safe):
+    result = await redis.set(
+        f"task_token:used:{jti}",
+        "1",
+        ex=600,          ← keep for 10 min after use (for audit)
+        nx=True          ← only set if NOT exists (atomic one-time use)
+    )
+    if not result:
+        raise TokenAlreadyUsed(jti)   ← concurrent replay attempt
+
+    return payload
+5.3 Agent Output Signing & Verification
+python
+OUTPUT_SIGNING_SPEC:
+──────────────────────────────────────────────────────────────
+Algorithm:  RSA-PKCS1v15 + SHA-256
+Key source: AGENT_PRIVATE_KEY (per-agent, from env or secrets mount)
+            Orchestrator uses ORCHESTRATOR_PRIVATE_KEY for replay chain
+
+SIGN (each agent, before returning output):
+──────────────────────────────────────────────────────────────
+def sign_agent_output(output_dict, agent_id, case_id, run_id):
+    # Build canonical JSON (deterministic key ordering, no whitespace):
+    canonical = json.dumps(output_dict, sort_keys=True, separators=(",",":"))
+
+    # Compute content hash:
+    output_hash = sha256(canonical.encode()).hexdigest()
+
+    # Sign the hash:
+    from Crypto.Signature import pkcs1_15
+    from Crypto.Hash import SHA256
+    from Crypto.PublicKey import RSA
+
+    key = RSA.import_key(AGENT_PRIVATE_KEY)
+    h   = SHA256.new(output_hash.encode())
+    sig = pkcs1_15.new(key).sign(h)
+    signature = base64.b64encode(sig).decode()
+
+    return {
+        "agent_id":       agent_id,
+        "case_id":        str(case_id),
+        "run_id":         str(run_id),
+        "schema_version": "1.0",
+        "output_hash":    output_hash,
+        "signature":      signature,
+        "signed_at":      datetime.utcnow().isoformat(),
+        "payload":        output_dict
+    }
+
+VERIFY (orchestrator, on receiving each agent response):
+──────────────────────────────────────────────────────────────
+def verify_agent_output(signed_output, expected_agent_id):
+    # 1. Check agent_id matches expectation:
+    assert signed_output["agent_id"] == expected_agent_id
+
+    # 2. Recompute canonical hash:
+    canonical  = json.dumps(signed_output["payload"],
+                             sort_keys=True, separators=(",",":"))
+    recomputed = sha256(canonical.encode()).hexdigest()
+    assert recomputed == signed_output["output_hash"], "HASH_MISMATCH"
+
+    # 3. Verify signature:
+    pub_key = AGENT_PUBLIC_KEYS[expected_agent_id]
+    key = RSA.import_key(pub_key)
+    h   = SHA256.new(recomputed.encode())
+    sig = base64.b64decode(signed_output["signature"])
+    pkcs1_15.new(key).verify(h, sig)    ← raises ValueError if invalid
+
+    return True   ← signature valid, content unmodified
+5.4 LLM Prompt Injection Defense
+python
+PROMPT_SANITIZATION PIPELINE:
+──────────────────────────────────────────────────────────────
+Every agent that calls the AI Gateway must sanitize evidence text first.
+
+SANITIZATION STEPS (in order):
+
+Step 1 — Injection Pattern Scan (12 patterns):
+    INJECTION_PATTERNS = [
+        r"(?i)(ignore|forget|disregard)\s+(all\s+)?previous\s+(instructions?|prompts?|context)",
+        r"(?i)you\s+are\s+now\s+(a\s+)?(?!forensic|analyst)",
+        r"(?i)(system|assistant|user)\s*:\s*['\"]",
+        r"(?i)print\s+(your\s+)?(system\s+)?prompt",
+        r"(?i)(reveal|show|display)\s+(your\s+)?(instructions?|prompts?)",
+        r"(?i)act\s+as\s+(?!a\s+forensic)",
+        r"(?i)DAN\b|jailbreak|override\s+safety",
+        r"<\s*/?s(ystem|cript)\b",          ← XML/HTML injection
+        r"\{\{.*?\}\}",                       ← template injection
+        r"(?i)base64\s*decode",
+        r"(?i)eval\s*\(",
+        r"(?i)exec\s*\("
+    ]
+
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, text):
+            raise PromptInjectionAttempt(pattern=pattern, text_excerpt=text[:100])
+            ← Log as SECURITY_EVENT, quarantine file, halt agent
+
+Step 2 — Structural Escape:
+    # Escape characters that could break prompt delimiters:
+    text = text.replace("```", "'''")           ← code fence escape
+    text = text.replace("<|", "[|").replace("|>","[|")  ← token boundary escape
+    text = re.sub(r"(system|user|assistant)\s*:", "[REDACTED_ROLE]:", text, flags=re.I)
+
+Step 3 — Delimiter Wrapping:
+    # Wrap in explicit delimiters so LLM knows it's data, not instruction:
+    sanitized = f"""
+    ===EVIDENCE_DOCUMENT_START===
+    {text}
+    ===EVIDENCE_DOCUMENT_END===
+    Analyze ONLY the content between the delimiters above.
+    """
+
+Step 4 — Length Truncation:
+    # LLM context window management:
+    if len(sanitized) > MAX_EVIDENCE_CHARS[agent_id]:
+        sanitized = sanitized[:MAX_EVIDENCE_CHARS[agent_id]]
+        sanitized += "\n...[DOCUMENT TRUNCATED — remaining content not included]"
+
+MAX_EVIDENCE_CHARS = {
+    "autopsy":    60_000,   ← ~15k tokens
+    "hypothesis": 10_000,   ← summary only, not full doc
+    "report":     8_000,    ← section summaries only
+}
+
+Step 5 — Audit Log:
+    INSERT INTO security_events: {
+        event_type: "PROMPT_SANITIZATION_PASS",
+        agent_id, case_id, original_length, sanitized_length,
+        patterns_checked: 12, patterns_matched: 0
+    }
+PART VI — REPLAY STEP SYSTEM: FULL SPEC
+Every agent logs structured replay steps during execution. These steps are the atomic units of forensic reasoning transparency — they are what an investigator, auditor, or court sees in the Reasoning Replay Viewer (Layer 4).
+
+6.1 ReplayStep Schema
+python
+class ReplayStep(BaseModel):
+    # Identity
+    id:              UUID = Field(default_factory=uuid4)
+    run_id:          UUID                    # agent_run.id
+    pipeline_run_id: UUID
+    case_id:         UUID
+    agent_id:        str
+
+    # Ordering
+    seq:             int = 0                 # assigned by reasoning_replay agent
+    timestamp:       datetime = Field(default_factory=datetime.utcnow)
+
+    # Content
+    trigger_type:    TriggerType             # enum below
+    input_summary:   str                     # what this step received (max 500 chars)
+    interpretation:  str                     # what the agent concluded (max 1000 chars)
+    confidence:      Optional[Decimal]       # 0.0000 to 1.0000
+    evidence_ids:    List[UUID] = []         # which evidence files this step references
+    input_data:      Optional[dict] = None   # full masked input (for deep drill-down)
+    model_version:   Optional[str] = None
+
+    # Cryptographic chain (set by reasoning_replay agent)
+    step_hash:       str = ""                # SHA-256 of canonical step content
+    prev_step_hash:  str = ""                # previous step's hash
+    signature:       str = ""               # RS256 sig
+
+class TriggerType(str, Enum):
+    INPUT               = "INPUT"
+    RULE                = "RULE"
+    MODEL_OUTPUT        = "MODEL_OUTPUT"
+    BAYESIAN_UPDATE     = "BAYESIAN_UPDATE"
+    LLM_EXTRACTION      = "LLM_EXTRACTION"
+    LLM_NARRATIVE       = "LLM_NARRATIVE"
+    CONSISTENCY_CHECK   = "CONSISTENCY_CHECK"
+    INTEGRITY_GATE      = "INTEGRITY_GATE"
+    ANOMALY_DETECTED    = "ANOMALY_DETECTED"
+    HOTSPOT_IDENTIFIED  = "HOTSPOT_IDENTIFIED"
+6.2 Replay Step Budgets per Agent
+The following table defines the expected replay step counts and types each agent produces — this governs the Reasoning Replay Viewer's rendering logic:
+
+text
+Agent                  │ Min Steps │ Max Steps │ Dominant Trigger Types
+───────────────────────┼───────────┼───────────┼──────────────────────────────────────────
+evidence_parser        │  2        │  8        │ INPUT, INTEGRITY_GATE
+ocr                    │  1        │  5        │ INPUT, MODEL_OUTPUT (confidence)
+format_normalizer      │  3        │  12       │ INPUT, RULE (schema mapping)
+autopsy                │  3        │  6        │ INPUT, LLM_EXTRACTION
+tod                    │  4        │  9        │ INPUT, MODEL_OUTPUT, CONSISTENCY_CHECK
+digital_timeline       │  3        │  10       │ INPUT, RULE (silence detection)
+anomaly_detector       │  2        │  6        │ MODEL_OUTPUT, ANOMALY_DETECTED
+hotspot_correlation    │  2        │  8        │ ANOMALY_DETECTED, HOTSPOT_IDENTIFIED
+hypothesis_manager     │  6        │  15       │ BAYESIAN_UPDATE (one per signal), LLM_NARRATIVE
+reasoning_replay       │  1        │  3        │ INTEGRITY_GATE (chain build + verify)
+report_generator       │  2        │  4        │ LLM_NARRATIVE, INPUT
+───────────────────────┼───────────┼───────────┼──────────────────────────────────────────
+TOTAL (typical case)   │ 33        │ 86        │ ~60 steps average
+6.3 Layer 4 Replay Viewer Data Contract
+Layer 4's Reasoning Replay Viewer (RRV) reads exclusively from these tables/endpoints:
+
+python
+# Endpoint exposed by Layer 3 internal API (not public-facing):
+GET /internal/replay/{pipeline_run_id}
+
+RETURNS:
+{
+  pipeline_run_id: UUID,
+  case_id:         UUID,
+  chain_valid:     bool,
+  genesis_hash:    str,
+  total_steps:     int,
+  steps: [
+    {
+      seq:            int,
+      agent_id:       str,
+      trigger_type:   str,
+      input_summary:  str,        # shown in UI step card left side
+      interpretation: str,        # shown in UI step card right side
+      confidence:     float|null, # rendered as confidence bar
+      evidence_ids:   [UUID],     # links to evidence viewer
+      step_hash:      str,        # shown as fingerprint in UI
+      prev_step_hash: str,        # shown as chain link
+      signature:      str,        # shown as verified/unverified badge
+      timestamp:      ISO,
+      chain_ok:       bool        # pre-verified by reasoning_replay agent
+    },
+    ...
+  ]
+}
+
+# Layer 4 can verify chain independently:
+GET /internal/replay/{pipeline_run_id}/verify
+RETURNS: {chain_valid: bool, total_steps, broken_at_seq: int|null}
+PART VII — WEBSOCKET EVENT TAXONOMY
+All WebSocket events emitted by Layer 3 to Layer 1's WS manager follow this schema:
+
+python
+class WsEvent(BaseModel):
+    event_type:     str         # see taxonomy below
+    pipeline_run_id:UUID
+    case_id:        UUID
+    timestamp:      datetime
+    payload:        dict        # event-specific data
+
+# EVENT TAXONOMY (all events emitted by Layer 3):
+──────────────────────────────────────────────────────────────────
+
+PIPELINE_TRIGGERED     {pipeline_run_id, evidence_count, mode}
+PIPELINE_STARTED       {pipeline_run_id, queue_wait_ms}
+AGENT_STARTED          {agent_id, tier}
+AGENT_RETRYING         {agent_id, retry_count, delay_sec, error_summary}
+AGENT_COMPLETE         {agent_id, duration_ms, llm_tokens}
+AGENT_ERROR            {agent_id, error_summary, retry_count, is_final}
+AGENT_SKIPPED          {agent_id, reason}
+TOD_UPDATED            {tod_point_estimate, tod_window_lower, tod_window_upper, pmi_mean_hours}
+ANOMALY_FLAGGED        {anomalous_event_count, total_events, top_flag_types}
+HOTSPOT_IDENTIFIED     {critical_count, high_count, top_hotspot_window}
+HYPOTHESIS_UPDATED     {top_hypothesis, top_confidence, all_posteriors}
+REPORT_READY           {report_id, top_hypothesis, top_confidence, chain_valid, warnings_count}
+PIPELINE_COMPLETE      {status, failed_agents, skipped_agents, total_duration_ms, total_llm_tokens}
+PIPELINE_FAILED        {error, failed_agent, is_critical}
+PART VIII — HYPOTHESIS SNAPSHOT TABLE
+The hypothesis evolution across Bayesian updates is preserved in full for the Reasoning Replay Viewer. This powers the "hypothesis trajectory" chart in Layer 4:
+
+sql
+CREATE TABLE hypothesis_snapshots (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pipeline_run_id     UUID NOT NULL,
+    case_id             UUID NOT NULL,
+    update_seq          INTEGER NOT NULL,   -- 1, 2, 3, ... (one per Bayesian signal)
+    evidence_signal     TEXT NOT NULL,      -- "manner_of_death", "defensive_wounds", etc.
+    signal_value        TEXT,               -- what the signal said
+    signal_confidence   NUMERIC(5,4),
+    prior_homicide      NUMERIC(7,6) NOT NULL,
+    prior_suicide       NUMERIC(7,6) NOT NULL,
+    prior_accident      NUMERIC(7,6) NOT NULL,
+    prior_natural       NUMERIC(7,6) NOT NULL,
+    prior_undetermined  NUMERIC(7,6) NOT NULL,
+    post_homicide       NUMERIC(7,6) NOT NULL,
+    post_suicide        NUMERIC(7,6) NOT NULL,
+    post_accident       NUMERIC(7,6) NOT NULL,
+    post_natural        NUMERIC(7,6) NOT NULL,
+    post_undetermined   NUMERIC(7,6) NOT NULL,
+    lr_applied          JSONB NOT NULL,     -- likelihood ratios used
+    run_id              UUID NOT NULL REFERENCES agent_runs(id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_snapshots_pipeline_seq ON hypothesis_snapshots(pipeline_run_id, update_seq);
+CREATE INDEX idx_snapshots_case         ON hypothesis_snapshots(case_id);
+
+-- Constraint: posteriors must sum to ~1.0
+ALTER TABLE hypothesis_snapshots ADD CONSTRAINT chk_posterior_sum
+    CHECK (
+        ABS((post_homicide + post_suicide + post_accident +
+             post_natural + post_undetermined) - 1.0) < 0.0001
+    );
+PART IX — FINAL REPORTS TABLE
+sql
+CREATE TABLE reports (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pipeline_run_id     UUID NOT NULL,
+    case_id             UUID NOT NULL REFERENCES cases(id),
+    report_version      INTEGER NOT NULL DEFAULT 1,
+    generated_at        TIMESTAMPTZ NOT NULL,
+    report_json         JSONB NOT NULL,         -- full ForensicReport object
+    executive_summary   TEXT NOT NULL,
+    top_hypothesis      TEXT NOT NULL,
+    top_confidence      NUMERIC(5,4) NOT NULL,
+    chain_valid         BOOLEAN NOT NULL,
+    agents_completed    INTEGER NOT NULL,
+    agents_failed       INTEGER NOT NULL DEFAULT 0,
+    agents_skipped      INTEGER NOT NULL DEFAULT 0,
+    total_llm_tokens    INTEGER NOT NULL DEFAULT 0,
+    total_pipeline_ms   INTEGER,
+    is_current          BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Only one current report per case:
+CREATE UNIQUE INDEX idx_reports_case_current
+    ON reports(case_id) WHERE is_current = TRUE;
+
+CREATE INDEX idx_reports_pipeline ON reports(pipeline_run_id);
+CREATE INDEX idx_reports_case     ON reports(case_id, report_version DESC);
+
+-- When a new report is inserted, mark previous as not current (trigger):
+CREATE OR REPLACE FUNCTION mark_previous_report_superseded()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE reports
+    SET is_current = FALSE
+    WHERE case_id = NEW.case_id
+      AND id != NEW.id
+      AND is_current = TRUE;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_report_supersede
+    AFTER INSERT ON reports
+    FOR EACH ROW
+    EXECUTE FUNCTION mark_previous_report_superseded();
+PART X — LAYER 3 → LAYER 4 COMPLETE DATA CONTRACT
+Layer 4 (Report Viewer + Reasoning Replay Viewer + Dashboard) reads exclusively from these Layer 3 outputs:
+
+text
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                     LAYER 3 → LAYER 4 READ CONTRACT                                  │
+├─────────────────────────────────────┬─────────────────────────────────────────────────┤
+│ Layer 4 Component                   │ Reads From                                      │
+├─────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ Forensic Report Viewer              │ reports.report_json                             │
+│                                     │ reports.executive_summary                       │
+│                                     │ reports.top_hypothesis, top_confidence          │
+├─────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ Reasoning Replay Viewer             │ replay_steps (full chain, ordered by seq)       │
+│                                     │ hypothesis_snapshots (for trajectory chart)     │
+│                                     │ agent_runs (for timeline sidebar)               │
+│                                     │ /internal/replay/{pid}/verify                  │
+├─────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ Timeline Viewer                     │ timeline_events (all, ordered by event_time)    │
+│                                     │ timeline_events WHERE is_anomalous=TRUE         │
+│                                     │ hotspot windows from agent_outputs              │
+├─────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ Agent Pipeline Status Dashboard     │ agent_runs (status, duration, retry_count)      │
+│                                     │ WS events (live updates)                        │
+├─────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ Hypothesis Dashboard                │ hypothesis_snapshots (trajectory)               │
+│                                     │ reports.hypothesis_posteriors (final)           │
+├─────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ Evidence Integrity Panel            │ evidence_files (from Layer 2 via API)           │
+│                                     │ custody_log (from Layer 2 via API)              │
+│                                     │ agent_outputs WHERE agent_id='evidence_parser'  │
+└─────────────────────────────────────┴─────────────────────────────────────────────────┘
+
+ALL Layer 4 reads are:
+  - Via Layer 1 authenticated REST endpoints (never direct DB)
+  - RBAC-enforced: ADMIN and LEAD_INVESTIGATOR see all sections;
+    INVESTIGATOR sees report + timeline but not raw evidence bytes
+  - Audit-logged: every Layer 4 read is an EVIDENCE_ACCESSED event
+Layer 3 is now fully specified end-to-end: all 11 agents with complete algorithmic internals, the orchestrator DAG executor, mTLS + task token security, the Bayesian hypothesis engine, the Monte Carlo TOD model, the cryptographic replay chain, circuit breakers, retry logic, all database schemas, and the complete Layer 4 data contract.

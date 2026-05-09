@@ -1,0 +1,1053 @@
+AIVENTRA Frontend Spec v1.0
+0. Global Design System
+0.1 Viewport & Breakpoints
+Primary target: Desktop (1366–1920 px width), 768+ px height.
+
+Breakpoints:
+
+lg (≥ 1280 px): Full 3‑column layout (sidebar + main + inspector).
+
+md (1024–1279 px): Sidebar collapsible; inspector collapsible.
+
+sm (≤ 1023 px): Single-column stacked views with tabs; inspector becomes modal.
+
+All specs below assume lg breakpoint; for md/sm, the agent should adapt by stacking main and inspector or collapsing the sidebar into an icon bar.
+
+0.2 Layout Structure
+Left navigation sidebar:
+
+Width: 80 px (collapsed), 240 px (expanded; optional).
+
+Fixed, full height.
+
+Main content column:
+
+Width: calc(100vw - sidebar_width - inspector_width).
+
+Padding: 24 px left/right, 20 px top/bottom.
+
+Right inspector panel:
+
+Width: 320 px.
+
+Fixed, full height minus global header.
+
+Scrollable.
+
+0.3 Color Palette (Dark Forensic Theme)
+Backgrounds:
+
+bg-base: #05060A (page background).
+
+bg-elevated: #0F1015 (cards & surfaces).
+
+bg-glass: rgba(255, 255, 255, 0.04) (glass panels).
+
+Borders & dividers:
+
+border-subtle: rgba(255, 255, 255, 0.06).
+
+Text:
+
+text-primary: #F9FAFB.
+
+text-muted: #9CA3AF.
+
+text-faint: #6B7280.
+
+Accents & statuses:
+
+Primary accent (analysis): #22C7D5 (cyan).
+
+Secondary accent (selection/hover): #38BDF8.
+
+Anomaly/high-risk: #F97373 (warm magenta/red).
+
+Warning: #FBBF24.
+
+Success: #22C55E.
+
+Semantic:
+
+TOD band: rgba(34, 199, 213, 0.18).
+
+Anomaly heat: rgba(251, 113, 133, 0.22).
+
+Background detail:
+
+Apply subtle noise texture overlay on bg-base at 3–5% opacity.
+
+Apply soft vignette (darkening at edges) to keep attention toward center.
+
+0.4 Typography
+Display font (titles): Instrument Serif or Playfair Display.
+
+H1 (page title): 28–32 px, weight 600–700.
+
+Body font (UI): Inter or Plus Jakarta Sans.
+
+Body text: 14–16 px, 1.5 line height.
+
+Meta text: 12 px.
+
+Rules:
+
+Titles and major labels always left-aligned, avoid centered text for reading.
+
+Use at most:
+
+4 font sizes: 32 (H1), 20 (H2), 16 (body), 12 (meta).
+
+Colors:
+
+Primary text: text-primary.
+
+Secondary text / meta: text-muted / text-faint.
+
+0.5 Spacing & Radius
+Spacing scale (px): 4, 8, 12, 16, 24, 32.
+
+Cards: padding 16–24 px.
+
+Section gaps: 24–32 px.
+
+Border radius:
+
+Small pill: 9999 px.
+
+Cards: 12–16 px.
+
+Node icons: circle (50%).
+
+0.6 Components Library (High-level)
+We will define these component types repeatedly:
+
+SidebarNav
+
+TopHeader
+
+AgentPill (pipeline node)
+
+MetricCard
+
+CaseCard
+
+TimelineChart
+
+MiniTimeline
+
+EventLane
+
+TableView
+
+HotspotCard
+
+GraphCanvas (causal graph)
+
+InspectorPanel
+
+AgentLabView
+
+PipelineDAGView
+
+XAIView
+
+ReplayStepView
+
+ReportEditor
+
+AuditTimeline
+
+Each component has props (e.g., title, status, data) and well-defined behavior.
+
+1. Global Shell
+1.1 SidebarNav
+Layout:
+
+Width: 80 px.
+
+Background: bg-elevated.
+
+Content (vertically stacked):
+
+Top: product logo (40×40 px).
+
+Middle: nav icons:
+
+Command Center, Cases, Agents, Labs, Replay, Reports, Analytics, Settings.
+
+Bottom: user avatar (32×32 px).
+
+Interaction:
+
+Hover nav icon:
+
+Tooltip with label.
+
+Background circle highlight.
+
+Active nav icon:
+
+Accent-colored border on left (4 px).
+
+Icon tinted to primary accent.
+
+1.2 TopHeader (Global)
+Used in all pages above main content + inspector.
+
+Height: 64–72 px.
+
+Contents:
+
+Left:
+
+Page title (e.g., “Case Workspace”).
+
+(If in a case) case breadcrumb: “Cases / Case #23”.
+
+Center:
+
+Global search input (icon + placeholder “Search cases or evidence”).
+
+Right:
+
+Small buttons: Notifications, Theme toggle, Profile menu.
+
+Interactions:
+
+Search opens results dropdown with:
+
+Cases and evidence hits.
+
+2. Case Lobby (Case List)
+2.1 Layout
+TopHeader as described.
+
+Main content (padding 24 px):
+
+Row 1: Title “Cases” + New Case button.
+
+Row 2: Filter bar.
+
+Row 3+: CaseCard grid.
+
+2.2 Filter Bar
+Horizontal bar with:
+
+Dropdowns: “Status”, “Risk”, “Data sources”.
+
+Toggle group: “All / Open / Closed”.
+
+A pill showing active filters count.
+
+2.3 CaseCard Component
+Container:
+
+Width: 360–420 px.
+
+Height: ~220 px.
+
+Background: bg-elevated with bg-glass overlay.
+
+Radius: 16 px.
+
+Border: border-subtle.
+
+Internal layout (top→bottom):
+
+Header row:
+
+Case title (16 px bold).
+
+Badge: case status (e.g. “In Triage”).
+
+Meta row:
+
+Line with location, date range.
+
+Pipeline completion strip:
+
+Row of agent icons:
+
+Small circle (16 px) per agent: Autopsy, TOD, Timeline, Correlation, Hypothesis, Bias.
+
+Each circle:
+
+Filled if agent ran.
+
+Outlined if pending.
+
+With colored ring if warning/failed.
+
+Mini timeline sparkline:
+
+Thin chart (height 40 px) showing event density over time:
+
+Grey line for total events.
+
+Underlay: anomaly heat tinted where anomalies exist.
+
+Bottom row:
+
+Risk badge (colored pill).
+
+Text “Agents: 7/9 ran”.
+
+Interactions:
+
+Hover:
+
+Card scale +1–2%.
+
+Glow under pipeline strip.
+
+Click:
+
+Navigate to Case Workspace for that case.
+
+3. Case Workspace (Hero Screen) — Detailed Spec
+3.1 Grid & Sizing
+Main content width: 100% - inspector_width (~1040 px at 1440).
+
+Inspector width: 320 px.
+
+Vertical divisions:
+
+Header band: 80 px.
+
+Pipeline strip: 60 px.
+
+Tab bar: 44 px.
+
+Content area: remaining height (split per tab specifics).
+
+3.2 Case Header Band
+Height: 80 px.
+
+Content:
+
+Left block (50% width):
+
+H1: “Case #23 — Riverside Bridge”.
+
+Meta: “Chennai · 04 May 2026 · Victim: John Doe · Lead: A. Kumar”.
+
+Center block (30% width): Hypothesis pills.
+
+Each pill:
+
+Height 32 px.
+
+Structure:
+
+Left: icon circle, 20 px.
+
+Center:
+
+Title (e.g., “Homicide”).
+
+Subtext: small trend arrow + “↑ from 0.54”.
+
+Background: pill with internal progress fill (internal bar width = probability).
+
+Colors:
+
+Fill color scaled from neutral to amber/red for high-risk hypotheses.
+
+Right block (20% width): Actions.
+
+Buttons:
+
+Run Full Pipeline (primary).
+
+Re-run Changed Agents (outline).
+
+Below: small text “Last run: 5 min ago · Model set v0.9.2”.
+
+Interaction:
+
+Click hypothesis pill:
+
+Activates Causal Graph tab focused on that hypothesis.
+
+Hover:
+
+Shows tooltip “Homicide — 72% confidence (TOD + 3 high collisions)”.
+
+3.3 Multi-Agent Pipeline Strip
+Height: 60 px.
+
+Base track:
+
+Horizontal line across width (with 24 px left/right margin).
+
+Slight glow effect along the line.
+
+Nodes:
+
+9–10 nodes, evenly spaced along track:
+
+Autopsy, TOD, Timeline & Anomaly, Correlation, Claim, Mapper, Hypothesis, Bias, Replay.
+
+Each node:
+
+Outer ring: 32 px diameter.
+
+Inner circle: 22 px.
+
+Icon: 16 px glyph + text acronym (“AU”, “TD”).
+
+Status ring color-coded:
+
+Idle: grey.
+
+Completed: cyan.
+
+Running: animated gradient.
+
+Error: red.
+
+Labels:
+
+10–12 px text under each node: “TOD Agent”, etc.
+
+Interactions:
+
+Hover:
+
+Show tooltip with last run info.
+
+Node grows to 36 px, ring glow intensifies.
+
+Click:
+
+Emphasize contributions:
+
+Timeline tab: e.g. highlight TOD band or anomalies.
+
+Right inspector: switch to “Agent” detail view for that agent in this case.
+
+Also expose “Open Agent Lab” button in the inspector.
+
+When pipeline is executing:
+
+Node rings animate clockwise; edges show a subtle shimmering “flow pulse” from left to right.
+
+3.4 Tab Bar
+Below pipeline:
+
+Three tab buttons: Timeline, Hotspots, Causal.
+
+Each is a pill (height 36 px).
+
+Underline or glass indicator slides smoothly under the active tab.
+
+Tab text 13–14 px, slightly uppercase.
+
+3.5 Timeline Tab — Detailed Layout
+Vertical distribution (within main content area)
+Main timeline: 30%.
+
+Mini timeline: 10%.
+
+Event lanes: 30%.
+
+Event table: 30%.
+
+3.5.1 Main Timeline (TimelineChart component)
+Full width minus 8 px margin to inspector edge.
+
+Height: ~220–260 px.
+
+Visual elements:
+
+Background: bg-elevated with slight inner shadow.
+
+Plot area:
+
+Stacked area or stacked bars; colors:
+
+CCTV = blue.
+
+Phone = purple.
+
+Other = gray.
+
+Anomaly heat:
+
+Semi-transparent red/pink band behind the curve wherever fused anomaly score > threshold.
+
+TOD band:
+
+Vertical translucent cyan rectangle.
+
+Axes:
+
+X-axis:
+
+Ticks, but minimal labels (e.g. hour ticks).
+
+Y-axis:
+
+No explicit labels by default; only shown on hover or when zoomed deep (to reduce clutter).
+
+Interaction details:
+
+Hover anywhere on chart:
+
+Vertical line (cursor) drawn at that x.
+
+Tooltip at top:
+
+Time (exact).
+
+Total events.
+
+Breakdown by source.
+
+Average anomaly score.
+
+“Inside TOD window” badge if within band.
+
+Zoom:
+
+Scroll/pinch horizontally changes x-axis range.
+
+Smooth transitions; mini timeline updates focus.
+
+Double-click:
+
+Reset zoom to entire case or current mini-window.
+
+3.5.2 Mini Timeline (MiniTimeline component)
+Height: 40 px.
+
+Same width as main timeline.
+
+Contents:
+
+Compressed density line.
+
+TOD band again.
+
+Focus window:
+
+Rectangular overlay with draggable edges.
+
+Interaction:
+
+Drag the entire window:
+
+Pan the visible portion.
+
+Drag left/right edges:
+
+Zoom in/out.
+
+Click outside window:
+
+Recenter window around click.
+
+3.5.3 Event Lanes (EventLane component)
+Number of lanes: 4–5.
+
+Layout:
+
+Each lane height: 40–60 px.
+
+Stacked vertically, with 8 px gap.
+
+Lane composition:
+
+Left label area: 80 px.
+
+Label text (“CCTV”, “Phone”, “Autopsy/TOD”, etc.).
+
+Small icon in lane color.
+
+Right plot area:
+
+Horizontal strip from left label edge to right boundary.
+
+Each event is placed according to timestamp.
+
+Events:
+
+Visual shape:
+
+Discrete event: small pill (width 10–16 px) with optional micro-icon if zoomed in enough.
+
+Interval event: bar spanning a time range.
+
+Color:
+
+Base color by source.
+
+Outline/halo for anomalies.
+
+Interactions:
+
+Hover event:
+
+Show tooltip detailing event.
+
+Highlight row in Event table.
+
+Click event:
+
+Mark as selected (solid outline).
+
+Inspector shows full details (metadata, raw content if safe, related claims).
+
+Drag to select:
+
+User can click-drag in lane to define time window; this becomes a filter across lanes and table.
+
+3.5.4 Event Table (TableView)
+Position: Bottom; height ~220–260 px.
+
+Columns:
+
+Timestamp (sortable).
+
+Source (icon + text).
+
+Type (short string).
+
+Description (wrap to 1–2 lines).
+
+Anomaly score (numeric + colored pill).
+
+Linked agents (chips, e.g. “Timeline”, “Image”).
+
+Interactions:
+
+Row hover:
+
+Highlight the corresponding event in lanes and main timeline.
+
+Row click:
+
+Select event; inspector updates.
+
+Column sort:
+
+Sort ASC/DESC on time or anomaly.
+
+Pagination or virtual scroll for long lists.
+
+3.6 Hotspots Tab — Detailed Layout
+Whole content area under tab bar.
+
+Structure:
+
+Top filter bar.
+
+HotspotCard list (scrollable).
+
+3.6.1 Filter Bar
+Chips:
+
+All, Within TOD, Multi-source, High Confidence.
+
+Slider:
+
+“Minimum collision score” (0.0–1.0).
+
+Small info text:
+
+“Showing 7 of 21 hotspots”.
+
+Interactions:
+
+Clicking chips toggles filter.
+
+Slider changes applied in real-time.
+
+3.6.2 HotspotCard Component
+Container:
+
+Full width minus margins.
+
+Height: 140–180 px.
+
+Padding: 16–20 px.
+
+Background: bg-elevated with subtle outline.
+
+Internal layout:
+
+Top row:
+
+Left:
+
+Title: “Hotspot #3 — Phone silence + CCTV gap”.
+
+Right:
+
+Score chip:
+
+Label “Score 0.89”.
+
+Color gradient from yellow (mid) to red (high).
+
+Timeline strip:
+
+Thin timeline across card:
+
+Shows the overall window for this hotspot.
+
+TOD band region tinted.
+
+Events relevant to this collision shown as small ticks.
+
+Collision segment highlighted thicker.
+
+Agent contributions row:
+
+Horizontally: chips like:
+
+“TOD Agent”, “Timeline & Anomaly”, “Image Agent”.
+
+Each chip color-coded (primary accent) with a small intensity bar representing contribution weight.
+
+Explanation block:
+
+2–3 lines of text.
+
+Example: “Between 21:02–21:18, the victim’s phone stopped sending data, CCTV camera 3 dropped frames, and the TOD window overlaps this period. This increases homicide hypothesis by 18%.”
+
+Footer actions:
+
+Buttons: View on Timeline, View in XAI Studio.
+
+Interactions:
+
+Card hover:
+
+Slight scale up.
+
+Collision segment glow pulses gently.
+
+Click anywhere on card:
+
+Opens Timeline tab at this hotspot’s time range.
+
+Click “View in XAI Studio”:
+
+Opens XAI studio pre-filtered to this collision.
+
+3.7 Causal Graph Tab — Detailed Layout
+Canvas area:
+
+Occupies full main content area.
+
+Background: darker gradient with faint grid.
+
+GraphCanvas:
+
+Hypothesis nodes at top.
+
+Claim nodes in middle.
+
+Evidence nodes at bottom.
+
+Node design:
+
+Hypothesis node:
+
+Pill shape with gradient fill.
+
+Label: e.g. “Homicide”.
+
+Small probability text.
+
+Claim node:
+
+Rounded rectangle.
+
+Label: “Victim alive at 21:05”.
+
+Evidence node:
+
+Small circle.
+
+Unobtrusive color.
+
+Edge design:
+
+Stroke:
+
+Green for support, red for contradiction, grey for neutral.
+
+Thickness:
+
+Slightly thicker for strong relationships.
+
+Interactions:
+
+Hover node:
+
+Node grows, label brightens.
+
+Adjacent edges and nodes brighten; others dim.
+
+Click hypothesis node:
+
+Focus mode:
+
+All unsupported nodes fade to 20% opacity.
+
+Inspector shows:
+
+Probability (with sparkline).
+
+Top 3 supporting evidence items.
+
+Top 3 contradicting evidence items.
+
+Drag background:
+
+Pan graph.
+
+Scroll:
+
+Zoom graph.
+
+Mini-map:
+
+Bottom-right overlay showing current viewport frame; clicking re-centers view.
+
+3.8 InspectorPanel — Detailed Layout
+Width: 320 px, full height under global header.
+
+Structure:
+
+Header: dynamic title (“Selected Event”, “Selected Hotspot”, “Agent: TOD").
+
+Content area: scrollable; context-dependent sections.
+
+Examples:
+
+Event selected:
+
+Section 1: Core metadata (time, source, type).
+
+Section 2: Extracted tech details (tower, location, etc.).
+
+Section 3: Linked claims (list of claim nodes).
+
+Section 4: Buttons: Open in Agent Lab, Open raw evidence.
+
+Agent node selected:
+
+Summary of last run in this case.
+
+Performance metrics.
+
+Link to Agent Lab.
+
+Hypothesis node selected:
+
+Probability numbers, key evidence list, “View timeline slice”.
+
+4. Agent Directory & Agent Lab — Detailed Specs
+4.1 Agent Directory Page
+Layout:
+
+TopHeader: “Agents”.
+
+Filters row:
+
+Chips: All, NLP, Vision, Tabular, XAI, Orchestration.
+
+AgentCard grid: 3 or 4 per row.
+
+AgentCard:
+
+Similar to case card, smaller:
+
+Icon large (32–40 px).
+
+Name and description.
+
+Model label.
+
+Stats (calls today, avg latency, error rate).
+
+Button: Open Agent Lab.
+
+4.2 Agent Lab Page Template
+Top: Agent header strip:
+
+Icon + agent name + tagline.
+
+Right: model label (e.g., “DeepSeek-V4-Flash”), version.
+
+Main area: two columns:
+
+Left: Test Bench.
+
+Right: Recent Runs & Config.
+
+Left: Test Bench
+Input card:
+
+For text agents (Autopsy, Claim Extractor):
+
+Multi-line text area with placeholder “Paste or type sample input…”.
+
+For TOD Agent:
+
+Grid of inputs:
+
+Temperature slider.
+
+BMI number input.
+
+Clothing dropdown.
+
+Environment dropdown.
+
+Each control with labels and hints.
+
+For Timeline Agent:
+
+Text area or file upload placeholder.
+
+For Image Agent:
+
+Image drop zone.
+
+Run button:
+
+At bottom-right of input card.
+
+Output card:
+
+Tab bar: Summary, JSON, XAI.
+
+Summary:
+
+For TOD: mini distribution plot + band text.
+
+For Anomaly: list of flagged anomalies.
+
+JSON:
+
+Scrollable, syntax-highlighted view.
+
+XAI:
+
+Mini bar chart or bullet list of top contributing factors.
+
+Right: Recent Runs & Config
+Recent runs table:
+
+Columns: Case, Timestamp, Input summary, Result summary, Latency.
+
+Config panel:
+
+Model version.
+
+Key hyperparameters (read-only or minimal controls).
+
+“Last updated” timestamp.
+
+5. Pipeline Explorer — Detailed Spec
+Context: Per-case; accessed from Case Workspace.
+
+Layout:
+
+Left: filter sidebar (optional).
+
+Center: PipelineDAGView.
+
+Bottom: pipeline execution timeline.
+
+5.1 PipelineDAGView
+Graph with nodes = agents; edges = data flow.
+
+Each node shows:
+
+Agent icon, name.
+
+Status for last run (color).
+
+Animated execution:
+
+When replaying:
+
+Nodes light in order with numbers (1, 2, 3…).
+
+Edges animate flow; timeline at bottom syncs.
+
+Interactions:
+
+Hover node:
+
+Show tooltip with metrics.
+
+Click node:
+
+Inspector (or side drawer) shows full detail of that agent’s run for selected case.
+
+5.2 Pipeline Execution Timeline
+X-axis: time.
+
+Y-axis: one row per agent.
+
+Bars: execution windows for each agent.
+
+Clicking a bar:
+
+Highlights corresponding node in DAG and updates inspector.
+
+6. XAI & Uncertainty Studio — High-level
+Because you asked mainly for implementation-level specs, your agent can treat this as:
+
+Tabs per output type (TOD, Anomaly, Hypothesis).
+
+Each tab:
+
+Summary metrics row (cards).
+
+Main chart (density/reliability or feature attribution).
+
+Right explanation panel.
+
+Use same chart patterns as TOD distribution and anomaly feature importances from labs but aggregated here.
+
+7. Reasoning Replay Theater — High-level
+Left: step list (vertical).
+
+Center: stage (reuse mini timeline/graph/HotspotCard components depending on step type).
+
+Right: textual narrative.
+
+Each step:
+
+Contains metadata:
+
+Which agents ran.
+
+Which outputs changed.
+
+Click step:
+
+Stage updates; highlight relevant region/hypothesis.
+
+Play:
+
+Auto-advance steps in sequence with brief delay.
+
+8. Report Builder & Audit — High-level
+These reuse cards, tables, and embedding screens (snapshots) from other pages. For implementation agents, treat:
+
+Report sections as composed of:
+
+Text blocks.
+
+Component snapshot blocks (Timeline, TOD chart, Hotspot list etc.).
+
+Audit timeline as a vertical list with timestamps and tags.

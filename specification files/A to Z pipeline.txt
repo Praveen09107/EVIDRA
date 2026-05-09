@@ -1,0 +1,1044 @@
+AIVENTRA — Complete End-to-End Pipeline: A to Z
+CHAPTER 1: SYSTEM OVERVIEW
+1.1 What AIVENTRA Is
+AIVENTRA is a multi-agent AI forensic intelligence platform that ingests raw case files (autopsy reports, call detail records, financial records, device data) and autonomously produces a structured forensic analysis — including time of death estimation, communication anomalies, financial motive scoring, unified timeline, ranked hypotheses, and a fully auditable reasoning replay report.
+
+1.2 Design Philosophy
+No black box. Every inference is traced to a specific evidence item and reasoning step.
+
+Physics first, ML second. Classical forensic models (Henssge, PMI heuristics) anchor ML outputs.
+
+Uncertainty over false precision. All estimates carry explicit confidence intervals.
+
+Explainability by design. SHAP values, narrative generation, and contradiction detection are first-class outputs.
+
+1.3 System Topology
+text
+CLIENT (Browser / Mobile)
+        │  HTTPS / WSS
+        ▼
+   NGINX (Reverse Proxy + TLS)
+        │
+        ├──► FRONTEND (React 18 + TypeScript)     :3000
+        │
+        └──► API GATEWAY (FastAPI)                :8000
+                  │  Internal HTTP
+                  ▼
+           ORCHESTRATOR (FastAPI)                 :8001
+                  │  Redis Streams (task dispatch)
+                  ▼
+    ┌─────────────────────────────────────────────────┐
+    │              AGENT WORKER POOL                  │
+    │  evidence_parser  │  ocr          │ normalizer  │
+    │  autopsy          │  cdr_analyzer │ financial   │
+    │  tod              │  timeline     │ hotspot     │
+    │  hypothesis       │  reasoning_replay           │
+    └─────────────────────────────────────────────────┘
+                  │
+         ┌────────┼────────┐
+         ▼        ▼        ▼
+     PostgreSQL  Redis   MinIO
+     (data)     (queue)  (files)
+CHAPTER 2: INFRASTRUCTURE BOOTSTRAP
+2.1 Prerequisites
+bash
+# Required:
+docker >= 24.0
+docker-compose >= 2.20
+python >= 3.11        (for local dev)
+node >= 20            (for frontend dev)
+
+# Secrets setup:
+mkdir -p secrets
+openssl genrsa -out secrets/jwt_private.pem 2048
+openssl rsa -in secrets/jwt_private.pem \
+            -outform PEM -pubout \
+            -out secrets/jwt_public.pem
+
+# ML models:
+mkdir -p models
+# Place trained model files:
+#   models/tod_rf_v2.pkl
+#   models/timeline_ae_v1.pt
+#   models/financial_ae_v1.pt
+2.2 First-Time Startup
+bash
+# 1. Copy and fill environment:
+cp .env.example .env
+# Edit: POSTGRES_PASSWORD, OPENAI_API_KEY, MINIO keys
+
+# 2. Start infrastructure:
+docker-compose up -d postgres redis minio
+
+# 3. Run DB migrations:
+docker-compose run --rm api_gateway \
+  python -m alembic upgrade head
+
+# 4. Create MinIO bucket:
+docker-compose run --rm minio_setup
+
+# 5. Start all services:
+docker-compose up -d
+
+# 6. Verify all healthy:
+docker-compose ps
+curl http://localhost:8000/health
+2.3 Service Health Matrix
+text
+Service              Health Endpoint              Expected
+─────────────────────────────────────────────────────────
+api_gateway          GET /health                  200 OK
+orchestrator         GET /health                  200 OK
+postgres             pg_isready -U aiventra       ready
+redis                redis-cli ping               PONG
+minio                GET /minio/health/live       200 OK
+All agent workers    Internal heartbeat           ALIVE
+CHAPTER 3: AUTHENTICATION & SESSION MANAGEMENT
+3.1 Login Flow
+text
+1. User → POST /auth/login {email, password}
+2. Gateway verifies password_hash (bcrypt)
+3. Gateway issues:
+   - access_token  (RS256 JWT, 8h, contains: sub, org, role, jti)
+   - refresh_token (RS256 JWT, 7d, stored in httpOnly cookie)
+4. Client stores access_token in memory (never localStorage)
+5. All subsequent requests: Authorization: Bearer <access_token>
+3.2 Role Permission Matrix
+text
+Endpoint                    READONLY  INVESTIGATOR  SUPERVISOR  ADMIN
+─────────────────────────────────────────────────────────────────────
+GET /cases                     ✓           ✓             ✓         ✓
+POST /cases                    ✗           ✓             ✓         ✓
+POST /cases/{id}/files         ✗           ✓             ✓         ✓
+POST /cases/{id}/pipeline/run  ✗           ✓             ✓         ✓
+GET  /cases/{id}/results       ✓           ✓             ✓         ✓
+GET  /cases/{id}/replay        ✓           ✓             ✓         ✓
+DELETE /cases/{id}             ✗           ✗             ✓         ✓
+GET /admin/*                   ✗           ✗             ✗         ✓
+3.3 Task Token (Agent-to-Agent Trust)
+text
+When Orchestrator dispatches a task to an agent:
+  → Issues task_token (RS256, 30min):
+      sub:             "agent:autopsy"
+      pipeline_run_id: <uuid>
+      case_id:         <uuid>
+      scope:           "agent:autopsy"
+
+Agent worker verifies task_token before processing any task.
+Prevents unauthorized task injection.
+CHAPTER 4: CASE CREATION
+4.1 Create Case
+text
+POST /cases
+{
+  "case_number": "CASE-2026-001",
+  "title":       "Kumar Homicide Investigation",
+  "description": "Male victim found at residence, Chennai",
+  "priority":    "HIGH"
+}
+
+Response:
+{
+  "case_id":    "550e8400-e29b-41d4-a716-446655440000",
+  "case_number":"CASE-2026-001",
+  "status":     "OPEN",
+  "created_at": "2026-05-10T01:00:00+05:30"
+}
+4.2 DB Record Created
+sql
+INSERT INTO cases (case_id, org_id, case_number, title,
+                   description, status, priority,
+                   created_by, created_at)
+VALUES (uuid, org_uuid, 'CASE-2026-001',
+        'Kumar Homicide Investigation',
+        '...', 'OPEN', 'HIGH', user_uuid, NOW());
+CHAPTER 5: FILE UPLOAD PIPELINE
+5.1 Upload Flow (per file)
+text
+Client → POST /cases/{case_id}/files
+         multipart: file + doc_type
+
+Gateway:
+  1. Validates MIME type against allowed list per doc_type
+  2. Checks file size limit (CDR: 50MB, Autopsy: 20MB, etc.)
+  3. Generates file_id (UUID)
+  4. Uploads raw file to MinIO:
+       s3_key = cases/{case_id}/raw/{file_id}/{filename}
+  5. Inserts into case_files table (status=PENDING)
+  6. Enqueues evidence_parser task to Redis Stream
+
+Response:
+  { "file_id": "...", "status": "PROCESSING" }
+5.2 Supported Document Types
+text
+CDR              → CSV/XLS from Airtel, Jio, BSNL, Vi
+AUTOPSY_REPORT   → PDF (native or scanned), JPEG/PNG (photographs)
+FINANCIAL_RECORDS→ CSV/PDF bank statements, JSON exports
+DEVICE_DATA      → ZIP (extracted mobile backup), JSON, XML
+5.3 Multi-File Validation
+python
+# All files for a case must be uploaded before pipeline trigger.
+# Gateway checks:
+
+def validate_case_files(case_id: UUID) -> ValidationResult:
+    files     = db.fetch_files(case_id)
+    doc_types = {f.doc_type for f in files}
+
+    warnings = []
+    if "AUTOPSY_REPORT" not in doc_types:
+        warnings.append("No autopsy report — TOD and manner analysis will be limited")
+    if "CDR" not in doc_types:
+        warnings.append("No CDR data — communication analysis will be skipped")
+    if not files:
+        return ValidationResult(valid=False, error="No files uploaded")
+
+    return ValidationResult(valid=True, warnings=warnings)
+CHAPTER 6: EVIDENCE PARSER AGENT
+6.1 What It Does
+Receives raw file from MinIO
+
+Determines document sub-type and carrier/bank/format
+
+Detects if OCR is required (scanned vs native)
+
+For CDR: parses CSV rows into canonical_cdr_events table
+
+For Financial: parses into canonical_financial_events table
+
+For Autopsy: extracts raw text and passes to OCR if needed
+
+Emits completion event back to Orchestrator
+
+6.2 CDR Parsing Flow
+text
+1. Load CSV from MinIO
+2. Detect carrier from header columns:
+   - "A_Party" → AIRTEL
+   - "Calling_Number" → JIO
+   - "CLI" → BSNL
+3. Apply CARRIER_COLUMN_MAPS normalization
+4. Map carrier event types → canonical types (MOC, MTC, SMS_MO, etc.)
+5. Validate rows: drop malformed (None return from normalizer)
+6. Bulk INSERT into canonical_cdr_events
+7. Update case_files.status = 'PROCESSED'
+8. Report: {rows_parsed, rows_dropped, carriers_detected, date_range}
+6.3 Financial Parsing Flow
+text
+1. Load CSV/PDF from MinIO
+2. Detect bank from header:
+   - "Narration", "Chq/Ref No" → HDFC
+   - "Transaction Remarks" → SBI
+   - "Description", "Money In/Out" → ICICI
+3. Normalize columns to canonical schema
+4. Parse amount signs (DEBIT/CREDIT)
+5. Bulk INSERT into canonical_financial_events
+6. Emit: {txn_count, date_range, total_debits, total_credits}
+CHAPTER 7: OCR WORKER AGENT
+7.1 Two-Stage OCR Strategy
+text
+Stage 1: Tesseract (local, free)
+  → Used for: clear printed text, typed reports
+  → Languages: eng + hin (configurable)
+  → Config: --oem 3 --psm 6 (assume uniform block)
+  → Threshold: confidence > 0.75
+
+Stage 2: Google Vision API (cloud fallback)
+  → Used when: Tesseract confidence < 0.75
+  → Use cases: handwritten notes, faded ink, photographs
+  → Returns: full text annotations with bounding boxes
+
+Stage 3: Hybrid merge
+  → Page-level decision: if Vision > Tesseract confidence → use Vision
+  → Stitch pages into single text document
+  → Store: s3_key = cases/{case_id}/ocr/{file_id}/extracted.txt
+7.2 OCR Quality Scoring
+python
+def score_ocr_quality(text: str, page_count: int) -> float:
+    words          = text.split()
+    if not words: return 0.0
+
+    # Heuristics for OCR quality:
+    real_word_ratio = sum(1 for w in words if w.isalpha()) / len(words)
+    avg_word_len    = np.mean([len(w) for w in words])
+    chars_per_page  = len(text) / max(page_count, 1)
+
+    score  = 0.0
+    score += real_word_ratio * 0.5           # most words should be real
+    score += min(1.0, avg_word_len / 6) * 0.3 # avg word 5-7 chars is good
+    score += min(1.0, chars_per_page / 500) * 0.2  # reasonable density
+
+    return round(score, 3)
+CHAPTER 8: FORMAT NORMALIZER AGENT
+8.1 Responsibilities
+Takes OCR'd text (or native PDF text) from previous stage
+
+Segments autopsy text into logical sections
+
+Validates section completeness
+
+Stores structured section map in DB for Autopsy Agent
+
+For CDR/Financial already handled by Evidence Parser
+
+8.2 Section Segmentation Algorithm
+text
+Input:  Raw text string (4,000–12,000 words)
+
+Steps:
+  1. Split into lines
+  2. Scan each line for section header patterns (regex)
+  3. Assign each line to a section bucket
+  4. Post-process: merge orphaned lines into nearest section
+  5. Output: { "CAUSE_OF_DEATH": "...", "EXTERNAL_EXAMINATION": "...", ... }
+
+Quality checks:
+  - CAUSE_OF_DEATH section must be non-empty → else WARNING
+  - MANNER_OF_DEATH section must be non-empty → else WARNING
+  - If both empty → agent raises CRITICAL flag, skips LLM extraction
+CHAPTER 9: AUTOPSY AGENT (M-05)
+9.1 Full Internal Pipeline
+text
+Input: Segmented text sections (from Format Normalizer)
+
+STEP 1 — NER Pass:
+  → Custom BERT-NER identifies injury entities, PMI signs, measurements
+  → Relation Extraction links injuries to causes
+
+STEP 2 — LLM Structured Extraction:
+  → Sends segmented text to GPT-4o with strict JSON schema prompt
+  → Temperature: 0.05 (near-deterministic)
+  → response_format: json_object (enforced)
+  → Retries up to 3× on schema validation failure
+
+STEP 3 — Pydantic Validation:
+  → Validates all fields against AutopsyExtraction schema
+  → Fills null for missing optional fields
+  → Raises for missing required fields (cause_chain.1a, manner_of_death)
+
+STEP 4 — Manner Classifier:
+  → Rule-enhanced logistic classifier validates LLM manner label
+  → If rule set and LLM agree → confidence boosted
+  → If disagree → warning flagged, lower confidence assigned
+
+STEP 5 — Output Assembly:
+  → Packages full AutopsyResult
+  → Stores in agent_results table (JSONB)
+  → Emits agent_complete event
+
+Output Schema:
+{
+  cause_chain:         { 1a, 1b, 1c, 2 }
+  manner_of_death:     HOMICIDE | SUICIDE | ACCIDENT | NATURAL | UNDETERMINED
+  manner_confidence:   float 0-1
+  mechanism_of_death:  string
+  wound_descriptions:  [{ type, location, dimensions_cm, tool_consistent_with }]
+  postmortem_signs:    { rigor, livor, decomposition, algor_notes }
+  toxicology:          { available, findings, alcohol_bac, drugs_detected }
+  body_params:         { weight_kg, height_cm, clothing }
+  temperature_findings:{ rectal_temp_c, ambient_temp_c, measurement_time }
+  pathology_warnings:  [string]
+  timeline_mentions:   { found_dead, last_seen_alive, last_known_normal }
+}
+CHAPTER 10: CDR ANALYZER AGENT (M-06)
+10.1 Full Analysis Pipeline
+text
+Input: canonical_cdr_events for case_id (from DB)
+
+STEP 1 — Behavioral Baseline:
+  → Compute 30-day baseline per MSISDN:
+      daily_call_mean, daily_call_std
+      active_hours, typical_silent_hours
+      top_contacts, tower_entropy
+      hourly_distribution
+
+STEP 2 — Last Activity Detection:
+  → Find last CDR event for victim's MSISDN
+  → Record: last_call_timestamp, last_call_counterparty, last_tower
+
+STEP 3 — Silence Window Detection:
+  → From last CDR event to discovery time = silence duration
+  → Z-score vs baseline max-silence
+  → If overlap with TOD window → severity bump
+  → Output: { duration_h, z_score, anomaly_score, severity }
+
+STEP 4 — Contact Escalation:
+  → Per-contact call frequency in 72h before last event vs 30-day baseline
+  → Flag contacts with escalation_ratio ≥ 2.5 and ≥ 3 calls
+  → Output: [{ contact_msisdn, escalation_ratio, severity }]
+
+STEP 5 — Tower Proximity Analysis:
+  → For flagged contacts: find their last tower during TOD window
+  → Haversine distance from victim's address
+  → Flag if within 2× tower radius (~3km urban)
+
+STEP 6 — IMEI Analysis:
+  → Check for IMEI changes (SIM swap or new phone)
+  → Flag if IMEI changes within 48h of death
+
+STEP 7 — Network Graph:
+  → Build contact graph for victim
+  → Identify bridge nodes (contacts connecting victim to unknown parties)
+
+Output: CdrAnalysisResult
+{
+  last_activity:         { timestamp, counterparty, tower_id }
+  silence_window:        { start, end, duration_h, anomaly_score, severity }
+  escalation_flags:      [EscalationFlag]
+  proximity_flags:       [ProximityFlag]
+  imei_anomalies:        [ImeiAnomaly]
+  tower_sequence:        [TowerEvent]
+  analysis_flags:        [string]  (high-level flags for UI)
+  confidence:            float
+}
+CHAPTER 11: FINANCIAL ANALYZER AGENT (M-07)
+11.1 Full Analysis Pipeline
+text
+Input: canonical_financial_events for case_id (from DB)
+
+STEP 1 — Baseline Construction:
+  → 90-day rolling stats per account:
+      monthly_mean_amount, monthly_std_amount
+      known_counterparties, typical_txn_categories
+      max_single_txn_historical
+      cash_vs_digital_ratio
+
+STEP 2 — Point Anomaly Detection (Isolation Forest):
+  → Feature vector per transaction:
+      amount, amount_zscore, log_amount
+      hour, is_weekend, is_cash
+      is_round_number, balance_ratio
+  → IF score → anomaly_probability [0,1]
+  → Flag if anomaly_probability > 0.65
+
+STEP 3 — Sequence Anomaly Detection (BiLSTM AE):
+  → 14-day sliding window of daily txn features
+  → Reconstruction error > 0.038 → sequence anomaly
+  → Identifies pattern shifts (e.g. sudden cash escalation week)
+
+STEP 4 — Motive Pattern Scoring:
+  → Checks within 72h before TOD for:
+      LARGE_CASH_WITHDRAWAL (>3× monthly mean)
+      REPEATED_CASH_ESCALATION (multiple cash txns escalating)
+      LARGE_TRANSFER_TO_UNKNOWN (new counterparty, large amount)
+      INSURANCE_POLICY_ACTIVITY ("insurance", "policy" in narration)
+      DEBT_REPAYMENT_SPIKE (EMI/loan >1.5× normal)
+  → Computes motive_score [0,1]
+
+STEP 5 — LLM Narrative:
+  → Sends anomalies + motive flags to GPT-4o
+  → Gets plain-English financial analysis narrative
+  → Used directly in Reasoning Replay report
+
+Output: FinancialAnalysisResult
+{
+  baseline_stats:       BaselineStats
+  point_anomalies:      [PointAnomaly]
+  sequence_anomalies:   [SequenceAnomaly]
+  motive_flags:         [MotiveFlag]
+  motive_score:         float
+  llm_narrative:        string
+  total_anomalous_amount: float
+  confidence:           float
+}
+CHAPTER 12: TOD AGENT (M-08)
+12.1 Full Estimation Pipeline
+text
+Input: AutopsyExtractionMinimal + SceneData + TemperatureMeasurements
+
+STEP 1 — Mode Selection:
+  → If rectal_temp available → HYBRID mode
+  → If only signs available → SIGNS_CONSTRAINED mode
+  → If only prior/timeline → PHYSICS_ONLY with wide prior
+
+STEP 2 — Physics Core (Henssge Numeric Solver):
+  → Inputs: temp_rectal, temp_ambient, weight_kg, correction_factor
+  → Iteratively solves cooling equation via scipy.brentq
+  → Output: PMI_mean_hours, CI_lower_95, CI_upper_95
+  → Tolerance: ±2.8h (PMI<10h), ±4.8h (10-20h), ±7.4h (>20h)
+
+STEP 3 — Heuristic Sign Likelihoods:
+  → Maps rigor/livor/decomp stages to truncated Gaussian distributions
+  → L_rigor(t), L_livor(t), L_decomp(t) over PMI grid
+
+STEP 4 — ML Surrogate (RF/GBM Ensemble):
+  → 13-feature vector → RF (500 trees) + GBM (300 trees)
+  → Ensemble weights: 0.55 RF, 0.45 GBM
+  → Output: PMI_ml_mean, PMI_ml_std (from RF tree variance)
+
+STEP 5 — Prior Construction:
+  → If last_seen_alive + found_dead known:
+        Uniform prior over that interval + soft tails
+  → Else: Broad uniform 0–72h before discovery
+
+STEP 6 — Bayesian Monte Carlo Fusion (20,000 samples):
+  → For each PMI candidate t:
+        log_weight = log_prior(t)
+                   + log_L_physics(t)
+                   + 0.7 * log_L_ml(t)
+                   + log_L_rigor(t)
+                   + log_L_livor(t)
+                   + log_L_decomp(t)
+  → Normalize weights → posterior distribution
+  → Extract: median, 95% CI, 68% CI
+
+STEP 7 — Consistency Check:
+  → Compare posterior band with each sign's plausible PMI range
+  → CONSISTENT / INCONSISTENT / INSUFFICIENT_DATA per sign
+
+STEP 8 — SHAP Explainability:
+  → TreeSHAP on RF model for feature contributions
+  → Map to TodFeatureContribution[] with direction + description
+
+STEP 9 — LLM Narrative:
+  → Numeric summary → GPT-4o → plain English TOD explanation
+
+Output: TodResult
+{
+  mode:              HYBRID | PHYSICS_ONLY | SIGNS_CONSTRAINED
+  todPointEstimate:  ISO timestamp
+  todWindow95:       { start, end }
+  todWindow68:       { start, end }
+  componentContributions: [...]
+  consistency:       { rigor, livor, algor, decomposition }
+  featureImportance: [TodFeatureContribution]
+  warnings:          [string]
+  explanationNarrative: [string]
+}
+CHAPTER 13: TIMELINE & ANOMALY AGENT (M-09)
+13.1 Full Pipeline
+text
+Input: All Tier-2 agent outputs (CDR, Financial, Autopsy, TOD)
+
+STEP 1 — Unified Timeline Construction:
+  → Merges CDR events + financial events + TOD window into
+     a single chronological event stream
+  → Resolution: 15-minute bins
+  → Feature matrix: (T, 8) → call_count, sms_count, data,
+                               contacts, fin_txn, fin_amount,
+                               tod_prob, silence_indicator
+
+STEP 2 — LSTM Autoencoder Anomaly Detection:
+  → Sliding window: 32 bins (8h) × stride 4
+  → Reconstruction error per window vs threshold 0.045
+  → Flag windows: error > threshold → anomaly window
+  → Severity: HIGH (>2×threshold), MEDIUM (1.4×), LOW (1×)
+
+STEP 3 — Isolation Forest Cross-Modal:
+  → Per-bin feature vector across modalities
+  → IF score → point anomalies at specific timestamps
+  → Cross-references with CDR silence windows
+
+STEP 4 — TOD Intersection:
+  → Find all anomaly windows that overlap TOD 95% credible interval
+  → These are "critical windows" — high investigative priority
+
+STEP 5 — Contact Co-location:
+  → For each flagged contact from CDR Agent:
+        Check if their tower places them in victim's cell cluster
+        during any anomaly window
+  → Co-location flag: contact + window + distance
+
+STEP 6 — Anomaly Window Ranking:
+  → Score each window:
+        base_score = reconstruction_error / threshold
+        + 0.30 if overlap with TOD window
+        + 0.20 if flagged contact co-located
+        + 0.15 if financial anomaly in same window
+  → Sort by combined score
+
+Output: TimelineAnomalyResult
+{
+  unified_timeline_bins:  int
+  anomaly_windows:        [AnomalyWindow]
+  critical_windows:       [AnomalyWindow]  (TOD overlap)
+  co_location_flags:      [CoLocationFlag]
+  tod_intersection_count: int
+  confidence:             float
+}
+CHAPTER 14: HOTSPOT ENGINE (M-10)
+14.1 Full Pipeline
+text
+Input: TOD result + Timeline result + CDR result + Financial result
+
+STEP 1 — Temporal Hotspot:
+  → Intersect:
+        TOD 95% window
+        CDR silence window
+        Financial anomaly window (72h before TOD)
+        Critical anomaly windows from Timeline Agent
+  → Hotspot_time_window = broadest consistent overlap
+
+STEP 2 — Contact Hotspot:
+  → From CDR: escalation_flags + proximity_flags
+  → Score each contact:
+        score += 0.35 * (escalation_ratio / 4)        # call escalation
+        score += 0.30 * (1 if proximate else 0)        # physical proximity
+        score += 0.20 * (1 if last_call_before_silence) # last known contact
+        score += 0.15 * (financial_link_score)          # financial connection
+  → Rank contacts by hotspot score
+
+STEP 3 — Spatial Hotspot:
+  → From tower data: identify cell towers with high activity during hotspot window
+  → Map overlapping towers between victim and top contacts
+  → Output: tower_ids, lat/lon cluster
+
+STEP 4 — Cross-Modal Confidence:
+  → Count how many independent evidence streams point to same hotspot:
+        Each supporting stream adds +0.15 to hotspot confidence
+  → Max confidence capped at 0.95
+
+STEP 5 — Motive-Opportunity Matrix:
+  → For each contact in hotspot:
+        Motive:      financial_link_score + escalation_ratio > threshold
+        Opportunity: proximate during TOD window
+        Score:       motive × opportunity × normalization
+
+Output: HotspotResult
+{
+  temporal_hotspot:     { start, end, supporting_streams }
+  contact_hotspots:     [ContactHotspot ranked by score]
+  spatial_hotspot:      { tower_ids, lat, lon, radius_km }
+  motive_opportunity:   [{ contact, motive_score, opportunity_score }]
+  confidence:           float
+}
+CHAPTER 15: HYPOTHESIS MANAGER (M-11)
+15.1 Full Scoring Pipeline
+text
+Input: All prior agent outputs
+
+STEP 1 — Evidence Flag Extraction:
+  → From autopsy:   "blunt_force_trauma", "defensive_wounds",
+                    "body_not_moved", "natural_disease_history", etc.
+  → From CDR:       "phone_silence_coincides_tod", "contact_escalation"
+  → From financial: "large_cash_withdrawal", "insurance_activity"
+  → From hotspot:   "contact_proximity_tod"
+
+STEP 2 — Bayesian Log-Additive Scoring:
+  → Start: uniform prior log(0.2) for each of 5 hypotheses
+  → For each evidence flag:
+        log_score[hypothesis] += EVIDENCE_WEIGHT[flag][hypothesis]
+  → Softmax-normalize → probability scores
+
+STEP 3 — Contradiction Detection:
+  → Check for logical impossibilities:
+        HOMICIDE + hesitation_wounds          → contradiction
+        NATURAL + blunt_force_trauma          → contradiction
+        SUICIDE + body_not_moved + no_note    → potential contradiction
+  → Each contradiction: { type, description, severity, affected_hypotheses }
+
+STEP 4 — Supporting / Weakening Evidence Lists:
+  → For primary hypothesis: collect all flags with positive weight
+  → For primary hypothesis: collect all flags with negative weight
+
+STEP 5 — LLM Recommendation Generation:
+  → Sends scores + evidence + contradictions to GPT-4o
+  → Gets: 5 ranked recommended_actions for investigators
+
+STEP 6 — Confidence Adjustment:
+  → Base: primary_score from Bayesian model
+  → Penalize: -0.05 per HIGH contradiction
+  → Penalize: -0.03 per missing key evidence (no toxicology, no device data)
+  → Final: primary_confidence [0,1]
+
+Output: HypothesisResult
+{
+  scores:                { HOMICIDE, SUICIDE, ACCIDENT, NATURAL, UNDETERMINED }
+  primary_hypothesis:    string
+  primary_confidence:    float
+  supporting_evidence:   [string]
+  weakening_evidence:    [string]
+  contradictions:        [Contradiction]
+  recommended_actions:   [string]
+  confidence:            float
+}
+CHAPTER 16: REASONING REPLAY AGENT (M-12)
+16.1 Full Pipeline
+text
+Input: ALL agent_results + ALL agent_tasks for pipeline_run_id
+
+STEP 1 — Step Collection:
+  → Queries replay_steps table for all steps in this pipeline_run
+  → Orders by global_index
+  → Groups by agent_id
+
+STEP 2 — Global Step Indexing:
+  → Assigns sequential global_index across all agents
+     in tier execution order:
+        evidence_parser steps → 1, 2, 3...
+        ocr steps            → next...
+        autopsy steps        → next...
+        ...continuing through hypothesis_manager
+
+STEP 3 — Reasoning Gap Detection:
+  → A gap = a decision in one agent that cannot be traced to
+     any output of its prerequisite agents
+  → For each step: verify evidence_ids[] map to actual case_files
+  → For each inference: check parent_step_ids[] are non-empty
+  → Gaps: { gap_before_step, description, severity }
+
+STEP 4 — Contradiction Detection:
+  → Cross-agent consistency checks:
+        TOD window vs CDR silence: consistent?
+        Autopsy manner vs wound pattern: consistent?
+        Financial motive window vs TOD: temporally consistent?
+        Hypothesis score vs autopsy confidence: aligned?
+  → Output: [Contradiction]
+
+STEP 5 — Confidence Aggregation:
+  → Per-agent: harmonic mean of all step confidences in that agent
+  → Overall: harmonic mean of all step confidences
+              − 0.05 per HIGH contradiction
+              − 0.03 per reasoning gap
+  → Overall: capped [0.10, 0.99]
+
+STEP 6 — DAG Construction:
+  → Nodes: each replay step
+  → Edges: parent_step_ids links
+  → Used by frontend DAG viewer
+
+STEP 7 — LLM Narrative Generation:
+  → Sends structured summary to GPT-4o:
+        TOD estimate + window
+        Manner of death + confidence
+        CDR key findings
+        Financial key findings
+        Primary hypothesis + confidence
+        All contradictions
+        All gaps
+  → Gets: 500-800 word plain English forensic narrative
+  → Temperature: 0.2 (slight variation for readability)
+
+STEP 8 — Step Index Table:
+  → Assembles UI-ready table:
+        step_id, global_index, agent_id, trigger_type,
+        timestamp, input_summary, interpretation,
+        confidence, evidence_ids, warnings, duration_ms
+
+Output: ReasoningReplayReport
+{
+  pipeline_run_id:         UUID
+  case_id:                 UUID
+  generated_at:            ISO timestamp
+  total_steps:             int
+  agents_covered:          [string]
+  step_index_table:        [ReplayStep]
+  reasoning_dag:           { nodes, edges }
+  reasoning_gaps:          [Gap]
+  contradictions:          [Contradiction]
+  confidence_summary:      { agent_id: float }
+  overall_case_confidence: float
+  total_llm_tokens_used:   int
+  total_duration_ms:       int
+  narrative:               string
+}
+CHAPTER 17: ORCHESTRATOR EXECUTION FLOW
+17.1 Complete Tier Execution
+text
+TRIGGER received from Gateway:
+  → pipeline_run created (status=PENDING)
+  → agent_plan built based on uploaded file types
+  → All tasks inserted (status=WAITING)
+
+TIER 0 → Dispatch simultaneously:
+  evidence_parser (always)
+  ocr (if scanned file detected)
+  ↓ wait for all TIER 0 complete
+
+TIER 1 → Dispatch:
+  format_normalizer (waits for parser + ocr)
+  ↓ wait for TIER 1 complete
+
+TIER 2 → Dispatch simultaneously:
+  autopsy_agent    (if AUTOPSY_REPORT uploaded)
+  cdr_analyzer     (if CDR uploaded)
+  financial_analyzer (if FINANCIAL_RECORDS uploaded)
+  ↓ wait for all TIER 2 complete
+
+TIER 3 → Dispatch simultaneously:
+  tod_agent        (waits for autopsy)
+  timeline_anomaly (waits for all Tier 2)
+  ↓ wait for all TIER 3 complete
+
+TIER 4 → Dispatch:
+  hotspot_engine   (waits for tod + timeline + cdr + financial)
+  ↓ wait for TIER 4 complete
+
+TIER 5 → Dispatch:
+  hypothesis_manager (waits for all prior)
+  ↓ wait for TIER 5 complete
+
+TIER 6 → Dispatch:
+  reasoning_replay (waits for everything)
+  ↓ wait for TIER 6 complete
+
+→ pipeline_run status = COMPLETE
+→ emit WebSocket: pipeline_complete
+→ UI auto-switches to Reasoning Replay tab
+17.2 Retry / Failure Policy
+text
+Per agent task:
+  Max attempts:       3
+  Backoff:            10s → 30s → 90s
+  Non-retryable:      INVALID_DATA, SCHEMA_ERROR
+  After max retries:  task = FAILED, pipeline = PARTIAL
+
+Pipeline PARTIAL rules:
+  If hypothesis_manager or reasoning_replay failed → pipeline = FAILED
+  If any Tier 2 agent failed but others succeeded → pipeline = PARTIAL
+  Partial results still returned with clear PARTIAL flag in UI
+CHAPTER 18: REAL-TIME UI UPDATE FLOW
+18.1 WebSocket Event Sequence
+text
+Client connects: WSS /ws/cases/{case_id}?token=<jwt>
+Gateway accepts, registers in case_connections[case_id]
+
+Events emitted during pipeline:
+
+t=0:00  pipeline_started
+        { pipeline_run_id, agents_planned, progress: 0 }
+
+t=0:30  agent_started   { agent_id: "evidence_parser" }
+t=0:45  agent_complete  { agent_id: "evidence_parser" }
+        → UI: evidence_parser dot turns green
+
+t=0:50  agent_started   { agent_id: "ocr" }
+t=1:20  agent_complete  { agent_id: "ocr" }
+
+t=1:25  pipeline_progress { progress: 20 }
+
+t=1:30  agent_started   { agent_id: "autopsy" }
+        agent_started   { agent_id: "cdr_analyzer" }    (parallel)
+        agent_started   { agent_id: "financial_analyzer" }
+
+t=3:10  agent_complete  { agent_id: "autopsy" }
+        → UI: fetches autopsy result, populates Autopsy tab
+
+t=3:45  agent_complete  { agent_id: "cdr_analyzer" }
+        → UI: fetches CDR result, populates CDR tab
+
+t=4:00  agent_complete  { agent_id: "financial_analyzer" }
+        → UI: fetches financial result
+
+t=4:05  pipeline_progress { progress: 55 }
+
+... (TOD, Timeline, Hotspot, Hypothesis in sequence)
+
+t=7:50  agent_complete  { agent_id: "hypothesis_manager" }
+        → UI: populates Hypothesis tab, updates Overview
+
+t=8:07  agent_complete  { agent_id: "reasoning_replay" }
+t=8:07  pipeline_complete { pipeline_run_id, overall_confidence: 0.79 }
+        reasoning_replay_complete {}
+        → UI: auto-switches to Reasoning Replay tab
+CHAPTER 19: FRONTEND UI FLOW (User Perspective)
+19.1 Page Journey
+text
+1. Login Page
+   → POST /auth/login → access_token stored in memory
+   → Redirect → Case List Page
+
+2. Case List Page
+   → GET /cases → shows all cases with status badges
+   → Click "New Case" → New Case Page
+
+3. New Case Page
+   → Fill: case_number, title, description, priority
+   → POST /cases → redirect to Case Dashboard
+
+4. Case Dashboard (Evidence Tab active)
+   → Upload files via drag-drop zone
+   → Each upload: POST /cases/{id}/files → shows processing queue
+   → When all uploaded: "Run Analysis" button appears
+
+5. Click "Run Analysis"
+   → POST /cases/{id}/pipeline/run
+   → WebSocket connected
+   → Pipeline Status Bar appears (agent progress dots)
+   → Tabs light up one by one as agents complete
+
+6. Tabs populate in order:
+   Autopsy tab  → manner badge, wound list, TOD hint
+   CDR tab      → contact table, silence window chart, tower map
+   Financial tab→ transaction anomaly list, motive score
+   Timeline tab → unified timeline with anomaly bands, TOD marker
+   Hypothesis tab → score bars, supporting/weakening evidence
+   Replay tab   → [auto-activated at pipeline_complete]
+                  → step table, narrative, contradiction banners
+
+7. Reasoning Replay Tab (final view):
+   → Overall confidence badge (e.g. 79%)
+   → Per-agent confidence row (5 cards)
+   → Contradiction banners (if any HIGH severity)
+   → AI Narrative (expandable, exportable PDF/TXT)
+   → Step table (44 rows, color-coded by confidence)
+   → View toggle: Table ↔ DAG
+   → Agent filter dropdown
+CHAPTER 20: DATABASE WRITE PATH (Complete)
+20.1 Tables Written During Pipeline
+text
+Table                       Written by              When
+──────────────────────────────────────────────────────────────────
+cases                       Gateway                 Case create
+case_files                  Gateway                 File upload
+pipeline_runs               Orchestrator            Pipeline trigger
+agent_tasks                 Orchestrator            Task planning
+canonical_cdr_events        evidence_parser         CDR parsing
+canonical_financial_events  evidence_parser         Financial parsing
+agent_results               Each agent              Task complete
+replay_steps                Each agent              Each reasoning step
+audit_log                   Gateway middleware      Every HTTP request
+20.2 Read Path (Results Fetch)
+text
+GET /cases/{case_id}/results:
+  → Joins pipeline_runs + agent_results for latest run
+  → Returns: all agent result JSONBs in one response
+
+GET /cases/{case_id}/replay:
+  → Queries replay_steps ORDER BY global_index
+  → Queries agent_results for confidence_summary
+  → Computes reasoning_gaps, contradictions
+  → Generates/returns ReasoningReplayReport
+CHAPTER 21: SECURITY & AUDIT TRAIL
+21.1 Security Layers
+text
+Layer 1: TLS (nginx)              All traffic encrypted in transit
+Layer 2: RS256 JWT                All API calls authenticated
+Layer 3: Task tokens              Agent-to-agent calls scoped to run
+Layer 4: Role-based routing       READONLY cannot trigger pipeline
+Layer 5: Rate limiting (Redis)    Per-user sliding window
+Layer 6: File validation          MIME type + size checks at upload
+Layer 7: Input sanitization       All user inputs validated via Pydantic
+Layer 8: MinIO presigned URLs     Files never publicly accessible
+Layer 9: Secret management        JWT keys via Docker secrets (not env)
+Layer 10: Audit log               Every request logged with user + IP
+21.2 Audit Log Entry (every request)
+json
+{
+  "log_id":        "uuid",
+  "user_id":       "uuid",
+  "org_id":        "uuid",
+  "action":        "PIPELINE_TRIGGER",
+  "resource_type": "pipeline_run",
+  "resource_id":   "uuid",
+  "ip_address":    "203.0.113.42",
+  "timestamp":     "2026-05-10T01:00:00+05:30",
+  "metadata": {
+    "method":      "POST",
+    "path":        "/cases/uuid/pipeline/run",
+    "status_code": 200,
+    "duration_ms": 45
+  }
+}
+CHAPTER 22: PERFORMANCE BENCHMARKS
+22.1 Per-Agent Timing (Typical Case)
+text
+Agent                  Typical Duration    Bottleneck
+────────────────────────────────────────────────────
+evidence_parser        15–30s              MinIO read + CSV parse
+ocr (15 pages)         45–90s              Vision API latency
+format_normalizer      10–20s              Regex + LLM call
+autopsy_agent          40–80s              GPT-4o (2–3 calls)
+cdr_analyzer           20–40s             Baseline computation
+financial_analyzer     25–50s             IF training + LLM
+tod_agent              15–30s             Monte Carlo (20k samples)
+timeline_anomaly       20–40s             AE inference
+hotspot_engine         10–20s             Intersection logic
+hypothesis_manager     30–60s             LLM + scoring
+reasoning_replay       40–90s             Full aggregation + GPT-4o
+
+Total (typical):       5–12 minutes
+22.2 System Resource Targets
+text
+Service              CPU (steady)   RAM      Notes
+─────────────────────────────────────────────────
+api_gateway          0.2 vCPU      256MB    Stateless, scales out
+orchestrator         0.5 vCPU      512MB    Event loop heavy
+Agent workers (each) 0.5–1 vCPU   512MB–1GB ML inference
+postgres             1 vCPU        2GB      Write-heavy during pipeline
+redis                0.2 vCPU      512MB    Stream throughput
+minio                0.5 vCPU      1GB      Object reads/writes
+CHAPTER 23: COMPLETE DATA FLOW SUMMARY
+text
+RAW FILE → MinIO (object storage)
+              ↓
+      evidence_parser → canonical_cdr_events table
+                      → canonical_financial_events table
+                      → OCR queue (if scanned)
+              ↓
+          ocr_worker → extracted_text.txt → MinIO
+              ↓
+    format_normalizer → sectioned text map → DB
+              ↓
+   ┌──────────────────────────────────────┐
+   │ PARALLEL TIER 2 AGENTS              │
+   │  autopsy_agent   → AutopsyResult    │
+   │  cdr_analyzer    → CdrResult        │
+   │  financial_agent → FinancialResult  │
+   └──────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────┐
+   │ PARALLEL TIER 3 AGENTS     │
+   │  tod_agent        → TodResult         │
+   │  timeline_anomaly → TimelineResult    │
+   └─────────────────────────────┘
+              ↓
+      hotspot_engine → HotspotResult
+              ↓
+   hypothesis_manager → HypothesisResult
+              ↓
+    reasoning_replay → ReasoningReplayReport
+              ↓
+   WebSocket → Frontend → Reasoning Replay Tab
+              ↓
+   Investigator reads narrative + downloads PDF
+CHAPTER 24: WORKED CASE SUMMARY (CASE-2026-001)
+text
+Case:    Kumar Homicide, Chennai
+Files:   autopsy_kumar.pdf + airtel_cdr.csv + hdfc_bank.csv
+Runtime: 8 min 7 sec
+Steps:   44 reasoning steps
+Tokens:  18,420 LLM tokens used
+
+Key Findings:
+  TOD:         2026-05-07 03:18 IST (window: 00:05–06:52)
+  Manner:      HOMICIDE (89% confidence)
+  Mechanism:   Single blunt force blow, posterior skull
+  CDR Signal:  Phone silent from 22:47 May 6 (15h 13min, Z=4.2)
+  Contact:     "Suresh" 9 calls in 48h vs 1.6/day baseline
+               Tower CHN-041 (1.3km from victim) at 23:02 May 6
+  Financial:   ₹1.4L cash in 72h (8× monthly baseline)
+  Hypothesis:  HOMICIDE 82%, ACCIDENT 6%, SUICIDE 4%
+  Confidence:  Overall 79%
+  Contradictions: 1 (LOW — missing toxicology)
+  Gaps:        0 reasoning gaps
+
+Recommended Actions:
+  1. Obtain Suresh's CDR for May 6-7
+  2. Review building CCTV 22:00–07:00 May 6-7
+  3. Verify Suresh's alibi
+  4. Investigate purpose of ₹1.4L cash withdrawals
+  5. Commission toxicology report
+CHAPTER 25: EXTENSION ROADMAP
+Future ML Modules (V2+)
+text
+Module                    Technology              Status
+───────────────────────────────────────────────────────
+Microbiome PMI            16S rRNA + RF           Planned V2
+Metabolomics PMI          LC-MS + Neural Net      Planned V2
+Video/CCTV Analysis       YOLO + ReID             Planned V2
+Voice Stress Analysis     Mel-Spectrogram + CNN   Planned V3
+Social Media Mining       BERT Sentiment + NER    Planned V2
+Federated Multi-Case      Federated Learning      Planned V3
+On-Device Processing      TinyML / ONNX           Planned V3
+API Extensibility
+text
+Agent plugin interface:
+  Every new agent must implement:
+    - process(task: AgentTask) → AgentResult
+    - health() → HealthStatus
+    - get_replay_steps() → list[ReplayStep]
+
+  Register in agent_registry.json:
+    { "agent_id": "...", "tier": N, "depends_on": [...] }
+
+  Orchestrator auto-discovers and integrates.

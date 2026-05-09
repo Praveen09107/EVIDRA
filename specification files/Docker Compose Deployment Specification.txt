@@ -1,0 +1,834 @@
+PART 1 — Docker Compose / Deployment Specification
+1. Service Inventory
+Service	Image	Port	Replicas
+api_gateway	aiventra/gateway:latest	8000	2
+orchestrator	aiventra/orchestrator:latest	8001	1
+evidence_parser	aiventra/evidence-parser:latest	8010	2
+ocr_worker	aiventra/ocr:latest	8011	2
+format_normalizer	aiventra/normalizer:latest	8012	1
+autopsy_agent	aiventra/autopsy:latest	8020	1
+cdr_analyzer	aiventra/cdr:latest	8021	1
+financial_analyzer	aiventra/financial:latest	8022	1
+tod_agent	aiventra/tod:latest	8023	1
+timeline_anomaly	aiventra/timeline:latest	8024	1
+hotspot_engine	aiventra/hotspot:latest	8025	1
+hypothesis_manager	aiventra/hypothesis:latest	8026	1
+reasoning_replay	aiventra/replay:latest	8027	1
+postgres	postgres:16-alpine	5432	1
+redis	redis:7-alpine	6379	1
+minio	minio/minio:latest	9000/9001	1
+frontend	aiventra/frontend:latest	3000	2
+nginx	nginx:alpine	80/443	1
+2. docker-compose.yml
+text
+version: "3.9"
+
+x-common-env: &common-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: aiventra
+  POSTGRES_USER: aiventra
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  REDIS_URL: redis://redis:6379/0
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+  MINIO_BUCKET: aiventra-cases
+  JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
+  JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  LOG_LEVEL: INFO
+  ENVIRONMENT: production
+
+services:
+
+  # ─── INFRASTRUCTURE ─────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: aiventra
+      POSTGRES_USER: aiventra
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiventra"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+
+  minio:
+    image: minio/minio:latest
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9001:9001"   # Console only; 9000 is internal
+
+  # ─── GATEWAY ────────────────────────────────────────────────────────
+
+  api_gateway:
+    image: aiventra/gateway:latest
+    restart: always
+    environment:
+      <<: *common-env
+      PORT: 8000
+      ORCHESTRATOR_URL: http://orchestrator:8001
+    secrets:
+      - jwt_private_key
+      - jwt_public_key
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    deploy:
+      replicas: 2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+
+  # ─── ORCHESTRATOR ───────────────────────────────────────────────────
+
+  orchestrator:
+    image: aiventra/orchestrator:latest
+    restart: always
+    environment:
+      <<: *common-env
+      PORT: 8001
+      GATEWAY_URL: http://api_gateway:8000
+    secrets:
+      - jwt_private_key
+      - jwt_public_key
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+
+  # ─── AGENT WORKERS ──────────────────────────────────────────────────
+
+  evidence_parser:
+    image: aiventra/evidence-parser:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: evidence_parser
+    depends_on: [postgres, redis, minio]
+    deploy:
+      replicas: 2
+
+  ocr_worker:
+    image: aiventra/ocr:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: ocr
+      TESSERACT_LANG: eng
+      GOOGLE_VISION_KEY: ${GOOGLE_VISION_KEY}
+    depends_on: [postgres, redis, minio]
+    deploy:
+      replicas: 2
+
+  format_normalizer:
+    image: aiventra/normalizer:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: format_normalizer
+    depends_on: [postgres, redis]
+
+  autopsy_agent:
+    image: aiventra/autopsy:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: autopsy
+      LLM_MODEL: gpt-4o
+      LLM_TEMPERATURE: "0.1"
+    depends_on: [postgres, redis]
+
+  cdr_analyzer:
+    image: aiventra/cdr:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: cdr_analyzer
+    depends_on: [postgres, redis]
+
+  financial_analyzer:
+    image: aiventra/financial:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: financial_analyzer
+      LLM_MODEL: gpt-4o
+    depends_on: [postgres, redis]
+
+  tod_agent:
+    image: aiventra/tod:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: tod
+      TOD_ML_MODEL_PATH: /models/tod_rf_v2.pkl
+    volumes:
+      - ./models:/models:ro
+    depends_on: [postgres, redis]
+
+  timeline_anomaly:
+    image: aiventra/timeline:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: timeline_anomaly
+      AUTOENCODER_MODEL_PATH: /models/timeline_ae_v1.pt
+    volumes:
+      - ./models:/models:ro
+    depends_on: [postgres, redis]
+
+  hotspot_engine:
+    image: aiventra/hotspot:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: hotspot
+    depends_on: [postgres, redis]
+
+  hypothesis_manager:
+    image: aiventra/hypothesis:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: hypothesis_manager
+      LLM_MODEL: gpt-4o
+    depends_on: [postgres, redis]
+
+  reasoning_replay:
+    image: aiventra/replay:latest
+    restart: always
+    environment:
+      <<: *common-env
+      AGENT_ID: reasoning_replay
+      LLM_MODEL: gpt-4o
+      LLM_TEMPERATURE: "0.2"
+    depends_on: [postgres, redis]
+
+  # ─── FRONTEND ───────────────────────────────────────────────────────
+
+  frontend:
+    image: aiventra/frontend:latest
+    restart: always
+    environment:
+      VITE_API_BASE_URL: https://api.aiventra.internal
+      VITE_WS_BASE_URL: wss://api.aiventra.internal
+    deploy:
+      replicas: 2
+
+  # ─── REVERSE PROXY ──────────────────────────────────────────────────
+
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on: [api_gateway, frontend]
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+secrets:
+  jwt_private_key:
+    file: ./secrets/jwt_private.pem
+  jwt_public_key:
+    file: ./secrets/jwt_public.pem
+3. nginx.conf (Key Routing)
+text
+upstream gateway {
+    server api_gateway:8000;
+    server api_gateway:8000;  # second replica
+}
+
+upstream frontend {
+    server frontend:3000;
+    server frontend:3000;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.aiventra.internal;
+
+    ssl_certificate     /etc/nginx/certs/aiventra.crt;
+    ssl_certificate_key /etc/nginx/certs/aiventra.key;
+
+    # REST API
+    location /api/ {
+        proxy_pass         http://gateway/;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_read_timeout 120s;
+        client_max_body_size 200M;  # large file uploads
+    }
+
+    # WebSocket upgrade
+    location /ws/ {
+        proxy_pass         http://gateway/ws/;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_read_timeout 3600s;   # keep WS alive
+    }
+
+    # Frontend
+    location / {
+        proxy_pass http://frontend/;
+    }
+}
+4. Environment Variables Reference (.env)
+bash
+# Database
+POSTGRES_PASSWORD=your_strong_password_here
+
+# Redis (no auth in internal network)
+
+# Object Storage
+MINIO_ACCESS_KEY=aiventra_minio
+MINIO_SECRET_KEY=your_minio_secret
+
+# LLM
+OPENAI_API_KEY=sk-...
+
+# OCR (optional cloud fallback)
+GOOGLE_VISION_KEY=...
+
+# App
+NODE_ENV=production
+ENVIRONMENT=production
+5. Migration Strategy
+bash
+# Run migrations on first deploy:
+docker run --rm \
+  --env-file .env \
+  -e POSTGRES_HOST=postgres \
+  aiventra/gateway:latest \
+  python -m alembic upgrade head
+
+# Or inline via init.sql at postgres startup (development only)
+PART 2 — Testing Strategy
+Layer 1: Unit Tests (per agent)
+text
+tests/
+├── unit/
+│   ├── test_henssge_model.py         # TOD: physics math correctness
+│   ├── test_cdr_normalizer.py        # CDR: format parsing for all carriers
+│   ├── test_autopsy_extractor.py     # Autopsy: LLM prompt → schema validation
+│   ├── test_hypothesis_scorer.py     # Hypothesis: Bayesian score math
+│   ├── test_replay_collector.py      # Replay: step collection ordering
+│   └── test_pipeline_dag.py          # Orchestrator: tier resolution logic
+Example — TOD unit test:
+
+python
+def test_henssge_estimate_midrange():
+    result = henssge_estimate(
+        temp_rectal=30.0,
+        temp_ambient=18.0,
+        weight_kg=70,
+        correction_factor=1.0
+    )
+    # Known reference: ~10h PMI at these values
+    assert 8.0 <= result.mean_hours <= 13.0
+    assert result.lower_95 < result.mean_hours < result.upper_95
+
+def test_henssge_rejects_impossible_temps():
+    with pytest.raises(ValueError):
+        henssge_estimate(temp_rectal=39.0, temp_ambient=18.0,
+                         weight_kg=70, correction_factor=1.0)
+        # Body temp above normal → can't estimate cooling
+Layer 2: Integration Tests (agent pipelines)
+python
+# tests/integration/test_full_autopsy_pipeline.py
+
+@pytest.mark.asyncio
+async def test_autopsy_to_tod_pipeline():
+    # Upload a synthetic autopsy PDF
+    case_id = await create_test_case()
+    file_id = await upload_test_file(case_id, "synthetic_autopsy.pdf",
+                                      "AUTOPSY_REPORT")
+
+    # Trigger pipeline (autopsy + TOD only)
+    run_id = await trigger_pipeline(case_id)
+
+    # Wait for completion (max 60s in test)
+    result = await wait_for_agents(run_id, ["autopsy", "tod"], timeout=60)
+
+    assert result["autopsy"]["manner_of_death"] in VALID_MANNERS
+    assert result["tod"]["todWindow95"]["start"] is not None
+    assert result["tod"]["todWindow95"]["end"] is not None
+    assert result["tod"]["consistency"]["rigor"] != "INCONSISTENT"
+Layer 3: End-to-End Tests
+python
+# tests/e2e/test_full_murder_case.py
+
+async def test_complete_murder_case_pipeline():
+    """
+    Uses the synthetic CASE-001 fixture:
+    - CDR: 3 numbers, 48h of records
+    - Autopsy PDF: blunt force trauma, fixed livor
+    - Financial: 2 large cash withdrawals day before
+    Expected outcome: HOMICIDE primary hypothesis > 0.70
+    """
+    case_id = await create_and_upload_case_001()
+    run_id  = await trigger_pipeline(case_id)
+
+    report  = await wait_for_pipeline_complete(run_id, timeout=300)
+
+    # Core assertions:
+    assert report["hypothesis"]["primary_hypothesis"] == "HOMICIDE"
+    assert report["hypothesis"]["primary_confidence"] >= 0.70
+
+    # Replay completeness:
+    replay = report["reasoning_replay"]
+    assert replay["total_steps"] >= 20
+    assert len(replay["reasoning_gaps"]) == 0
+    assert replay["overall_case_confidence"] >= 0.65
+
+    # TOD consistency:
+    tod = report["tod"]
+    assert tod["consistency"]["rigor"] == "CONSISTENT"
+    assert tod["consistency"]["livor"] == "CONSISTENT"
+PART 3 — Complete Worked Example: Full Pipeline Run
+Case: CASE-2026-001 "Kumar"
+Setup:
+
+Victim: Rajesh Kumar, 42, found at home, Chennai
+
+Discovery time: 2026-05-07 14:00 IST
+
+Files uploaded: autopsy_kumar.pdf, airtel_cdr_kumar.csv, hdfc_bank_kumar.csv
+
+Last seen alive: 2026-05-06 22:00 IST (CCTV at apartment gate)
+
+Step 1 — File Upload (14:10 IST)
+text
+POST /cases/CASE-001/files
+→ file_id: f001 (autopsy_kumar.pdf,  AUTOPSY_REPORT)
+→ file_id: f002 (airtel_cdr_kumar.csv, CDR)
+→ file_id: f003 (hdfc_bank_kumar.csv, FINANCIAL_RECORDS)
+
+Gateway enqueues 3 × evidence_parser tasks.
+Step 2 — Evidence Parser (14:11)
+text
+evidence_parser processes f001:
+→ doc_type confirmed: AUTOPSY_REPORT
+→ is_scanned: TRUE (photographed pages, not native PDF)
+→ enqueues ocr task for f001
+
+evidence_parser processes f002:
+→ doc_type: CDR, format: CSV, carrier: AIRTEL
+→ rows: 2,847 call records
+→ date_range: 2026-05-01 to 2026-05-07
+→ stores raw canonical_cdr_events
+
+evidence_parser processes f003:
+→ doc_type: FINANCIAL, format: CSV, bank: HDFC
+→ rows: 143 transactions
+→ date_range: 2026-04-01 to 2026-05-07
+Step 3 — OCR Worker (14:12)
+text
+ocr processes f001 (15 pages):
+→ Page 1-3: Tesseract OCR (clear print)
+→ Pages 4-6: Google Vision fallback (handwritten notes by pathologist)
+→ Extracted text: 4,230 words
+→ Confidence: 0.91
+
+format_normalizer:
+→ Parses extracted text via LLM
+→ Extracts structured AutopsyExtraction:
+    cause_chain["1a"]: "Subdural haematoma"
+    cause_chain["1b"]: "Blunt force trauma to occipital region"
+    manner_of_death:   "HOMICIDE"
+    manner_confidence: 0.89
+    postmortem_signs:
+      rigor_mortis_stage: "FULL"
+      livor_mortis_stage: "FIXED"
+      livor_distribution: "Posterior — consistent with supine position"
+      decomposition:      "NONE"
+    body_params:
+      estimated_weight_kg: 68
+      clothing: "LIGHT"
+    temperature_findings:
+      rectal_temp_c: 29.5
+      ambient_temp_c: 24.0   (indoor AC at 24°C per scene notes)
+    timeline_mentions:
+      found_dead: "2026-05-07T14:00:00+05:30"
+Step 4 — Autopsy Agent (14:14, replay step 1–8)
+text
+[Replay Step 1]
+Agent: autopsy
+Trigger: INITIAL_PARSE
+Input: "Autopsy report — 15 pages — blunt force trauma"
+Interpretation: "Primary cause confirmed as subdural haematoma from
+                 blunt force impact to posterior skull. Pattern
+                 consistent with single heavy blow, likely cylindrical
+                 object (pipe/rod). No defensive wounds documented."
+Confidence: 0.89
+Tokens: 1,240
+
+[Replay Step 2]
+Agent: autopsy
+Trigger: MANNER_CLASSIFICATION
+Input: "Subdural haematoma, blunt force, no defensive wounds,
+        no suicide note, no fall evidence at scene"
+Interpretation: "Manner classified HOMICIDE. Blunt force by another
+                 party. Suicide and accident ruled out — trajectory
+                 and force angle require external application."
+Confidence: 0.89
+Warnings: ["No toxicology available — drug involvement cannot be
+            excluded"]
+
+[Replay Step 3]
+Agent: autopsy
+Trigger: POSTMORTEM_SIGNS_EVAL
+Input: "Rigor FULL, livor FIXED posterior, decomp NONE"
+Interpretation: "Full rigor + fixed livor → PMI likely 12–36h at time
+                 of discovery. Livor fixed in supine position —
+                 body not moved post-mortem."
+Confidence: 0.82
+
+[Replay Steps 4–8: toxicology placeholders, wound measurement
+ extraction, pathology warning generation, autopsy summary]
+Step 5 — CDR Analyzer (14:14 parallel, replay steps 9–16)
+text
+[Replay Step 9]
+Agent: cdr_analyzer
+Trigger: INITIAL_PARSE
+Input: "2,847 CDR rows — Airtel — MSISDN +91-9876543210 (victim)"
+Interpretation: "Victim's phone active until 2026-05-06 22:47 IST.
+                 Last call: outgoing to +91-9123456789 (contact
+                 labelled 'Suresh'). Duration: 3 min 12 sec."
+Confidence: 0.97
+
+[Replay Step 10]
+Agent: cdr_analyzer
+Trigger: SILENCE_DETECTION
+Input: "Call history before/after last event"
+Interpretation: "Complete communication silence from 22:47 on May 6
+                 to discovery at 14:00 on May 7 — 15h 13min silence.
+                 Victim historically sent ≥3 messages/day. Silence
+                 is a strong statistical anomaly (Z-score: 4.2)."
+Confidence: 0.93
+Warnings: ["Phone may have been switched off or destroyed — confirms
+            nothing about biological death time alone"]
+
+[Replay Step 11]
+Agent: cdr_analyzer
+Trigger: TOWER_ANALYSIS
+Input: "Tower IDs for last 6 hours of activity"
+Interpretation: "Last 4 calls all routed via Tower CHN-042
+                 (2.1km from victim's address). No tower-hop
+                 anomalies. Contact 'Suresh' (+91-9123456789)
+                 last pinged Tower CHN-041 at 23:02 on May 6 —
+                 same cell cluster as victim."
+Confidence: 0.88
+
+[Replay Step 12]
+Agent: cdr_analyzer
+Trigger: CONTACT_FREQUENCY_ANALYSIS
+Input: "Frequency matrix for all contacts 30 days"
+Interpretation: "Top contact is 'Suresh' — 47 calls in 30 days,
+                 avg 1.6/day. Call frequency spiked on May 5-6:
+                 9 calls in 48h, vs baseline 1.6/day. Significant
+                 pre-death escalation flagged."
+Confidence: 0.85
+
+[Replay Steps 13–16: anomaly scoring, tower map generation,
+ silence window finalisation, CDR summary]
+Step 6 — Financial Analyzer (14:14 parallel, replay steps 17–22)
+text
+[Replay Step 17]
+Agent: financial_analyzer
+Trigger: INITIAL_PARSE
+Input: "143 HDFC transactions April–May 2026"
+Interpretation: "Account shows normal salary credit (₹45,000 on
+                 Apr 30). Two large cash withdrawals flagged:
+                 ₹80,000 on May 4, ₹60,000 on May 6 (18:30 IST).
+                 Total unusual outflow: ₹1,40,000 in 3 days."
+Confidence: 0.91
+
+[Replay Step 18]
+Agent: financial_analyzer
+Trigger: ANOMALY_DETECTION
+Input: "Withdrawal pattern vs 6-month baseline"
+Interpretation: "Baseline monthly cash withdrawal: ₹12,000–18,000.
+                 May 4-6 withdrawals are 8× the monthly average.
+                 Pattern consistent with: extortion payment, debt
+                 settlement under duress, or staged financial
+                 transfer pre-flight. All three flagged."
+Confidence: 0.78
+Warnings: ["No transaction purpose available — all marked 'CASH
+            WITHDRAWAL'. Cannot distinguish legitimate vs coerced."]
+
+[Replay Steps 19–22: counterparty analysis, timeline alignment,
+ anomaly scoring, financial summary]
+Step 7 — TOD Agent (14:16, replay steps 23–28)
+text
+TOD Input:
+  rectal_temp:   29.5°C
+  ambient_temp:  24.0°C
+  weight_kg:     68
+  clothing:      LIGHT
+  rigor:         FULL
+  livor:         FIXED
+  decomp:        NONE
+  last_seen:     2026-05-06T22:00
+  found_dead:    2026-05-07T14:00
+
+[Replay Step 23]
+Agent: tod
+Trigger: PHYSICS_ESTIMATE
+Input: "Body temp 29.5°C, ambient 24°C, weight 68kg"
+Interpretation: "Henssge model: ΔT = 12.5°C from ambient.
+                 Corrected for light clothing (factor 1.0).
+                 PMI estimate: 9.8h mean, 95% CI [7.1, 12.9h]."
+Confidence: 0.80
+
+[Replay Step 24]
+Agent: tod
+Trigger: SIGNS_CONSISTENCY
+Input: "Rigor FULL, livor FIXED"
+Interpretation: "FULL rigor → PMI 8–36h consistent with physics.
+                 FIXED livor → PMI ≥ 12h also consistent.
+                 Both signs aligned with physics window."
+Confidence: 0.84
+
+[Replay Step 25]
+Agent: tod
+Trigger: ML_ESTIMATE
+Input: "Feature vector: rectal=29.5, ambient=24, rigor=2,
+        livor=2, decomp=0, weight=68, clothing=1, indoor=1"
+Interpretation: "RF surrogate model: PMI = 10.6h (MAE ±4.2h).
+                 Consistent with physics core."
+Confidence: 0.77
+
+[Replay Step 26]
+Agent: tod
+Trigger: BAYESIAN_FUSION
+Input: "Physics PMI 9.8h, ML PMI 10.6h, prior: 22:00–14:00"
+Interpretation: "Posterior TOD median: 2026-05-07 03:18 IST.
+                 95% credible interval: May 7 00:05 – 06:52 IST.
+                 All components consistent. Posterior narrowed
+                 by timeline prior (last seen 22:00)."
+Confidence: 0.81
+
+TOD Result:
+  todPointEstimate: "2026-05-07T03:18:00+05:30"
+  todWindow95:
+    start: "2026-05-07T00:05:00+05:30"
+    end:   "2026-05-07T06:52:00+05:30"
+  consistency:
+    rigor:         CONSISTENT
+    livor:         CONSISTENT
+    decomposition: CONSISTENT
+Step 8 — Timeline & Anomaly Agent (14:17, replay steps 29–34)
+text
+[Replay Step 29]
+Agent: timeline_anomaly
+Trigger: UNIFIED_TIMELINE_BUILD
+Input: "CDR last event 22:47, financial last txn 18:30,
+        TOD window 00:05–06:52"
+Interpretation: "Unified timeline constructed. Critical window:
+                 22:47 (last CDR) → 03:18 (TOD median) → 06:52
+                 (TOD upper bound). Financial anomaly at 18:30
+                 (₹60k withdrawal) precedes death by ~9h."
+Confidence: 0.87
+
+[Replay Step 30]
+Agent: timeline_anomaly
+Trigger: ANOMALY_DETECTION_CDR
+Input: "15h CDR silence after historically active phone"
+Interpretation: "Autoencoder reconstruction error: 0.84
+                 (threshold 0.45). Silence window flagged as
+                 HIGH severity anomaly. Consistent with
+                 phone being removed/destroyed at time of death."
+Confidence: 0.91
+
+[Replay Step 31]
+Agent: timeline_anomaly
+Trigger: ANOMALY_DETECTION_FINANCIAL
+Input: "₹1.4L cash in 3 days vs ₹15k/month baseline"
+Interpretation: "Isolation Forest outlier score: 0.78.
+                 Financial anomaly window: May 4-6. Temporally
+                 adjacent to death — possible motive evidence."
+Confidence: 0.82
+
+[Replay Step 32]
+Agent: timeline_anomaly
+Trigger: CONTACT_TIMELINE_INTERSECTION
+Input: "Suresh (+91-9123456789) tower CHN-041 at 23:02"
+Interpretation: "Suresh's last known tower (CHN-041) is 1.3km
+                 from victim's address. Suresh was geographically
+                 proximate to victim at ~23:00 on May 6 — within
+                 TOD window. Flagged as CRITICAL intersection."
+Confidence: 0.79
+Warnings: ["Tower precision ±500m; contact could be 0–1.8km from
+            victim's exact address"]
+Step 9 — Hotspot Engine (14:19, replay steps 35–38)
+text
+[Replay Step 35]
+Agent: hotspot
+Trigger: TEMPORAL_INTERSECTION
+Input: "CDR silence 22:47–14:00, TOD 00:05–06:52,
+        Suresh proximate 23:00–23:10"
+Interpretation: "Hotspot window: 22:47–06:52 on May 6-7.
+                 Suresh is only identified contact in this
+                 temporal + spatial window."
+Confidence: 0.84
+
+[Replay Step 36]
+Agent: hotspot
+Trigger: FINANCIAL_MOTIVE_FLAG
+Input: "₹1.4L withdrawals, escalated calls to Suresh"
+Interpretation: "Financial anomaly + call escalation to same
+                 contact in 48h before death. Pattern consistent
+                 with financial dispute or extortion resolution."
+Confidence: 0.73
+Warnings: ["No direct evidence linking Suresh to financial
+            transactions"]
+Step 10 — Hypothesis Manager (14:20, replay steps 39–44)
+text
+[Replay Step 39]
+Agent: hypothesis_manager
+Trigger: SCORE_ALL_HYPOTHESES
+Input: "All agent outputs aggregated"
+
+Scores:
+  HOMICIDE:     0.82   ← PRIMARY
+  SUICIDE:      0.04
+  ACCIDENT:     0.06
+  NATURAL:      0.02
+  UNDETERMINED: 0.06
+
+[Replay Step 40]
+Agent: hypothesis_manager
+Trigger: SUPPORTING_EVIDENCE_EXTRACTION
+Interpretation: "Supporting HOMICIDE:
+  1. Blunt force with tool — external application required
+  2. Body not moved (livor fixed supine)
+  3. Phone silent immediately after death — removed by perpetrator
+  4. Contact 'Suresh' proximate at time of death
+  5. Financial escalation suggests dispute motive"
+
+[Replay Step 41]
+Agent: hypothesis_manager
+Trigger: WEAKENING_EVIDENCE_CHECK
+Interpretation: "No weakening evidence for HOMICIDE identified.
+                 No suicide note, no self-infliction wound patterns,
+                 no evidence of fall/accident."
+
+[Replay Step 42]
+Agent: hypothesis_manager
+Trigger: CONTRADICTION_CHECK
+Interpretation: "No major contradictions detected. Minor: toxicology
+                 unavailable — cannot fully exclude drug-facilitated
+                 scenario as secondary factor."
+
+[Replay Steps 43–44: recommended actions generation, summary]
+
+Recommended Actions:
+  1. Obtain call records for +91-9123456789 (Suresh) for May 6-7
+  2. Review CCTV near victim's building between 22:00–07:00 May 6-7
+  3. Verify Suresh's whereabouts and obtain alibi for May 6-7
+  4. Obtain toxicology report to exclude drug involvement
+  5. Investigate purpose of ₹1,40,000 cash withdrawals
+Step 11 — Reasoning Replay Agent (14:22, final)
+text
+Replay Report Summary:
+
+  total_steps:              44
+  agents_covered:           8
+  total_llm_tokens_used:    18,420
+  total_duration_ms:        487,000 (8 min 7 sec)
+  overall_case_confidence:  0.79
+  reasoning_gaps:           0
+  contradictions:           1 (LOW severity — missing toxicology)
+
+  confidence_summary:
+    autopsy:            0.89
+    cdr_analyzer:       0.91
+    financial_analyzer: 0.82
+    tod:                0.81
+    timeline_anomaly:   0.87
+    hotspot:            0.79
+    hypothesis_manager: 0.82
+    reasoning_replay:   0.95
+
+  Narrative (excerpt):
+  "The analysis of the Kumar case establishes a highly consistent
+   picture of homicide. The autopsy confirms death from a single
+   blunt force blow to the posterior skull, a wound pattern that
+   requires external application and is inconsistent with self-
+   infliction or accidental fall. Time of death is estimated at
+   03:18 IST on May 7 (window: 00:05–06:52), based on body cooling,
+   rigor, and fixed livor mortis — all three indicators mutually
+   consistent.
+
+   The victim's phone went permanently silent at 22:47 on May 6,
+   within minutes of his last recorded movement, and 15 hours before
+   discovery — a strong statistical anomaly suggesting the phone was
+   removed or destroyed at or near the time of death.
+
+   Contact 'Suresh' (+91-9123456789) shows a pre-death call
+   escalation (9 calls in 48h vs a 1.6/day baseline) and was
+   geographically proximate to the victim's address at 23:02 on
+   May 6 — within the estimated death window. Simultaneously, the
+   victim made two large, unexplained cash withdrawals totalling
+   ₹1,40,000 in the 72 hours before death, 8× his monthly baseline,
+   suggesting financial dispute or duress.
+
+   The primary hypothesis is HOMICIDE (confidence 82%). Recommended
+   immediate actions are: acquisition of Suresh's call records and
+   alibi, CCTV review of the building entrance for 22:00–07:00,
+   and toxicology to exclude secondary drug involvement."
+
+Pipeline completed: 14:22 IST (12 minutes total)
+WebSocket event: pipeline_complete → UI auto-switches to Replay tab
+Complete System: Everything Specced ✅
+Document	Status
+Document	Status
+M-02 OCR Agent	✅
+M-03 Evidence Parser	✅
+M-04 Format Normalizer	✅
+M-05 Autopsy Agent	✅
+M-06 CDR Analyzer	✅
+M-07 Financial Analyzer	✅
+M-08 TOD Agent	✅
+M-09 Timeline & Anomaly Agent	✅
+M-10 Hotspot Engine	✅
+M-11 Hypothesis Manager	✅
+M-12 Reasoning Replay Agent	✅
+G-01 API Gateway	✅
+O-01 Orchestrator	✅
+DB-01 Database Schema	✅
+FE-01 Frontend UI	✅
+DEPLOY-01 Docker Compose	✅
+TEST-01 Testing Strategy	✅
+EXAMPLE-01 Full Worked Case	✅

@@ -1,0 +1,506 @@
+Global Design Language (for all pages)
+These choices make the UI feel high-end and consistent with complex analytical tools and graph/timeline best practices.
+
+Theme: Dark “forensic cockpit”
+
+Background: deep, slightly warm charcoal (e.g., #0F1013) with subtle gradient top→bottom.
+
+Surfaces: glassy panels (rgba(255,255,255,0.04) on dark) with soft blur and thin, low-contrast borders.
+
+Accents: cool cyan for primary (analysis), amber for risk, magenta for anomalies.
+
+Typography:
+
+Display: Instrument Serif or Playfair for page titles (only big headings).
+
+Body/UI: Inter or Plus Jakarta; 14–16 px body, 12 px for metadata.
+
+All headings left-aligned, very little centered text except hero titles.
+
+Visual motifs:
+
+Timeline = horizontal + “heat” (density/anomaly).
+
+Graphs = node-link with focus+context, not hairballs.
+
+Agents = pills/cards with consistent iconography.
+
+Motion:
+
+No silly bounce; all motion is springy but controlled.
+
+Duration: 180–250 ms for hover/selection, 400–600 ms for view transitions.
+
+Easing: cubic-bezier tuned to feel “hardware-like” (fast out, gentle in).
+
+Lighting:
+
+Very subtle noise texture over the background + soft vignette towards corners to feel “cinematic”.
+
+Keep this mental backdrop as I describe the screen.
+
+Flagship Screen: Case Workspace (Forensic Cockpit)
+0. Layout Grid
+Base grid: 12 columns.
+
+Page padding: 24 px left/right, 20 px top/bottom.
+
+Regions (desktop 1440 px wide):
+
+Left global sidebar: 80 px fixed.
+
+Main content region:
+
+Header + pipeline strip: 120–140 px tall.
+
+Content + tabs: stretches full height minus header.
+
+Right inspector: 320 px wide, from under header to bottom, scrollable.
+
+So visually:
+
+Sidebar (80 px) | Main (approx 1040 px) | Inspector (320 px).
+
+1. Case Header Band (Top)
+Height ~80 px, spanning main + inspector.
+
+Components (left→right):
+
+Breadcrumb + Case ID
+
+“Cases / Chennai – Riverside Incident” small breadcrumb.
+
+Large case title: “Case #23 — Riverside Bridge, Chennai”.
+
+Underneath: subtle metadata line: “Victim: John Doe · 04 May 2026 · Zone 3 · Lead Investigator: A. Kumar”.
+
+Hypothesis chips (center)
+
+Horizontal pill group:
+
+Each pill = label + progress fill + % number.
+
+Example pill:
+
+Left: icon (e.g., shield for natural).
+
+Middle: label “Homicide”.
+
+Background: rounded pill with an internal bar showing 72% fill in accent color.
+
+Pills sorted by probability (highest first).
+
+If a hypothesis is currently “primary”, a faint glow ring around its pill.
+
+Controls (right)
+
+Two main buttons:
+
+“Run Full Pipeline” (primary cyan).
+
+“Re-run Changed Agents” (outline).
+
+Small text to the right: “Last run: 5 min ago · v0.9.2”.
+
+Interactions:
+
+Clicking a hypothesis pill filters the Causal Graph tab to focus on that hypothesis (you’ll see that later).
+
+Hovering a hypothesis pill:
+
+Tooltip: “Trend: ↑ from 54% after CCTV anomaly #3”.
+
+2. Multi-Agent Pipeline Strip (Below Header)
+Height ~60 px, under header, full width of main content.
+
+Visual: horizontal, slightly curved pipeline track
+
+Background: a faint glowing “track” line running left→right, representing data flow.
+
+Nodes (agents) placed along this track:
+
+Circular nodes ∼ 32 px diameter.
+
+Outer ring: thin line colored by status:
+
+Cyan for success, amber pulsating for running, red for error.
+
+Inner circle: agent icon or 2-letter code (“AU”, “TD”, “TL”, “CO”, “CL”, “EM”, “HY”, “BI”, “RP”).
+
+Under each node: label in 12 px text: “TOD Agent”, “Hypothesis Manager”, etc.
+
+Edges:
+
+Soft arrows connecting nodes, with animated shimmer flowing from left to right when pipeline is executing.
+
+State examples:
+
+When pipeline runs:
+
+Nodes light up sequentially, ring animates with a rotating stroke.
+
+Edges between “just-run” and “up-next” nodes have a mild cyan pulse.
+
+Interactions:
+
+Hover a node:
+
+Tooltip: TOD Agent — Last run: 1.6s · Contributed: TOD [19:40–21:10].
+
+Slight scale-up + ring brightens.
+
+Click a node:
+
+Left: the main tab content jumps to a state where that agent’s contributions are highlighted (e.g., TOD band on timeline).
+
+Right: Inspector updates to show that agent’s last output and a “View Agent Lab” button.
+
+This strip is the “spine” visualizing the multi-agent orchestration in a compact way.
+
+3. Center Tabs & Content Area
+Under the pipeline, we have a tab bar:
+
+Tabs: Timeline, Hotspots, Causal Graph.
+
+Segmented control style, with a glass indicator moving behind the active tab.
+
+I’ll deep-dive on Timeline, then describe main visual elements of the others.
+
+3A. Timeline Tab — Detailed Layout & Interactions
+Height: everything under pipeline, full main width minus inspector.
+
+Structure (top→bottom):
+Main timeline (density + anomalies) — ~30% height.
+
+Mini timeline (overview) — ~10% height.
+
+Event lanes (multi-source) — ~30% height.
+
+Event table — ~30% height.
+
+3A.1 Main Timeline (Event Density + TOD + Anomalies)
+Rendering:
+
+Full-width chart with:
+
+X-axis: time.
+
+Y-axis: event count (but no heavy grid; light dashed lines only).
+
+Visualization:
+
+Stacked area or bar chart with colors by source: blue (CCTV), purple (phone), gray (misc).
+
+Over that:
+
+Anomaly heat band — a semi-transparent gradient running along the baseline; peaks where anomaly score is high (deep magenta).
+
+TOD band — translucent vertical rectangle (e.g., cyan with 10–15% opacity) marking the predicted TOD window.
+
+Microdetails:
+
+On hover:
+
+Vertical “cursor” line appears.
+
+Small floating tooltip above the chart:
+
+Time.
+
+Event counts per source.
+
+Average anomaly score in ±X minutes.
+
+Whether this time falls in TOD band (“Inside TOD window” badge).
+
+Zoom behavior:
+
+Scroll wheel or pinch zoom (horizontal).
+
+Smooth scaling of x-axis; y-axis auto-normalizes for current window.
+
+Interactions must be consistent and predictable per visualization UX best practices.
+
+3A.2 Mini Timeline (Overview + Focus Window)
+Just below main.
+
+A slim (∼40 px tall) chart representing entire case time span with:
+
+Simple grey area for total events.
+
+TOD band drawn here too.
+
+Overlaid: a draggable, resizable “focus window” rectangle that defines which part of time is zoomed in above.
+
+Interactions:
+
+Drag the window → pan across the case.
+
+Drag the left or right edge → zoom in/out, with the main timeline responding in real time.
+
+Clicking anywhere on the mini timeline recenters focus window around that point.
+
+This is a classic focus+context pattern recommended for dense timelines.
+
+3A.3 Event Lanes (Source Strips)
+Below the mini timeline, we have horizontally stacked lanes:
+
+Autopsy/TOD lane.
+
+Phone lane.
+
+CCTV lane.
+
+Other sensors lane.
+
+Agent Output lane (passive markers: anomalies, collisions, key inferences).
+
+Each lane is a horizontal strip with a subtle background, e.g. slightly raised glass strip.
+
+Events:
+
+Each event is a small “pill” or icon:
+
+Position on x-axis: timestamp.
+
+Y is fixed because lanes are 1D.
+
+Shape:
+
+For discrete events: pill with short label like “call ended” when zoomed in far enough.
+
+For intervals (e.g., “phone offline 20m”): a bar spanning that interval.
+
+Visual coding:
+
+Source-coded by color, consistent with main timeline.
+
+Anomaly-coded: events in highly anomalous windows get halo outlines or a brighter border.
+
+Interactions:
+
+Hover:
+
+Tooltip on the event itself with details.
+
+Corresponding rows in event table highlight.
+
+Click:
+
+Event becomes “selected”:
+
+Slight “lift” animation.
+
+Inspector panel shows full metadata + related agent outputs (e.g., anomaly score, mapping to claims).
+
+Drag selection:
+
+User can drag a small selection region across lanes to create a time window filter.
+
+3A.4 Event Table
+At the bottom, aligned with current window only. It’s essentially a forensic “log view” synced with the timeline.
+
+Columns:
+
+Time (relative & absolute)
+
+Source (icon + text)
+
+Type (“Call ended”, “CCTV frame”, etc.)
+
+Brief description
+
+Anomaly score badge
+
+Linked agents (small chips: “Timeline Agent”, “Image Agent”)
+
+Behavior:
+
+Sorted by time by default.
+
+Clicking a row:
+
+Selects its event in lanes.
+
+Hovering a row:
+
+Darkens background slightly, and the matching event in lanes glows.
+
+3B. Hotspots Tab — Visual Drama for Collisions
+Here we emphasize your collision engine.
+
+Top filter strip:
+
+Toggle chips: “All”, “In TOD window”, “Multi-source”, “Very high score”.
+
+A slider for collision score threshold.
+
+Main content: vertical card list
+
+Each Collision card:
+
+Spread across the width of main content with 16 px margin.
+
+Contains:
+
+Header row:
+
+“Hotspot #3 — Multi-source collision”.
+
+Right: score pill (“Score: 0.89”) with color scale.
+
+Time bar:
+
+Horizontal mini band showing a slice of timeline:
+
+TOD window (cyan).
+
+Event markers (small colored ticks).
+
+The collision time band highlighted (a thicker bar).
+
+Agent chips:
+
+Row of small pills:
+
+“TOD Agent”, “Timeline & Anomaly”, “Image Agent”.
+
+Each has tiny colored dot (status/strength of contribution).
+
+Explanation block:
+
+2–3 lines:
+
+“Between 21:02–21:18, the victim’s phone was offline, CCTV camera 3 dropped frames, and TOD band overlaps this interval.”
+
+Footer controls:
+
+“View in Timeline” button.
+
+“Explain with XAI” button (jumps to XAI Studio prefiltered to this collision).
+
+Interactions:
+
+Hover:
+
+Card lifts slightly and glow appears on the collision band in the time bar.
+
+Click card:
+
+Switches active tab to Timeline (or just updates timeline under the hood) focusing on that window.
+
+Lanes show only events relevant to this hotspot (others faded).
+
+Clicking an agent chip:
+
+Right inspector shows how that specific agent contributed to this collision (e.g. “Anomaly Agent flagged 2 logs at 21:10 and 21:14”).
+
+3C. Causal Graph Tab — Beautiful Graph UX
+Here you visually justify hypotheses with evidence.
+
+Canvas:
+
+Background with faint grid or subtle dark gradient.
+
+Nodes sized by importance; edges the standard thickness, but color-coded by support/contradiction.
+
+Nodes:
+
+Hypotheses: large pill-shaped nodes at the top (one per manner of death).
+
+Claims: medium nodes in the middle.
+
+Evidence: small nodes at bottom.
+
+Color coding:
+
+Hypothesis nodes colored by probability.
+
+Edges:
+
+Green for support.
+
+Red for contradiction.
+
+Grey for neutral/weak.
+
+Interactions (graph UX best practices):
+
+Hover any node:
+
+Node grows slightly, label boldens, adjacent nodes highlight, everything else fades.
+
+Click a hypothesis node:
+
+“Focus mode”:
+
+Non-linked nodes fade more.
+
+Right inspector shows:
+
+Probability for this hypothesis over time (small sparkline).
+
+3 strongest supporting and 3 strongest contradicting evidence items.
+
+Pan/zoom:
+
+Mouse drag pans the canvas.
+
+Scroll zooms with smooth animation.
+
+A small mini-map in the bottom right shows view area.
+
+Inspector on right during this tab:
+
+For selected node:
+
+Title, type, brief textual description.
+
+For evidence: which agents produced it, where in timeline it lies, a “View on Timeline” link.
+
+For hypotheses: list of critical collisions and anomalies affecting its probability.
+
+Agent Lab & Pipeline Explorer — Visual Tuning
+I won’t rewrite everything, but here’s how to amplify visual impact:
+
+Agent Lab
+Keep a large hero strip at the top:
+
+Agent’s icon in a radial gradient circle.
+
+“Agent: TOD Engine” text with tagline below.
+
+Test Bench side:
+
+Inputs expressed as interactive controls:
+
+Sliders with gradients (e.g., ambient temp slider: blue→red).
+
+Toggles for environment (“Indoor/Outdoor” with icon change).
+
+When you run:
+
+Show a “wave” animation going from inputs to outputs area, mimicking data flow.
+
+Outputs:
+
+Visual first, JSON second.
+
+E.g., TOD: mini distribution plot and feature importance before showing raw JSON.
+
+Pipeline Explorer
+Emphasize storytelling animation:
+
+When you click “Replay run”, nodes light up one after another and edges glow.
+
+You can watch it like a pipeline animation for 4–5 seconds; perfect for judges.
+
+Each node on click:
+
+Expands into a side card with:
+
+Tiny timeline of when it ran.
+
+Input summaries (no raw text, but gist).
+
+Output categories.

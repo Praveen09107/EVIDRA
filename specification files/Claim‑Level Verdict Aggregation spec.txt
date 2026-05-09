@@ -1,0 +1,285 @@
+1. Purpose of Aggregation
+A single claim may be linked to:
+
+3 pieces of evidence that say SUPPORTS,
+
+1 that says REFUTES (from a witness),
+
+2 that say NOT_ENOUGH_INFO.
+
+The Evidence–Claim Mapper produces individual EvidenceClaimLink objects with label + confidence per pair. The Aggregator fuses them into a claim‑level verdict — a single label with confidence, justification, and conflict flag — that the Argument Graph, Hypothesis Manager, and Gap Auditor use downstream.
+
+This mirrors FEVER‑style claim verification systems where multiple evidence pieces are combined into a final claim‑level SUPPORTED/REFUTED/NOT_ENOUGH_INFO label.
+
+2. Data Contracts
+2.1 Input
+ts
+VerdictAggregationRequest {
+  caseId: string;
+  claim: Claim;
+  links: EvidenceClaimLink[];       // from Evidence–Claim Mapper
+  evidenceWeights: EvidenceWeightMap;  // type → default weight (see §3.1)
+  config: AggregationConfig;
+}
+
+EvidenceWeightMap {
+  [evidenceKind: string]: number;   // "AUTOPSY" → 0.95, "TEXT_SNIPPET" → 0.55, etc.
+}
+
+AggregationConfig {
+  refuteThreshold: number;          // default 0.5 — refute wins if refute mass > this
+  supportThreshold: number;         // default 0.6 — must exceed to call SUPPORTED
+  conflictTolerance: number;        // default 0.25 — if both support and refute mass above, flag CONFLICTING
+  notEnoughInfoFallback: boolean;   // if no strong signal, return NEI (default true)
+}
+2.2 Output
+ts
+ClaimVerdict {
+  caseId: string;
+  claimId: string;
+
+  verdict: "SUPPORTED" | "REFUTED" | "CONFLICTING" | "NOT_ENOUGH_INFO";
+  confidence: number;              // 0–1
+
+  supportMass: number;             // aggregated support score
+  refuteMass: number;              // aggregated refute score
+  neiMass: number;                 // aggregated NEI/irrelevant score
+
+  primaryEvidence: EvidenceClaimLink[];   // top 1–3 most influential links
+  conflictingEvidence?: EvidenceClaimLink[];  // if CONFLICTING or REFUTED, show the opposing links
+
+  justification: string;           // LLM-generated claim-level explanation
+  flags: VerdictFlag[];
+}
+
+VerdictFlag {
+  type: "SINGLE_SOURCE" | "WEAK_EVIDENCE" | "HIGH_CONFLICT" | "MODALITY_MISMATCH" |
+        "TEMPORAL_MISMATCH" | "HUMAN_REVIEW_REQUIRED";
+  message: string;
+}
+3. Aggregation Algorithm
+The aggregation pipeline has five steps:
+
+3.1 Step 1 — Source Weighting
+Not all evidence is equally reliable. Before aggregating, apply source type weights per link.
+
+text
+w(link) = evidenceWeights[link.evidenceKind]
+           × link.confidence           (from NLI model)
+           × sourceCredibilityFactor   (optional per-case manual override)
+Default evidence weights from the spec table:
+
+Evidence kind	Default weight
+AUTOPSY	0.95
+TOD	0.90
+COLLISION (multi-modal)	0.88
+COLLISION (single modal)	0.72
+TIMELINE_EVENT	0.75
+ANOMALY / HOTSPOT	0.60
+TEXT_SNIPPET (witness)	0.55
+GRAPH_NODE / derived	0.30
+This mirrors weighted‑voting fusion strategies in multi‑source fact checking systems that prefer high‑quality and high‑reliability sources.
+
+3.2 Step 2 — Mass Accumulation
+For each link, map its label to a score distribution over {SUPPORT, REFUTE, NEI}:
+
+text
+labelToMass(link) = 
+  if SUPPORTS:         { support: w(link),     refute: 0,        nei: 0 }
+  if REFUTES:          { support: 0,            refute: w(link),  nei: 0 }
+  if PARTIAL_SUPPORT:  { support: 0.6*w(link),  refute: 0,        nei: 0.4*w(link) }
+  if PARTIAL_REFUTE:   { support: 0,            refute: 0.6*w(link), nei: 0.4*w(link) }
+  if NOT_ENOUGH_INFO:  { support: 0,            refute: 0,        nei: w(link) }
+  if IRRELEVANT:        excluded from aggregation
+Sum over all links, then normalize to sum to 1:
+
+text
+supportMass = sum(support) / totalMass
+refuteMass  = sum(refute)  / totalMass
+neiMass     = sum(nei)     / totalMass
+This is analogous to evidence fusion networks like EvidenceNet and dual‑channel fact verification pipelines that accumulate sentence‑level and claim‑level evidence signals before computing a final verdict.
+
+3.3 Step 3 — Verdict Decision Rules
+Apply a decision function based on thresholds and priorities:
+
+text
+if refuteMass > refuteThreshold:
+  if supportMass > conflictTolerance:
+    → verdict = CONFLICTING
+  else:
+    → verdict = REFUTED
+
+elif supportMass > supportThreshold:
+  → verdict = SUPPORTED
+
+elif supportMass > supportThreshold * 0.6 and neiMass < 0.4:
+  → verdict = SUPPORTED (weak)
+
+else:
+  if notEnoughInfoFallback:
+    → verdict = NOT_ENOUGH_INFO
+  else:
+    → verdict = CONFLICTING  (no strong signal in either direction)
+The REFUTED takes priority over SUPPORTED when both masses are above threshold — this is an asymmetric design choice aligned with legal/forensic caution: a strong contradiction should not be overridden by weak support.
+
+This mirrors the FEVER pipeline's label priority logic and the "conflicting evidence" label used in real‑world fact checking evaluation setups.
+
+Confidence for the final verdict:
+
+text
+if verdict = SUPPORTED:   confidence = supportMass
+if verdict = REFUTED:     confidence = refuteMass
+if verdict = CONFLICTING: confidence = max(supportMass, refuteMass)
+if verdict = NOT_ENOUGH_INFO: confidence = neiMass
+3.4 Step 4 — Primary and Conflicting Evidence Selection
+From all links:
+
+Primary evidence: top 1–3 links by weighted score in the direction of the final verdict.
+
+Conflicting evidence: if verdict is CONFLICTING or REFUTED, include the top opposing links (highest scoring support links if verdict=REFUTED, and vice versa).
+
+This follows explainable fact‑checking practice: surface both confirming and opposing evidence for human reviewers, not just the winning side, similar to ClaimVer and EvidenceNet attribution approaches.
+
+3.5 Step 5 — Flags
+Attach VerdictFlag objects for downstream warning:
+
+Condition	Flag
+All supporting evidence from a single source type only	SINGLE_SOURCE
+Highest link confidence < 0.5	WEAK_EVIDENCE
+refuteMass > 0.2 and verdict=SUPPORTED, or supportMass > 0.2 and verdict=REFUTED	HIGH_CONFLICT
+Claim time and evidence time differ significantly	TEMPORAL_MISMATCH
+Evidence from only one modality (e.g. only TEXT_SNIPPET, no digital/physical)	MODALITY_MISMATCH
+Any flags above are critical, or verdict is CONFLICTING	HUMAN_REVIEW_REQUIRED
+Flags feed directly into the Bias & Uncertainty Monitor and Gap & Logic Auditor.
+
+3.6 Step 6 — Justification Generation
+Once verdict, masses, primary and conflicting evidence are known, prompt an LLM to generate the justification:
+
+Prompt template:
+
+text
+You are a forensic AI reasoning engine. A claim has been assessed against multiple pieces of evidence.
+
+Claim: {claim.normalizedText}
+
+Verdict: {verdict} (confidence {confidence:.0%})
+
+Primary supporting evidence:
+{for each primaryEvidence: "- [{kind}] {link.explanation}"}
+
+Conflicting evidence:
+{for each conflictingEvidence: "- [{kind}] {link.explanation}"}
+
+Flags: {flags list}
+
+Write a 2–4 sentence justification explaining why this verdict was reached, 
+which evidence matters most, and what uncertainty or conflict remains. 
+Be specific about entities, times, and locations where relevant.
+Example output for the earlier Suspect A alibi:
+
+"The claim that suspect A remained home all night is refuted primarily by collision evidence placing both suspect A and the victim at the industrial building around 01:47–01:50 (confirmed by CCTV and phone data, high confidence). A phone silence record covering this window was considered but does not independently corroborate the alibi since phone inactivity does not imply presence at home. No credible evidence supports the alibi claim in this critical interval, and a human review flag has been raised given the single-witness basis for the original claim."
+
+This style mirrors ClaimVer's token‑attributed explanations and JustiLM's few‑shot justification generation.
+
+4. Downstream Integration
+4.1 Argument Graph
+Once verdicts are finalized for all claims:
+
+SUPPORTED claim → graph node gets a STRONG_SUPPORT marker; edges from primary evidence with positive weight.
+
+REFUTED claim → node marked REFUTED; edges from primary evidence with negative weight; conflicting evidence linked.
+
+CONFLICTING → node marked UNCERTAIN with dual edges from both sides.
+
+NOT_ENOUGH_INFO → node marked UNSUPPORTED/OPEN — critical input for Gap Auditor.
+
+The Hypothesis Manager then uses these node/edge weights to update hypothesis probabilities.
+
+4.2 Gap & Logic Auditor
+Queries all claims attached to a hypothesis and checks:
+
+All claims are SUPPORTED: hypothesis is well‑grounded.
+
+Critical claims (e.g., "victim was alone", "suspect had no access") are NOT_ENOUGH_INFO or CONFLICTING: raise GAP finding.
+
+Multiple CONFLICTING claims: raise CONTRADICTION finding.
+
+All evidence from single source or weak: raise WEAK_CHAIN finding.
+
+4.3 Bias & Uncertainty Monitor
+Reads VerdictFlags across all claims:
+
+Many SINGLE_SOURCE flags: hypothesis rests on one evidence type → modality bias warning.
+
+Many HIGH_CONFLICT flags: case is internally inconsistent → escalate for expert review.
+
+Many HUMAN_REVIEW_REQUIRED flags: overall case not ready for automated conclusion.
+
+5. End‑to‑End Example
+Claim C: "Victim left the bar alone at approximately 23:00."
+
+Links from Evidence–Claim Mapper:
+
+Link	Kind	Label	Raw confidence	Weight
+L1	TEXT_SNIPPET (Witness 1)	SUPPORTS	0.90	0.55
+L2	COLLISION (co-presence: victim + person_X in parking lot 23:05)	REFUTES	0.78	0.88
+L3	TIMELINE_EVENT (CCTV exit event: one person only at 22:57)	SUPPORTS	0.85	0.75
+L4	TEXT_SNIPPET (Witness 2: "I think someone was with him but I'm not sure")	NOT_ENOUGH_INFO	0.60	0.55
+Mass accumulation:
+
+text
+L1: support  += 0.90×0.55 = 0.495
+L2: refute   += 0.78×0.88 = 0.686
+L3: support  += 0.85×0.75 = 0.638
+L4: nei      += 0.60×0.55 = 0.330
+
+Totals (raw):   support=1.133, refute=0.686, nei=0.330
+Sum = 2.149
+
+Normalized:    support=0.527, refute=0.319, nei=0.154
+Decision:
+
+refuteMass 0.319 < refuteThreshold 0.5 → no hard refute.
+
+supportMass 0.527 < supportThreshold 0.6 → not strongly supported.
+
+supportMass > 0.6×0.6 = 0.36 and neiMass < 0.4 → → SUPPORTED (weak), confidence 0.527.
+
+But refuteMass=0.319 > conflictTolerance 0.25 → flag HIGH_CONFLICT.
+
+Flags: HIGH_CONFLICT, SINGLE_SOURCE (no AUTOPSY/digital only 1 modal collision).
+
+Primary evidence: L3 (CCTV exit) and L1 (Witness 1).
+Conflicting evidence: L2 (collision with unknown person at parking lot 23:05).
+
+Justification generated:
+
+"The claim is weakly supported: CCTV footage shows a single person exiting the bar at 22:57, and a witness confirms the victim left alone. However, a collision event at 23:05 in the parking lot places the victim alongside an unidentified individual, partially contradicting the 'alone' claim. The conflict flag indicates that additional evidence — especially identification of the parking lot individual — is needed before this claim can be fully confirmed."
+
+6. Implementation Notes
+Threshold calibration: start with defaults; tune using annotated case examples. Use held‑out split to evaluate precision@REFUTED specifically since false‑negative refutes are dangerous.
+
+LLM justification quality: ClaimVer shows that entity‑level highlighting + rationale from NLI attention heads significantly improves explanation quality vs pure LLM generation.
+
+Multi‑hop claims: some claims require chaining evidence (e.g., "victim was alone" requires combining bar exit + no co‑presence after). For these, implement multi‑hop inference as in explainable multi‑hop fact verification.
+
+Multi‑agent verification: for very high‑stakes or CONFLICTING verdicts, optionally run a second independent verifier (different model or reviewer) and treat disagreement as further uncertainty, similar to multi‑agent collaborative fake‑news detection frameworks.
+
+At this point we've covered the full AIVENTRA reasoning chain end‑to‑end:
+
+text
+Ingestion
+  → Autopsy Agent
+  → TOD Agent
+  → Collision Agent
+  → Timeline & Anomaly Agent
+  → Hotspot Engine
+  → Claim Extractor
+  → Evidence–Claim Mapper
+  → Claim–Level Verdict Aggregation         ← (just covered)
+  → Argument Graph Builder
+  → Hypothesis Manager
+  → Gap & Logic Auditor
+  → Bias & Uncertainty Monitor
+  → NBE Agent
+  → Reasoning Replay Agent
