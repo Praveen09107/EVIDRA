@@ -39,8 +39,8 @@ async def main():
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("Content-Type", "application/json")
         if body_data:
-            return urllib.request.urlopen(req, json.dumps(body_data).encode(), timeout=30)
-        return urllib.request.urlopen(req, timeout=30)
+            return urllib.request.urlopen(req, json.dumps(body_data).encode(), timeout=300)
+        return urllib.request.urlopen(req, timeout=300)
 
     # ── 2. Create Case ──
     print("\n── Create Case ──")

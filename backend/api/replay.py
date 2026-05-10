@@ -28,17 +28,17 @@ async def get_replay_steps(case_id: str, current_user: dict = Depends(get_curren
 async def get_audit_log(case_id: str, current_user: dict = Depends(get_current_user)):
     """Get the audit log for a case (or system-wide if case_id='system')."""
     if case_id == "system":
-        rows = await db.fetch("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200")
+        rows = await db.fetch("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 200")
     else:
-        rows = await db.fetch("SELECT * FROM audit_log WHERE case_id=$1 ORDER BY created_at DESC LIMIT 200", case_id)
+        rows = await db.fetch("SELECT * FROM audit_log WHERE case_id=$1 ORDER BY timestamp DESC LIMIT 200", case_id)
 
     return [{
-        "id": str(r.get("log_id", r.get("id", ""))),
-        "timestamp": str(r.get("created_at", "")),
-        "user": r.get("performed_by", "SYSTEM"),
-        "role": r.get("role", "-"),
+        "id": str(r.get("log_id", "")),
+        "timestamp": str(r.get("timestamp", "")),
+        "user": str(r.get("actor", r.get("user_id", "SYSTEM"))),
+        "role": "-",
         "action": r.get("action", ""),
-        "resource": r.get("resource_type", ""),
-        "result": r.get("result", "SUCCESS"),
-        "ip": r.get("ip_address", "internal"),
+        "resource": r.get("resource", ""),
+        "result": "SUCCESS",
+        "ip": str(r.get("ip_address", "internal")),
     } for r in rows]
