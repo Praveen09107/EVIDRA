@@ -407,11 +407,15 @@ CREATE TABLE nbe_feedback (
 -- ─── 24. AUDIT LOG (Append-Only — IMMUTABLE) ───
 CREATE TABLE audit_log (
     log_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id     UUID REFERENCES cases(case_id),
     user_id     UUID REFERENCES users(user_id),
+    actor       TEXT,
     action      TEXT NOT NULL,
     resource    TEXT,
     resource_id UUID,
     details     JSONB DEFAULT '{}',
+    prev_entry_hash TEXT DEFAULT 'GENESIS',
+    entry_hash  TEXT,
     ip_address  INET,
     timestamp   TIMESTAMPTZ DEFAULT NOW()
 );
@@ -423,10 +427,14 @@ CREATE INDEX idx_audit_action ON audit_log(action);
 -- ─── 25. CHAIN OF CUSTODY (Append-Only — IMMUTABLE) ───
 CREATE TABLE chain_of_custody (
     custody_id  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id     UUID REFERENCES cases(case_id),
     file_id     UUID NOT NULL REFERENCES case_files(file_id),
-    action      TEXT NOT NULL CHECK (action IN ('UPLOADED','ACCESSED','EXPORTED','MODIFIED','DELETED')),
+    action      TEXT NOT NULL,
+    actor       TEXT,
     actor_id    UUID REFERENCES users(user_id),
     sha256_at_action VARCHAR(64),
+    file_hash   TEXT,
+    details     TEXT,
     notes       TEXT,
     timestamp   TIMESTAMPTZ DEFAULT NOW()
 );

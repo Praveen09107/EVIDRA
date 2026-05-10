@@ -35,6 +35,8 @@ class Settings:
 
     # --- LLM ---
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     LLM_MAX_CONCURRENT: int = int(os.getenv("LLM_MAX_CONCURRENT", "5"))
     LLM_MAX_TOKENS_PER_RUN: int = int(os.getenv("LLM_MAX_TOKENS_PER_RUN", "100000"))
     LLM_RATE_LIMIT_RPM: int = int(os.getenv("LLM_RATE_LIMIT_RPM", "60"))

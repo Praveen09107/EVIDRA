@@ -1,17 +1,50 @@
-fastapi==0.111.0
-uvicorn==0.29.0
-pydantic==2.7.1
-pydantic-settings==2.2.1
-asyncpg==0.29.0
-redis==5.0.4
-minio==7.2.7
-google-genai==0.3.0
-python-multipart==0.0.9
-PyJWT==2.8.0
-bcrypt==4.1.2
-# ML & Data Science
-pandas==2.2.2
-numpy==1.26.4
-scikit-learn==1.4.2
-scipy==1.13.0
-torch==2.3.0
+# ═══════════════════════════════════════════════════════════
+# EVIDRA Backend — Python Dependencies
+# ═══════════════════════════════════════════════════════════
+
+# --- Core Framework ---
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+pydantic>=2.7.0
+
+# --- Database ---
+asyncpg>=0.29.0
+
+# --- Redis ---
+redis>=5.0.0
+
+# --- Object Storage ---
+minio>=7.2.0
+
+# --- LLM (Primary) ---
+google-generativeai>=0.7.0
+
+# --- ML / Scientific Computing ---
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0
+scikit-learn>=1.5.0
+torch>=2.3.0
+joblib>=1.4.0
+
+# --- NLP & OCR ---
+pytesseract>=0.3.10
+Pillow>=10.3.0
+PyMuPDF>=1.24.0
+pytz>=2024.1
+python-dateutil>=2.9.0
+
+# --- Image Processing ---
+opencv-python-headless>=4.10.0
+
+# --- Explainability ---
+shap>=0.45.0
+
+# --- Auth ---
+PyJWT>=2.8.0
+passlib[bcrypt]>=1.7.4
+
+# --- WebSockets ---
+websockets>=12.0
