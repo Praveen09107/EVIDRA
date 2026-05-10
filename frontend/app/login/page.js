@@ -41,7 +41,7 @@ export default function LoginPage() {
             <div style={styles.brandIcon}>
               <Activity size={28} color="var(--accent-cyan)" />
             </div>
-            <h1 style={styles.brandTitle}>AIVENTRA</h1>
+            <h1 style={styles.brandTitle}>ForensIQ</h1>
             <p style={styles.brandTagline}>
               Multi-Agent Forensic Intelligence Platform
             </p>

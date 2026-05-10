@@ -1,5 +1,5 @@
 // ================================================================
-// AIVENTRA — WebSocket Client with Auto-Reconnect
+// ForensIQ — WebSocket Client with Auto-Reconnect
 // Endpoint: /ws/cases/{case_id}?token=... (per CANONICAL_03 CTR-03)
 // ================================================================
 
@@ -20,7 +20,7 @@ export class TelemetryClient {
   connect(caseId) {
     if (typeof window === 'undefined') return;
     this.caseId = caseId;
-    const token = localStorage.getItem('aiventra_token') || '';
+    const token = localStorage.getItem('forensiq_token') || '';
     const url = `${WS_BASE}/ws/cases/${caseId}?token=${token}`;
 
     try {

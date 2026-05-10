@@ -334,7 +334,7 @@ function ReportTab({report}){
     <div className="card" style={{padding:24,background:'#0c0d11'}}>
       <div style={{textAlign:'center',marginBottom:24}}>
         <div style={{fontSize:'0.65rem',color:'var(--text-faint)',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:8}}>CONFIDENTIAL</div>
-        <h3 style={{fontSize:'1.2rem',fontWeight:700}}>AIVENTRA FORENSIC INTELLIGENCE REPORT</h3>
+        <h3 style={{fontSize:'1.2rem',fontWeight:700}}>FORENSIQ INTELLIGENCE REPORT</h3>
         <div style={{fontSize:'0.8rem',color:'var(--text-muted)',marginTop:8}}>Generated: {new Date(report.generatedAt).toLocaleString('en-IN')}</div>
         <div style={{display:'flex',justifyContent:'center',gap:8,marginTop:8}}>
           <StatusBadge status={report.chainValid?'COMPLETE':'FAILED'} size="sm"/>

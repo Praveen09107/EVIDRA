@@ -4,6 +4,7 @@ EVIDRA — Analysis, TOD, Hypothesis & Anomalies API.
 Serves all forensic intelligence results to the frontend.
 """
 from fastapi import APIRouter, Depends
+import json
 from core.database import db
 from api.auth import get_current_user
 
@@ -50,7 +51,10 @@ async def get_tod_result(case_id: str, current_user: dict = Depends(get_current_
     if not result or not result["result_data"]:
         return {"error": "No TOD result available"}
 
-    return result["result_data"]
+    data = result["result_data"]
+    if isinstance(data, str):
+        data = json.loads(data)
+    return data
 
 
 @router.get("/hypothesis")
@@ -81,7 +85,10 @@ async def get_hypothesis(case_id: str, current_user: dict = Depends(get_current_
 
     signals = []
     if agent_result and agent_result["result_data"]:
-        signals = agent_result["result_data"].get("signals", [])
+        data = agent_result["result_data"]
+        if isinstance(data, str):
+            data = json.loads(data)
+        signals = data.get("signals", [])
 
     return {
         "posteriors": posteriors,

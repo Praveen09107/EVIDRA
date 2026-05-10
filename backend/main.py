@@ -1,5 +1,5 @@
 """
-EVIDRA Forensic Intelligence Platform — Backend Entrypoint.
+ForensIQ Intelligence Platform — Backend Entrypoint.
 Run with: uvicorn main:app --reload
 """
 import logging
@@ -26,23 +26,23 @@ from api.replay import router as replay_router
 from api.reports import router as reports_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("evidra.main")
+logger = logging.getLogger("forensiq.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize connections
-    logger.info("Starting EVIDRA backend...")
+    logger.info("Starting ForensIQ backend...")
     await db.get_pool()
     storage.get_minio() # Ensure bucket exists
     yield
     # Shutdown: Clean up connections
-    logger.info("Shutting down EVIDRA backend...")
+    logger.info("Shutting down ForensIQ backend...")
     await db.close_pool()
     await close_redis()
 
 app = FastAPI(
-    title="EVIDRA API",
-    description="Forensic Intelligence Platform API",
+    title="ForensIQ API",
+    description="ForensIQ — Multi-Agent Forensic Intelligence Platform",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -73,7 +73,7 @@ app.include_router(ws_router) # WebSockets don't use standard api prefix
 @app.get("/health")
 async def health_check():
     """Simple health check."""
-    return {"status": "ok", "service": "evidra-api"}
+    return {"status": "ok", "service": "forensiq-api"}
 
 
 @app.get("/api/v1/system/metrics")

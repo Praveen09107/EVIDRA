@@ -1,5 +1,5 @@
 // ================================================================
-// AIVENTRA — Zustand Global State Stores
+// ForensIQ — Zustand Global State Stores
 // Stores: auth, case, pipeline (per Layer 4 spec)
 // ================================================================
 
@@ -7,17 +7,17 @@ import { create } from 'zustand';
 
 // --- Auth Store ---
 export const useAuthStore = create((set) => ({
-  token: typeof window !== 'undefined' ? localStorage.getItem('aiventra_token') : null,
+  token: typeof window !== 'undefined' ? localStorage.getItem('forensiq_token') : null,
   user: null,
   role: null,
-  isAuthenticated: typeof window !== 'undefined' ? !!localStorage.getItem('aiventra_token') : false,
+  isAuthenticated: typeof window !== 'undefined' ? !!localStorage.getItem('forensiq_token') : false,
 
   login: (token, user, role) => {
-    if (typeof window !== 'undefined') localStorage.setItem('aiventra_token', token);
+    if (typeof window !== 'undefined') localStorage.setItem('forensiq_token', token);
     set({ token, user, role, isAuthenticated: true });
   },
   logout: () => {
-    if (typeof window !== 'undefined') localStorage.removeItem('aiventra_token');
+    if (typeof window !== 'undefined') localStorage.removeItem('forensiq_token');
     set({ token: null, user: null, role: null, isAuthenticated: false });
   },
 }));

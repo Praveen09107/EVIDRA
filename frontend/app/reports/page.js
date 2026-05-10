@@ -58,7 +58,7 @@ export default function ReportsPage() {
                 <div className="card" style={{ padding: 24, background: '#0c0d11' }}>
                   <div style={{ textAlign: 'center', marginBottom: 24 }}>
                     <div style={{ fontSize: '0.6rem', color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.12em' }}>CONFIDENTIAL</div>
-                    <h3 style={{ fontSize: '1.1rem', fontWeight: 700, marginTop: 8 }}>AIVENTRA FORENSIC INTELLIGENCE REPORT</h3>
+                    <h3 style={{ fontSize: '1.1rem', fontWeight: 700, marginTop: 8 }}>FORENSIQ INTELLIGENCE REPORT</h3>
                   </div>
                   <h4 style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--accent-cyan)', marginBottom: 8 }}>Executive Summary</h4>
                   <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.7, marginBottom: 20 }}>{report.executiveSummary}</p>

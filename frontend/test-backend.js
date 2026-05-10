@@ -1,5 +1,5 @@
 // ================================================================
-// AIVENTRA — Test Backend (DIFFERENT data to prove dynamic rendering)
+// ForensIQ — Test Backend (DIFFERENT data to prove dynamic rendering)
 // This simulates Dev A's FastAPI backend with COMPLETELY DIFFERENT values
 // to verify the frontend renders whatever the backend sends.
 // ================================================================
@@ -229,7 +229,7 @@ function json(res, data) {
 
 const server = http.createServer(handleRequest);
 server.listen(PORT, () => {
-  console.log(`\n🧪 AIVENTRA Test Backend running on http://localhost:${PORT}`);
+  console.log(`\n🧪 ForensIQ Test Backend running on http://localhost:${PORT}`);
   console.log(`   Serving COMPLETELY DIFFERENT data to prove dynamic rendering!\n`);
   console.log(`   Case: "Ravi Verma Suspicious Fire Case" (instead of "Arun Kumar")`);
   console.log(`   Hypothesis: HOMICIDE 45% (instead of 79%)`);

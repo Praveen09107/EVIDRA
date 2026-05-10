@@ -1,5 +1,5 @@
 // ================================================================
-// AIVENTRA — Centralized Mock Data (Forensically Realistic)
+// ForensIQ — Centralized Mock Data (Forensically Realistic)
 // Based on PLAN_18 Synthetic Test Case: "Arun Kumar Incident"
 // ================================================================
 

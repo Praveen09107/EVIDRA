@@ -43,12 +43,11 @@ async def trigger_pipeline_by_case(case_id: str, current_user: dict = Depends(ge
 
     await db.execute("UPDATE cases SET status = 'IN_ANALYSIS' WHERE case_id = $1", case_id)
 
-    await publish_task("orchestrator:trigger", {
-        "case_id": case_id,
-        "pipeline_run_id": run_id
-    })
+    # Execute pipeline inline (runs ML agents synchronously)
+    from orchestrator.pipeline_executor import execute_pipeline
+    await execute_pipeline(case_id, run_id)
 
-    return {"status": "triggered", "pipeline_run_id": run_id, "message": "Pipeline orchestration started"}
+    return {"status": "complete", "pipeline_run_id": run_id, "message": "Pipeline execution complete"}
 
 
 @router.get("/cases/{case_id}/pipeline/status")

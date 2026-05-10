@@ -1,7 +1,7 @@
 import './globals.css';
 
 export const metadata = {
-  title: 'AIVENTRA — Forensic Intelligence Platform',
+  title: 'ForensIQ — Forensic Intelligence Platform',
   description: 'Multi-agent AI-powered forensic intelligence platform for death investigation analysis.',
 };
 

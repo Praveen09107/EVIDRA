@@ -49,7 +49,7 @@ async def create_case(case: CaseCreate, current_user: dict = Depends(get_current
         """
         INSERT INTO cases (org_id, title, description, risk_level, created_by)
         VALUES ($1, $2, $3, $4, $5)
-        RETURNING case_id, case_number, title, status, risk_level, created_at::text
+        RETURNING case_id::text, case_number, title, status, risk_level, created_at::text
         """,
         current_user["org_id"], case.title, case.description, case.risk_level, current_user["user_id"]
     )
@@ -60,7 +60,7 @@ async def list_cases(current_user: dict = Depends(get_current_user)):
     """List all cases for the user's organization."""
     rows = await db.fetch(
         """
-        SELECT case_id, case_number, title, status, risk_level, created_at::text
+        SELECT case_id::text, case_number, title, status, risk_level, created_at::text
         FROM cases
         WHERE org_id = $1
         ORDER BY created_at DESC

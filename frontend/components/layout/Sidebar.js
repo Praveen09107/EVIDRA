@@ -27,7 +27,7 @@ export default function Sidebar() {
           <LayoutDashboard size={20} color="var(--accent-cyan)" />
         </div>
         <div>
-          <div style={styles.logoText}>AIVENTRA</div>
+          <div style={styles.logoText}>ForensIQ</div>
           <div style={styles.logoSub}>Forensic Intelligence</div>
         </div>
       </div>
