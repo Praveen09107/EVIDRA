@@ -61,6 +61,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: evidra_backend:latest
     container_name: evidra_api
     restart: unless-stopped
     ports:
@@ -86,6 +87,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: evidra_backend:latest
     container_name: evidra_worker
     restart: unless-stopped
     command: ["python", "-m", "worker"]

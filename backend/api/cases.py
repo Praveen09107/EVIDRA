@@ -125,3 +125,26 @@ async def upload_file(
     )
 
     return dict(updated)
+
+
+@router.get("/{case_id}/files")
+async def list_files(case_id: str, current_user: dict = Depends(get_current_user)):
+    """List all evidence files uploaded to a case."""
+    case = await db.fetchrow("SELECT case_id FROM cases WHERE case_id = $1 AND org_id = $2", case_id, current_user["org_id"])
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    rows = await db.fetch(
+        "SELECT file_id, original_name, doc_type, mime_type, file_size_bytes, sha256_hash, uploaded_at "
+        "FROM case_files WHERE case_id=$1 ORDER BY uploaded_at DESC",
+        case_id
+    )
+    return [{
+        "file_id": str(r["file_id"]),
+        "original_name": r["original_name"],
+        "doc_type": r["doc_type"],
+        "size_bytes": r["file_size_bytes"],
+        "status": "PROCESSED",
+        "checksum": r["sha256_hash"][:12] + "..." if r["sha256_hash"] else "",
+        "uploaded_at": str(r["uploaded_at"]),
+    } for r in rows]
